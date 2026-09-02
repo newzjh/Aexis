@@ -212,9 +212,9 @@ void AexisMultinomialPack4_Impl(uint3 id)
 
     float normalizer = 0.0;
     [loop]
-    for (int category = 0; category < _MultinomialClasses; ++category)
+    for (int multiCatIdx = 0; multiCatIdx < _MultinomialClasses; ++multiCatIdx)
     {
-        float value = AexisMultinomialLogit(batch, category);
+        float value = AexisMultinomialLogit(batch, multiCatIdx);
         if (isfinite(value) && maxLogit > -3.4e+38f)
             normalizer += exp(clamp(value - maxLogit, -80.0, 0.0));
     }

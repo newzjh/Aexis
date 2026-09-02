@@ -83,8 +83,8 @@ void AexisSoftmax2D_Impl(uint3 groupId, uint3 groupThreadId)
                 break;
             }
         }
-        for (int c = tid; c < cols; c += 256)
-            _SoftOut[baseIndex + c] = c == firstMaximum ? 1.0 : 0.0;
+        for (int softCCIdx = tid; softCCIdx < cols; softCCIdx += 256)
+            _SoftOut[baseIndex + softCCIdx] = softCCIdx == firstMaximum ? 1.0 : 0.0;
         return;
     }
 

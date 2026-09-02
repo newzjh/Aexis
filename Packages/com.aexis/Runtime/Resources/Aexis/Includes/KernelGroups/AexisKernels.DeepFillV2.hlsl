@@ -183,28 +183,28 @@ void AexisDeepFillV2Softmax_Impl(uint3 groupId, uint3 groupThreadId)
     float maxValue = _DeepFillReduce[0];
 
     float localSum = 0.0;
-    for (int sourcePack = lane; sourcePack < _DeepFillSourcePacks; sourcePack += 128)
+    for (int dfSrcIdx = lane; dfSrcIdx < _DeepFillSourcePacks; dfSrcIdx += 128)
     {
-        float4 score = _DeepFillScoresArr[int3(targetX, targetY, sourcePack)] * _DeepFillSoftmaxScale;
+        float4 score = _DeepFillScoresArr[int3(targetX, targetY, dfSrcIdx)] * _DeepFillSoftmaxScale;
         float4 exponent = exp(score - maxValue);
         localSum += exponent.x + exponent.y + exponent.z + exponent.w;
     }
     _DeepFillReduce[lane] = localSum;
     GroupMemoryBarrierWithGroupSync();
-    for (int step = 64; step > 0; step >>= 1)
+    for (int dfStepIdx = 64; dfStepIdx > 0; dfStepIdx >>= 1)
     {
-        if (lane < step)
-            _DeepFillReduce[lane] += _DeepFillReduce[lane + step];
+        if (lane < dfStepIdx)
+            _DeepFillReduce[lane] += _DeepFillReduce[lane + dfStepIdx];
         GroupMemoryBarrierWithGroupSync();
     }
     float invSum = rcp(max(_DeepFillReduce[0], 1.0e-20));
 
-    for (int sourcePack = lane; sourcePack < _DeepFillSourcePacks; sourcePack += 128)
+    for (int dfSrcIdx2 = lane; dfSrcIdx2 < _DeepFillSourcePacks; dfSrcIdx2 += 128)
     {
-        float4 score = _DeepFillScoresArr[int3(targetX, targetY, sourcePack)] * _DeepFillSoftmaxScale;
+        float4 score = _DeepFillScoresArr[int3(targetX, targetY, dfSrcIdx2)] * _DeepFillSoftmaxScale;
         float4 weight = exp(score - maxValue) * invSum;
-        weight *= AexisDeepFillSourceValid4(sourcePack);
-        _DeepFillWeightsOutArr[int3(targetX, targetY, sourcePack)] = weight;
+        weight *= AexisDeepFillSourceValid4(dfSrcIdx2);
+        _DeepFillWeightsOutArr[int3(targetX, targetY, dfSrcIdx2)] = weight;
     }
 }
 

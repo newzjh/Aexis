@@ -549,11 +549,11 @@ void AexisRecurrentPack4(uint3 id : SV_DispatchThreadID)
         }
 
         [loop]
-        for (int output = 0; output < _RecurrentHiddenSize; ++output)
+        for (int recurOutIdx = 0; recurOutIdx < _RecurrentHiddenSize; ++recurOutIdx)
         {
-            state[output] = nextState[output];
+            state[recurOutIdx] = nextState[recurOutIdx];
             if (_RecurrentKind == 2)
-                cell[output] = nextCell[output];
+                cell[recurOutIdx] = nextCell[recurOutIdx];
         }
 
         int packs = (_RecurrentHiddenSize + 3) / 4;
@@ -705,10 +705,10 @@ void AexisGatedDeltaRulePack4(uint3 id : SV_DispatchThreadID)
     float decay = exp(-exp(alog) * (max(a + dt, 0.0) + log(1.0 + exp(-abs(a + dt)))));
 
     float4 memory = 0.0;
-    for (int j = 0; j < _RecurrentKeyDim; ++j)
+    for (int gdrJIdx = 0; gdrJIdx < _RecurrentKeyDim; ++gdrJIdx)
     {
-        float kj = RecurrentLoadGdrTensor(_RecurrentKArr, token, head, j) * kScale;
-        float4 decayedState = _RecurrentGdrStateInArr.Load(int4(id.x, j, head, 0)) * decay;
+        float kj = RecurrentLoadGdrTensor(_RecurrentKArr, token, head, gdrJIdx) * kScale;
+        float4 decayedState = _RecurrentGdrStateInArr.Load(int4(id.x, gdrJIdx, head, 0)) * decay;
         memory += kj * decayedState;
     }
 
@@ -721,12 +721,12 @@ void AexisGatedDeltaRulePack4(uint3 id : SV_DispatchThreadID)
     }
     float4 delta = (value - memory) * beta;
     float4 projected = 0.0;
-    for (int j = 0; j < _RecurrentKeyDim; ++j)
+    for (int gdrJIdx2 = 0; gdrJIdx2 < _RecurrentKeyDim; ++gdrJIdx2)
     {
-        float kj = RecurrentLoadGdrTensor(_RecurrentKArr, token, head, j) * kScale;
-        float qj = RecurrentLoadGdrTensor(_RecurrentQArr, token, head, j) * qScale;
-        float4 updatedState = _RecurrentGdrStateInArr.Load(int4(id.x, j, head, 0)) * decay + kj * delta;
-        _RecurrentGdrStateOutArr[int3(id.x, j, head)] = updatedState;
+        float kj = RecurrentLoadGdrTensor(_RecurrentKArr, token, head, gdrJIdx2) * kScale;
+        float qj = RecurrentLoadGdrTensor(_RecurrentQArr, token, head, gdrJIdx2) * qScale;
+        float4 updatedState = _RecurrentGdrStateInArr.Load(int4(id.x, gdrJIdx2, head, 0)) * decay + kj * delta;
+        _RecurrentGdrStateOutArr[int3(id.x, gdrJIdx2, head)] = updatedState;
         projected += qj * updatedState;
     }
     projected *= rsqrt((float)_RecurrentKeyDim);
@@ -4746,7 +4746,7 @@ void AexisScatterLinear(uint3 id : SV_DispatchThreadID)
     [loop] for (int i = 0; i < _InputLength; ++i) _Output[int2(i, 0)] = ReadValue(i);
     // Planner accepts only statically/provably unique destinations. Serial writes
     // make that public reject-on-conflict contract deterministic on every backend.
-    [loop] for (int i = 0; i < _Capacity; ++i) { int dst = ReadIndex(i); if (dst >= 0 && dst < _InputLength) _Output[int2(dst, 0)] = ReadUpdate(i); }
+    [loop] for (int scatterIIdx = 0; scatterIIdx < _Capacity; ++scatterIIdx) { int dst = ReadIndex(scatterIIdx); if (dst >= 0 && dst < _InputLength) _Output[int2(dst, 0)] = ReadUpdate(scatterIIdx); }
 }
 
 [numthreads(1, 1, 1)]

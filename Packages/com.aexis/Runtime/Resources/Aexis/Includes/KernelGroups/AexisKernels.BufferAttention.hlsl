@@ -367,10 +367,10 @@ void AexisSdpaSoftmaxBuf_Impl(uint3 groupId, uint3 groupThreadId)
 
     float maxValue = _SdpaReduce[0];
     float localSum = 0.0;
-    for (int col = (int)tid; col < dst; col += 64)
+    for (int sdpaColIdx = (int)tid; sdpaColIdx < dst; sdpaColIdx += 64)
     {
-        float e = exp(_SdpaScores[scoreBase + col] - maxValue);
-        _SdpaScores[scoreBase + col] = e;
+        float e = exp(_SdpaScores[scoreBase + sdpaColIdx] - maxValue);
+        _SdpaScores[scoreBase + sdpaColIdx] = e;
         localSum += e;
     }
     _SdpaReduce[tid] = localSum;
@@ -385,8 +385,8 @@ void AexisSdpaSoftmaxBuf_Impl(uint3 groupId, uint3 groupThreadId)
     }
 
     float invSum = 1.0 / max(_SdpaReduce[0], 1e-20);
-    for (int col = (int)tid; col < dst; col += 64)
-        _SdpaScores[scoreBase + col] *= invSum;
+    for (int sdpaColIdx2 = (int)tid; sdpaColIdx2 < dst; sdpaColIdx2 += 64)
+        _SdpaScores[scoreBase + sdpaColIdx2] *= invSum;
 }
 
 void AexisSdpaQkvBuf_Impl(uint3 groupId, uint3 groupThreadId)
@@ -447,8 +447,8 @@ void AexisSdpaAttentionFast_Impl(uint3 groupId, uint3 groupThreadId)
     GroupMemoryBarrierWithGroupSync();
 
     float localMax = -3.402823466e+38;
-    for (int col = (int)tid; col < dst; col += 64)
-        localMax = max(localMax, _SdpaScoresFast[col]);
+    for (int sdpaColIdx3 = (int)tid; sdpaColIdx3 < dst; sdpaColIdx3 += 64)
+        localMax = max(localMax, _SdpaScoresFast[sdpaColIdx3]);
     _SdpaReduce[tid] = localMax;
     GroupMemoryBarrierWithGroupSync();
 
@@ -462,10 +462,10 @@ void AexisSdpaAttentionFast_Impl(uint3 groupId, uint3 groupThreadId)
 
     float maxValue = _SdpaReduce[0];
     float localSum = 0.0;
-    for (int col = (int)tid; col < dst; col += 64)
+    for (int sdpaColIdx4 = (int)tid; sdpaColIdx4 < dst; sdpaColIdx4 += 64)
     {
-        float e = exp(_SdpaScoresFast[col] - maxValue);
-        _SdpaScoresFast[col] = e;
+        float e = exp(_SdpaScoresFast[sdpaColIdx4] - maxValue);
+        _SdpaScoresFast[sdpaColIdx4] = e;
         localSum += e;
     }
     _SdpaReduce[tid] = localSum;
@@ -480,8 +480,8 @@ void AexisSdpaAttentionFast_Impl(uint3 groupId, uint3 groupThreadId)
     }
 
     float invSum = 1.0 / max(_SdpaReduce[0], 1e-20);
-    for (int col = (int)tid; col < dst; col += 64)
-        _SdpaScoresFast[col] *= invSum;
+    for (int sdpaColIdx5 = (int)tid; sdpaColIdx5 < dst; sdpaColIdx5 += 64)
+        _SdpaScoresFast[sdpaColIdx5] *= invSum;
     GroupMemoryBarrierWithGroupSync();
 
     for (int lane = (int)tid; lane < outEmbedDim; lane += 64)

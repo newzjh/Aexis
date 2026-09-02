@@ -592,7 +592,7 @@ void AexisP1DeformableConv2dPack4_Impl(uint3 id)
 
 float P1OutputScalar(int x, int y)
 {
-    return _P1OutArr.Load(int4(x, y, 0, 0)).x;
+    return _P1OutArr[int3(x, y, 0)].x;
 }
 
 void P1WriteOutputScalar(int x, int y, float value)

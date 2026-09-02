@@ -507,11 +507,11 @@ void AexisNonZeroLinearMat_Impl(uint3 id)
     int capacity = max(1, _AexisTotal);
     int count = 0;
     [loop] for (int i = 0; i < capacity; ++i) _LinearOut0[int2(i % _AexisOutStorageW, i / _AexisOutStorageW)] = -1.0;
-    [loop] for (int i = 0; i < sourceTotal; ++i)
+    [loop] for (int nzIIdx = 0; nzIIdx < sourceTotal; ++nzIIdx)
     {
-        if (AexisReadLinear(_LinearIn0, i, _AexisIn0StorageW, _AexisIn0StorageH) != 0.0)
+        if (AexisReadLinear(_LinearIn0, nzIIdx, _AexisIn0StorageW, _AexisIn0StorageH) != 0.0)
         {
-            if (count < capacity) _LinearOut0[int2(count % _AexisOutStorageW, count / _AexisOutStorageW)] = (float)i;
+            if (count < capacity) _LinearOut0[int2(count % _AexisOutStorageW, count / _AexisOutStorageW)] = (float)nzIIdx;
             count++;
         }
     }
@@ -525,11 +525,11 @@ void AexisCompressLinearMat_Impl(uint3 id)
     int capacity = max(1, _AexisTotal);
     int count = 0;
     [loop] for (int i = 0; i < capacity; ++i) _LinearOut0[int2(i % _AexisOutStorageW, i / _AexisOutStorageW)] = 0.0;
-    [loop] for (int i = 0; i < min(sourceTotal, conditionTotal); ++i)
+    [loop] for (int whIIdx = 0; whIIdx < min(sourceTotal, conditionTotal); ++whIIdx)
     {
-        if (AexisReadLinear(_LinearIn1, i, _AexisIn1StorageW, _AexisIn1StorageH) != 0.0)
+        if (AexisReadLinear(_LinearIn1, whIIdx, _AexisIn1StorageW, _AexisIn1StorageH) != 0.0)
         {
-            if (count < capacity) _LinearOut0[int2(count % _AexisOutStorageW, count / _AexisOutStorageW)] = AexisReadLinear(_LinearIn0, i, _AexisIn0StorageW, _AexisIn0StorageH);
+            if (count < capacity) _LinearOut0[int2(count % _AexisOutStorageW, count / _AexisOutStorageW)] = AexisReadLinear(_LinearIn0, whIIdx, _AexisIn0StorageW, _AexisIn0StorageH);
             count++;
         }
     }
@@ -554,10 +554,10 @@ void AexisScatterLinearMat_Impl(uint3 id)
     int total = AexisTotalCount(_AexisIn0W, _AexisIn0H, _AexisIn0D, _AexisIn0C);
     [loop] for (int i = 0; i < total; ++i) _LinearOut0[int2(i % _AexisOutStorageW, i / _AexisOutStorageW)] = AexisReadLinear(_LinearIn0, i, _AexisIn0StorageW, _AexisIn0StorageH);
     int updates = min(_AexisTotal, AexisTotalCount(_AexisIn2W, _AexisIn2H, _AexisIn2D, _AexisIn2C));
-    [loop] for (int i = 0; i < updates; ++i)
+    [loop] for (int scatIIdx = 0; scatIIdx < updates; ++scatIIdx)
     {
-        int target = (int)round(AexisReadLinear(_LinearIn1, i, _AexisIn1StorageW, _AexisIn1StorageH));
+        int target = (int)round(AexisReadLinear(_LinearIn1, scatIIdx, _AexisIn1StorageW, _AexisIn1StorageH));
         if (target < 0) target += total;
-        if (target >= 0 && target < total) _LinearOut0[int2(target % _AexisOutStorageW, target / _AexisOutStorageW)] = AexisReadLinear(_LinearIn2, i, _AexisIn2StorageW, _AexisIn2StorageH);
+        if (target >= 0 && target < total) _LinearOut0[int2(target % _AexisOutStorageW, target / _AexisOutStorageW)] = AexisReadLinear(_LinearIn2, scatIIdx, _AexisIn2StorageW, _AexisIn2StorageH);
     }
 }
