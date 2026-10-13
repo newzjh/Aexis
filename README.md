@@ -21,9 +21,9 @@
 
 Aexis imports and executes selected ONNX and NCNN model graphs on a texture-native GPU path, with compute shaders and Pack4 RenderTexture storage designed for real-time applications on edge devices.
 
-`com.aexis` is the engine package. AIImage is the complete application example built on top of it; it is not a runtime namespace or package dependency. The runtime does not wrap or require Unity Sentis, Tencent ncnn, ONNX Runtime, MNN, UniTask, or a native inference plug-in.
+`individual.jiahua-zhang.aexis` is the engine package. AIImage is the complete application example built on top of it; it is not a runtime namespace or package dependency. The runtime does not wrap or require Unity Sentis, Tencent ncnn, ONNX Runtime, MNN, UniTask, or a native inference plug-in.
 
-- **Current package:** `com.aexis` `0.1.0-pre.1`
+- **Current package:** `individual.jiahua-zhang.aexis` `0.1.0-pre.1`
 - **Unity range:** 2022.3 through 6000.3
 - **Primary production path:** Pack4 RenderTexture plus CommandBuffer-compatible compute dispatch
 
@@ -63,7 +63,7 @@ The images below are documentation copies of actual runner artifacts. Each timin
 
 ### Qwen3.5 0.8B Mobile Q4 and Q8
 
-![Qwen and CLIP multimodal input](Packages/com.aexis/Documentation~/images/qwen-and-clip-input.jpg)
+![Qwen and CLIP multimodal input](Packages/individual.jiahua-zhang.aexis/Documentation~/images/qwen-and-clip-input.jpg)
 
 | Variant | Runner evidence | Strict texture execution | Result |
 | --- | --- | --- | --- |
@@ -78,39 +78,39 @@ CLIP produces an embedding and ranked labels rather than a transformed image. Th
 
 ### CodeFormer Face Restoration
 
-![CodeFormer before and after on 03.jpg](Packages/com.aexis/Documentation~/images/codeformer-03-before-after.png)
+![CodeFormer before and after on 03.jpg](Packages/individual.jiahua-zhang.aexis/Documentation~/images/codeformer-03-before-after.png)
 
 The face-restoration runner completed in **17,958 ms** on `ref/03.jpg`, detected one face, and composited the restoration shown above (Windows/Vulkan, 2026-07-29).
 
 ### Foreground Matting
 
-![Matting composite result](Packages/com.aexis/Documentation~/images/matting-composite.png)
+![Matting composite result](Packages/individual.jiahua-zhang.aexis/Documentation~/images/matting-composite.png)
 
-![Matting alpha result](Packages/com.aexis/Documentation~/images/matting-matte.png)
+![Matting alpha result](Packages/individual.jiahua-zhang.aexis/Documentation~/images/matting-matte.png)
 
 The matting runner completed at **360x202** in **1,103 ms** with the strict texture plan and CommandBuffer path.
 
 ### GFPGAN Face Restoration
 
-![GFPGAN before and after on 03.jpg](Packages/com.aexis/Documentation~/images/gfpgan-03-before-after.png)
+![GFPGAN before and after on 03.jpg](Packages/individual.jiahua-zhang.aexis/Documentation~/images/gfpgan-03-before-after.png)
 
 The GFPGAN runner completed in **6,053 ms** on `ref/03.jpg` with the strict Pack4 guard (Windows/Vulkan, 2026-07-29). This is the raw runner output: this input visibly produces facial distortion, so it is shown as execution evidence rather than a quality claim. Its weights are excluded from the package payload and are delivered separately.
 
 ### YOLO Person Segmentation plus DeepFillV2
 
-![YOLO plus DeepFillV2 before and after on 3.png](Packages/com.aexis/Documentation~/images/yolo-deepfillv2-3-before-after.png)
+![YOLO plus DeepFillV2 before and after on 3.png](Packages/individual.jiahua-zhang.aexis/Documentation~/images/yolo-deepfillv2-3-before-after.png)
 
 On `ref/deepfillv2/DeepFillv2-main/test_data/3.png`, YOLO found seven people (mask coverage `0.042730`). The NCNN DeepFillV2 pass completed in **2,196 ms** (**1,995 ms** inference; Windows/Vulkan, 2026-07-29). The comparison intentionally retains the residual removal artifacts in the documented output.
 
 ### Real-ESRGAN AnimeVideo v3 x4
 
-![Real-ESRGAN before and after on 03.jpg](Packages/com.aexis/Documentation~/images/realesrgan-03-before-after.png)
+![Real-ESRGAN before and after on 03.jpg](Packages/individual.jiahua-zhang.aexis/Documentation~/images/realesrgan-03-before-after.png)
 
 The Real-ESRGAN AnimeVideo v3 x4 CommandBuffer Pack4-only validation completed in **1,057 ms** for `ref/03.jpg` (Windows/Vulkan, 2026-07-29).
 
 ### YOLO plus Stable Diffusion Inpainting
 
-![YOLO plus Stable Diffusion inpainting before and after on 3.png](Packages/com.aexis/Documentation~/images/yolo-sd-inpainting-3-before-after.png)
+![YOLO plus Stable Diffusion inpainting before and after on 3.png](Packages/individual.jiahua-zhang.aexis/Documentation~/images/yolo-sd-inpainting-3-before-after.png)
 
 On `ref/deepfillv2/DeepFillv2-main/test_data/3.png`, YOLO found seven people (mask coverage `0.042730`) and the 12-step Stable Diffusion inpainting run completed in **630,213 ms** (Windows/Vulkan, 2026-07-29). It removes people more completely than the DeepFillV2 run above, but the documented raw output still contains residual objects and artifacts. Stable Diffusion inpainting weights are external and are not included in the package sample.
 
@@ -122,7 +122,7 @@ On `ref/deepfillv2/DeepFillv2-main/test_data/3.png`, YOLO found seven people (ma
 
 ## Model Releases
 
-The application resolves model assets from [newzjh/AIImage releases](https://github.com/newzjh/Aexis/releases). The release pages below are the corresponding download locations; select the current asset listed on the page or use the application's model-download UI. Generated archive names are taken from `AIImageModelReleaseManifest.json` produced by `Aexis/Release/Build Reduced/Prepare Model Release Assets` rather than guessed in documentation.
+The application resolves model assets from [newzjh/AIImage releases](https://github.com/newzjh/Aexis/releases). The release pages below are the corresponding download locations; select the current asset listed on the page or use the application's model-download UI. Generated archive names are taken from `AIImageModelReleaseManifest.json` produced by `Tools/Aexis/Release/Build Reduced/Prepare Model Release Assets` rather than guessed in documentation.
 
 | Runner or model group | GitHub Release download page | Package payload |
 | --- | --- | --- |
@@ -137,7 +137,7 @@ The application resolves model assets from [newzjh/AIImage releases](https://git
 | VISTA3D skull | [`vista3d_skull`](https://github.com/newzjh/Aexis/releases/tag/vista3d_skull) | External model; medical input and data remain excluded. |
 | VISTA3D spine | [`vista3d_spine`](https://github.com/newzjh/Aexis/releases/tag/vista3d_spine) | External model; medical input and data remain excluded. |
 
-Release tags are part of the application delivery configuration. A successful download does not grant a model license; see [model distribution](Packages/com.aexis/Documentation~/model-distribution.md) before redistributing a model artifact.
+Release tags are part of the application delivery configuration. A successful download does not grant a model license; see [model distribution](Packages/individual.jiahua-zhang.aexis/Documentation~/model-distribution.md) before redistributing a model artifact.
 
 ## Operator and Precision Coverage
 
@@ -163,7 +163,7 @@ Compatible Unity targets and completed validation are different claims. The tabl
 | macOS Player | Mac16,10; Apple M4; 16 GB | 6000.2.7f2 | Metal | 2026-07-30, 600 x 337 input: CLIP 97 ms; CodeFormer 2,515 ms; GFPGAN 1,136 ms; Real-ESRGAN 707 ms; Matting 421 ms; YOLO 294 ms (two people, 78.69% mask); YOLO + DeepFillV2 3,528 ms | Completed: seven runners passed; Qwen3.5 Q4 and SD inpainting skipped because their model groups were absent. |
 | Android (MuMu emulator) | MuMu ADB `127.0.0.1:16384`; runtime report: vivo V2241A, Adreno (TM) 650, 8961 MiB | 6000.2.7f2 | Vulkan, GameActivity | 2026-07-26 full default Main2 pass: CodeFormer 6,946 ms; Real-ESRGAN 519 ms; GFPGAN 3,160 ms; YOLO 657 ms (four persons); DeepFillV2 3,442 ms; Matting 1,014 ms; CLIP 2,208 ms; Qwen Q4 326,821 ms (103 steps, 397 visible characters) | Passed; conservative Android fallback |
 | iPadOS Simulator (`iPad8,6` profile) | Apple M4 host GPU; 16 GB host memory | 6000.2.7f2 | Metal | 2026-07-30, 600 x 337 input: CLIP 111 ms; CodeFormer 2,974 ms; GFPGAN 1,336 ms; Real-ESRGAN 903 ms; Matting 486 ms; YOLO 475 ms (two people, 78.69% mask); YOLO + DeepFillV2 4,731 ms | Completed: seven runners passed; Qwen3.5 Q4 and SD inpainting skipped because their model groups were absent. Simulator evidence only. |
-| iPhone / iPad physical device | **Pending command-run report: device, SoC, GPU** | **Pending command-run report: Unity version** | Metal required | Run the [iOS Metal device procedure](Packages/com.aexis/Documentation~/apple-runtime-smoke.md#ios-metal-device) on the target Mac and return its build JSON plus `runner-report=` console log. | Ready for target-machine device validation |
+| iPhone / iPad physical device | **Pending command-run report: device, SoC, GPU** | **Pending command-run report: Unity version** | Metal required | Run the [iOS Metal device procedure](Packages/individual.jiahua-zhang.aexis/Documentation~/apple-runtime-smoke.md#ios-metal-device) on the target Mac and return its build JSON plus `runner-report=` console log. | Ready for target-machine device validation |
 
 Use a real graphics device for all Aexis validation. `-nographics` is not a valid package, shader, or runner test mode.
 
@@ -179,35 +179,35 @@ The test updates one JSON file named `AexisDevelopmentRunnerTest_*.json` below `
 
 ### UPM
 
+`individual.jiahua-zhang` is the verified Unity UPM publisher namespace. The single-package
+product technical name is `individual.jiahua-zhang.aexis`; the package directory and the
+`package.json` `name` field must stay identical for Asset Store Publishing Tools.
+
 Use an embedded package reference during development:
 
 ```json
 {
   "dependencies": {
-    "com.aexis": "file:../AIImage/Packages/com.aexis"
+    "individual.jiahua-zhang.aexis": "file:../AIImage/Packages/individual.jiahua-zhang.aexis"
   }
 }
 ```
 
-For a published registry or Git package, install `com.aexis` through Unity Package Manager. Do not copy `Runtime` into `Assets`; the package's assembly definitions and package-owned resources are part of the runtime contract.
-
-### `.unitypackage`
-
-From an Aexis project, run `Aexis/Release/Export Complete UnityPackage`, then import the resulting archive into the target Unity project with the Aexis entries selected. The import list contains the original `Packages/com.aexis/...` files, not an opaque ZIP payload. Unity writes them directly to `Packages/com.aexis`; the small bootstrap only confirms Package Manager registration and removes itself. The package is ready in the same editor session, with no project restart.
+For a published registry or Git package, install `individual.jiahua-zhang.aexis` through Unity Package Manager. Do not copy `Runtime` into `Assets`; the package's assembly definitions and package-owned resources are part of the runtime contract.
 
 To import the full application example, select **AIImage Main2 Application Example** in Package Manager, then run:
 
 ```text
-Aexis/Examples/Install Main2 Application StreamingAssets
+Tools/Aexis/Examples/Install Main2 Application StreamingAssets
 ```
 
-Open `Scenes/Main2.unity`, or choose `Aexis/Examples/Open Main2 Application Scene`. The installer copies the sample payload to `Assets/StreamingAssets`, which is the Player-included location. Model paths are relative to `Application.streamingAssetsPath`.
+Open `Scenes/Main2.unity`, or choose `Tools/Aexis/Examples/Open Main2 Application Scene`. The installer copies the sample payload to `Assets/StreamingAssets`, which is the Player-included location. Model paths are relative to `Application.streamingAssetsPath`.
 
 ## License
 
 The package manifest declares **MIT** for Aexis source. Model weights, medical data, and third-party sample artifacts are not covered by that source license and retain their own terms.
 
-This pre-release repository still contains a release-audit gate in [Packages/com.aexis/LICENSE.md](Packages/com.aexis/LICENSE.md). Complete the source, shader, sample, and model provenance audit before publishing or representing a package archive as an MIT release. See [Third Party Notices](Packages/com.aexis/Third%20Party%20Notices.md) and [model distribution](Packages/com.aexis/Documentation~/model-distribution.md).
+This pre-release repository still contains a release-audit gate in [Packages/individual.jiahua-zhang.aexis/LICENSE.md](Packages/individual.jiahua-zhang.aexis/LICENSE.md). Complete the source, shader, sample, and model provenance audit before publishing or representing a package archive as an MIT release. See [Third Party Notices](Packages/individual.jiahua-zhang.aexis/Third%20Party%20Notices.md) and [model distribution](Packages/individual.jiahua-zhang.aexis/Documentation~/model-distribution.md).
 
 ## Community links
 
@@ -218,7 +218,7 @@ This pre-release repository still contains a release-audit gate in [Packages/com
 
 ## Documentation
 
-- [Package README](Packages/com.aexis/README.md)
+- [Package README](Packages/individual.jiahua-zhang.aexis/README.md)
 - [Integration manual](Documents/Aexis-Engine-Integration-Manual.md)
-- [Runner sample guide](Packages/com.aexis/Documentation~/runner-samples.md)
-- [Model distribution and exclusions](Packages/com.aexis/Documentation~/model-distribution.md)
+- [Runner sample guide](Packages/individual.jiahua-zhang.aexis/Documentation~/runner-samples.md)
+- [Model distribution and exclusions](Packages/individual.jiahua-zhang.aexis/Documentation~/model-distribution.md)

@@ -6,7 +6,7 @@ EditorBuildSettings:
   serializedVersion: 2
   m_Scenes:
   - enabled: 1
-    path: Packages/com.aexis/Samples/AIImageApplicationExample/Scenes/Main2.unity
+    path: Packages/individual.jiahua-zhang.aexis/Samples/AIImageApplicationExample/Scenes/Main2.unity
     guid: c68ee43f25dfc214fb478164f24987f8
   - enabled: 0
     path: Assets/Scenes/Main.unity

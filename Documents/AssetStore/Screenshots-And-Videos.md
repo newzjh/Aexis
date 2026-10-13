@@ -25,8 +25,8 @@ Create one 75 to 90 second English video at 1920x1080, 30 fps. Capture the actua
 | Time | Scene | On-screen English copy | Capture notes |
 | --- | --- | --- | --- |
 | 0:00-0:05 | Cover image and Main2 scene | `Aexis | On-device inference for Unity` | Use the generated Cover only as an introduction, then cut to the real sample. |
-| 0:05-0:14 | Package Manager | `Install com.aexis and import the Main2 Application Example` | Show the three shipped samples. Do not show local paths or credentials. |
-| 0:14-0:23 | Installer and scene open | `Install StreamingAssets, then open Main2` | Show `Aexis/Examples/Install Main2 Application StreamingAssets`. |
+| 0:05-0:14 | Package Manager | `Install individual.jiahua-zhang.aexis and import the Main2 Application Example` | Show the three shipped samples. Do not show local paths or credentials. |
+| 0:14-0:23 | Installer and scene open | `Install StreamingAssets, then open Main2` | Show `Tools/Aexis/Examples/Install Main2 Application StreamingAssets`. |
 | 0:23-0:38 | CodeFormer and Real-ESRGAN | `Input -> runner output` | Use a licensed demo image. Show the original and the actual final output side by side. |
 | 0:38-0:52 | Matting and YOLO | `Texture-native GPU runner examples` | Show alpha/mask output followed by the actual composite. |
 | 0:52-1:06 | DeepFillV2 and CLIP | `Image transformation and embedding workflows` | Retain visible artifacts; do not imply perfect removal or universal quality. |

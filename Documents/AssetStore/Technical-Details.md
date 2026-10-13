@@ -47,7 +47,7 @@ Aexis is a self-contained, on-device inference engine for Unity. It imports sele
 
 Supported import formats are `.onnx`, NCNN `.param` plus `.bin`, and `.aexis` archives. An optional model manifest can declare precision, quantization, and planning constraints. The bundled sample model set is intentionally limited: default files may be included only for Clip, CodeFormer, DeepFillV2, Matting, RealESRGAN, and YOLO after provenance review.
 
-GFPGAN, Stable Diffusion, SD Inpainting, MONAI/VISTA, and Qwen weights are external downloads. Every model has its own license and redistribution conditions. A download location is not a license grant; review `Packages/com.aexis/Documentation~/model-distribution.md` before placing any weight in an Asset Store upload.
+GFPGAN, Stable Diffusion, SD Inpainting, MONAI/VISTA, and Qwen weights are external downloads. Every model has its own license and redistribution conditions. A download location is not a license grant; review `Packages/individual.jiahua-zhang.aexis/Documentation~/model-distribution.md` before placing any weight in an Asset Store upload.
 
 ## Dependencies and Runtime Boundaries
 
@@ -61,7 +61,7 @@ The production NCNN path keeps activations texture-backed using Pack4 RenderText
 
 ## Included Example
 
-Import **AIImage Main2 Application Example** from Package Manager, then run `Aexis/Examples/Install Main2 Application StreamingAssets` and open `Scenes/Main2.unity`. The example demonstrates the full application UI and runner configuration. It includes English and Chinese UI controls, model download configuration, development-player reports, and reusable runner components.
+Import **AIImage Main2 Application Example** from Package Manager, then run `Tools/Aexis/Examples/Install Main2 Application StreamingAssets` and open `Scenes/Main2.unity`. The example demonstrates the full application UI and runner configuration. It includes English and Chinese UI controls, model download configuration, development-player reports, and reusable runner components.
 
 ## Important Limitations
 
@@ -73,4 +73,4 @@ Import **AIImage Main2 Application Example** from Package Manager, then run `Aex
 
 ## License
 
-The package manifest declares MIT for Aexis source. The current repository retains a release-audit gate in `Packages/com.aexis/LICENSE.md`; complete the required provenance audit before publishing or describing the package archive as a completed MIT release.
+The package manifest declares MIT for Aexis source. The current repository retains a release-audit gate in `Packages/individual.jiahua-zhang.aexis/LICENSE.md`; complete the required provenance audit before publishing or describing the package as a completed MIT release.

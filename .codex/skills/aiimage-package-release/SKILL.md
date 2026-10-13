@@ -1,6 +1,6 @@
 ---
 name: aiimage-package-release
-description: Maintain, restructure, document, or validate the AIImage Aexis Unity package release. Use when editing Packages/com.aexis, package samples, package asmdefs, release documentation, model distribution, or empty-project import validation across Unity 2022.3 through Unity 6000.3.
+description: Maintain, restructure, document, or validate the AIImage Aexis Unity package release. Use when editing Packages/individual.jiahua-zhang.aexis, package samples, package asmdefs, release documentation, model distribution, or empty-project import validation across Unity 2022.3 through Unity 6000.3.
 ---
 
 # Aexis Package Release
@@ -9,7 +9,9 @@ Follow this skill for every Aexis package release change.
 
 ## Package contract
 
-- Publish one package only: `Packages/com.aexis`.
+- Publish one UPM package only: `Packages/individual.jiahua-zhang.aexis`.
+- The Asset Store publisher namespace is `individual.jiahua-zhang`, the product namespace is `aexis`, and the immutable package technical name is `individual.jiahua-zhang.aexis`. Keep the package directory, `package.json` `name`, project dependency, lock-file entry, and Publisher Portal draft technical name identical.
+- Never export or submit this package as a `.unitypackage`, place it below `Assets`, or add an `Assets` bootstrap. Those layouts create an improper hybrid UPM package.
 - Keep engine code in `Aexis*` namespaces. `AIImage` is an application/example namespace and must not appear in Runtime.
 - Keep multiple Runtime asmdefs only for real boundaries: `Aexis`, `Aexis.Async`, `Aexis.Onnx`, `Aexis.Ncnn`, and `Aexis.Execution`. Editor and tests have their own asmdefs.
 - Default release editor: Unity `6000.2.7f2`, executable `C:\Program Files\Unity 6000.2.7f2\Editor\Unity.exe`. The current project remains on this version for normal development and default release validation.
@@ -35,12 +37,13 @@ Follow this skill for every Aexis package release change.
 
 ## Required checks
 
-1. Scan `Packages/com.aexis/Runtime` for forbidden dependencies and paths.
+1. Scan `Packages/individual.jiahua-zhang.aexis/Runtime` for forbidden dependencies and paths.
 2. Run `dotnet build AIImage.sln -v minimal -m:1`.
 3. Compile and perform the default release smoke test with Unity `6000.2.7f2` in the current project. Do not change the current project's editor version for this check.
 4. When a release claim covers the full range, validate `2022.3.9f1`, `2023.2.20f1c1`, and `6000.3.2f1` only in separate empty projects or copied projects located outside the current project directory. Each isolated validation project must use its own `ProjectVersion.txt`, `Library`, `Temp`, and generated project files; it must not modify the current project.
-5. In every isolated validation project, validate both a `file:` package reference and the exported `.unitypackage`; compile first with only the package, then after importing AIImage Main2 Application Example and running its installer.
-6. Update `README.md`, `Documentation~`, and `Documents/Aexis-Engine-Integration-Manual.md` when public APIs, package layout, sample paths, or model payload change.
+5. In every isolated validation project, install the package through a `file:` dependency, compile with only the package, then import AIImage Main2 Application Example through Package Manager and run its installer. Do not export or import a `.unitypackage` as part of UPM release validation.
+6. Before upload, run `Aexis/Validation/Validate UPM Publishing Layout`, then run the official Asset Store UPM Validator. Upload only through the official **UPM Packages** workflow; do not use the legacy Asset Store Tools **Local UPM Package** workflow because it produces a hybrid `.unitypackage` submission.
+7. Update `README.md`, `Documentation~`, `Documents/Aexis-Engine-Integration-Manual.md`, and `Documents/AssetStore/UPM-Publishing.md` when public APIs, package identity, package layout, sample paths, model payload, or the Store workflow changes.
 
 ## Graphics-backed validation
 

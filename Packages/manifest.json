@@ -1,6 +1,7 @@
 {
   "dependencies": {
-    "com.aexis": "file:com.aexis",
+    "individual.jiahua-zhang.aexis": "file:individual.jiahua-zhang.aexis",
+    "com.unity.upm-publishing-tools": "0.3.3",
     "com.unity.collab-proxy": "2.10.2",
     "com.unity.ide.visualstudio": "2.0.25",
     "com.unity.test-framework": "1.6.0",
@@ -41,7 +42,7 @@
     "com.unity.modules.xr": "1.0.0"
   },
   "testables": [
-    "com.aexis"
+    "individual.jiahua-zhang.aexis"
   ],
   "scopedRegistries": [
     {

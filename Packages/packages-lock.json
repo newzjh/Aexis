@@ -1,27 +1,5 @@
 {
   "dependencies": {
-    "com.aexis": {
-      "version": "file:com.aexis",
-      "depth": 0,
-      "source": "embedded",
-      "dependencies": {
-        "com.unity.modules.imageconversion": "1.0.0",
-        "com.unity.modules.ui": "1.0.0",
-        "com.unity.modules.uielements": "1.0.0",
-        "com.unity.modules.unitywebrequest": "1.0.0",
-        "com.unity.modules.unitywebrequesttexture": "1.0.0",
-        "com.unity.ugui": "1.0.0",
-        "com.unity.test-framework": "1.1.33"
-      }
-    },
-    "com.unity.asset-store-tools": {
-      "version": "file:com.unity.asset-store-tools",
-      "depth": 0,
-      "source": "embedded",
-      "dependencies": {
-        "com.unity.nuget.newtonsoft-json": "3.2.1"
-      }
-    },
     "com.unity.collab-proxy": {
       "version": "2.10.2",
       "depth": 0,
@@ -49,6 +27,13 @@
       "depth": 0,
       "source": "embedded",
       "dependencies": {}
+    },
+    "com.unity.sharp-zip-lib": {
+      "version": "1.4.1",
+      "depth": 1,
+      "source": "registry",
+      "dependencies": {},
+      "url": "https://packages.unity.com"
     },
     "com.unity.test-framework": {
       "version": "1.6.0",
@@ -81,6 +66,16 @@
         "com.unity.modules.imgui": "1.0.0"
       }
     },
+    "com.unity.upm-publishing-tools": {
+      "version": "0.3.3",
+      "depth": 0,
+      "source": "registry",
+      "dependencies": {
+        "com.unity.sharp-zip-lib": "1.4.1",
+        "com.unity.nuget.newtonsoft-json": "3.2.1"
+      },
+      "url": "https://packages.unity.com"
+    },
     "com.unity.visualscripting": {
       "version": "1.9.9",
       "depth": 0,
@@ -90,6 +85,20 @@
         "com.unity.modules.jsonserialize": "1.0.0"
       },
       "url": "https://packages.unity.com"
+    },
+    "individual.jiahua-zhang.aexis": {
+      "version": "file:individual.jiahua-zhang.aexis",
+      "depth": 0,
+      "source": "embedded",
+      "dependencies": {
+        "com.unity.modules.imageconversion": "1.0.0",
+        "com.unity.modules.ui": "1.0.0",
+        "com.unity.modules.uielements": "1.0.0",
+        "com.unity.modules.unitywebrequest": "1.0.0",
+        "com.unity.modules.unitywebrequesttexture": "1.0.0",
+        "com.unity.ugui": "1.0.0",
+        "com.unity.test-framework": "1.1.33"
+      }
     },
     "com.unity.modules.accessibility": {
       "version": "1.0.0",
