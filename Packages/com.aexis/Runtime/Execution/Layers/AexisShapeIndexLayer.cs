@@ -279,7 +279,8 @@ namespace Aexis.Execution
             AexisGraphModel.Layer layer,
             AexisLayerCommandBufferContext context,
             string bottomName,
-            List<ComputeTexture> temps)
+            List<ComputeTexture> temps,
+            string plannedResourceName = null)
         {
             var src = AexisGraphSession.GetCmdTensor(context.blobs, bottomName);
             var shape = AexisGraphSession.GetCmdShape(context.shapes, context.blobs, bottomName);
@@ -297,7 +298,9 @@ namespace Aexis.Execution
             }
 
             var linearStorage = AexisGraphSession.ResolveLinearMatStorageShape(shape);
-            var linear = owner.RentTempMat(cmd, linearStorage.w, linearStorage.h, AexisGraphSession.ResolveLinearMatTextureFormat());
+            var linear = string.IsNullOrWhiteSpace(plannedResourceName)
+                ? owner.RentTempMat(cmd, linearStorage.w, linearStorage.h, AexisGraphSession.ResolveLinearMatTextureFormat())
+                : owner.RentTempMat(cmd, linearStorage.w, linearStorage.h, AexisGraphSession.ResolveLinearMatTextureFormat(), plannedResourceName);
             owner.Ops.ReshapePack4ToLinearMat(cmd, src.texture, shape.w, shape.h, shape.d, shape.c, shape.dims, linear);
             temps?.Add(linear);
             return new CmdLinearInput(linear, shape, linearStorage);
@@ -331,11 +334,14 @@ namespace Aexis.Execution
             AexisGraphModel.Layer layer,
             AexisLayerCommandBufferContext context,
             AexisGraphSession.BufferShape logicalShape,
-            Action<ComputeTexture, AexisGraphSession.BufferShape> fill)
+            Action<ComputeTexture, AexisGraphSession.BufferShape> fill,
+            string plannedResourceName = null)
         {
             RequireTops(layer, 1);
             var storage = AexisGraphSession.ResolveLinearMatStorageShape(logicalShape);
-            var output = owner.RentTempMat(context.commandBuffer, storage.w, storage.h, AexisGraphSession.ResolveLinearMatTextureFormat());
+            var output = string.IsNullOrWhiteSpace(plannedResourceName)
+                ? owner.RentTempMat(context.commandBuffer, storage.w, storage.h, AexisGraphSession.ResolveLinearMatTextureFormat())
+                : owner.RentTempMat(context.commandBuffer, storage.w, storage.h, AexisGraphSession.ResolveLinearMatTextureFormat(), plannedResourceName);
             try
             {
                 fill(output, storage);
@@ -781,12 +787,19 @@ namespace Aexis.Execution
             var temps = new List<ComputeTexture>();
             try
             {
-                var cond = AexisShapeIndexLayerUtil.GetCmdLinearInput(owner, context.commandBuffer, layer, context, layer.bottomNames[0], temps);
-                var a = AexisShapeIndexLayerUtil.GetCmdLinearInput(owner, context.commandBuffer, layer, context, layer.bottomNames[1], temps);
-                var b = AexisShapeIndexLayerUtil.GetCmdLinearInput(owner, context.commandBuffer, layer, context, layer.bottomNames[2], temps);
+                var cond = AexisShapeIndexLayerUtil.GetCmdLinearInput(
+                    owner, context.commandBuffer, layer, context, layer.bottomNames[0], temps,
+                    AexisGraphSession.GetStrictPack4ScratchIdentity(layer, "where-linear-input-0"));
+                var a = AexisShapeIndexLayerUtil.GetCmdLinearInput(
+                    owner, context.commandBuffer, layer, context, layer.bottomNames[1], temps,
+                    AexisGraphSession.GetStrictPack4ScratchIdentity(layer, "where-linear-input-1"));
+                var b = AexisShapeIndexLayerUtil.GetCmdLinearInput(
+                    owner, context.commandBuffer, layer, context, layer.bottomNames[2], temps,
+                    AexisGraphSession.GetStrictPack4ScratchIdentity(layer, "where-linear-input-2"));
                 var outShape = AexisShapeIndexLayerUtil.BroadcastShapes(cond.logicalShape, a.logicalShape, b.logicalShape);
                 AexisShapeIndexLayerUtil.PublishCmdLinear(owner, layer, context, outShape, (output, storage) =>
-                    owner.Ops.AexisWhereLinearMat(context.commandBuffer, cond.texture, cond.logicalShape, cond.storageShape, a.texture, a.logicalShape, a.storageShape, b.texture, b.logicalShape, b.storageShape, outShape, storage, output));
+                    owner.Ops.AexisWhereLinearMat(context.commandBuffer, cond.texture, cond.logicalShape, cond.storageShape, a.texture, a.logicalShape, a.storageShape, b.texture, b.logicalShape, b.storageShape, outShape, storage, output),
+                    layer.topNames[0]);
             }
             finally
             {

@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
@@ -10,10 +10,15 @@ namespace Aexis.Execution
     // Migration note: avoid expanding the legacy compute-buffer path; prefer pack4 RT execution, and plan for ComputeTexture command-buffer pack4 RT for async compute and temporary RT allocation support.
     public sealed class AexisUnaryOpLayer : AexisBaseLayer
     {
+        // [TTS-DIAG] tail unary 输出 staging（debug）。
+        private static RenderTexture s_tailUnaryRt;
+        public static RenderTexture GetTailUnaryRt() => s_tailUnaryRt;
         public AexisUnaryOpLayer() : base(AexisLayerTypes.UnaryOp, supportsBufferPath: true, supportsCommandBufferPath: true) { }
 
         public override void ExecuteBuffer(AexisGraphSession owner, AexisGraphModel.Layer layer, AexisLayerBufferContext context)
         {
+            if (layer.name.Contains("/dec/LeakyRelu_5"))
+                UnityEngine.Debug.Log($"[TTS-DIAG] UNARY-ENTRY ExecuteBuffer {layer.name} bottom={layer.bottomNames[0]}");
             if (!owner.ShouldForceCurrentLayerBufferPath()
                 && AexisGraphSession.TryGetExistingTexture(context.textureBlobs, context.textureShapes, layer.bottomNames[0], out var srcTex, out var srcShape)
                 && ((!AexisGraphSession.IsStrictLinearMatTexture(srcTex) && srcShape.dims <= 4)
@@ -98,6 +103,9 @@ namespace Aexis.Execution
                         var remaining = context.remaining;
                         var pinnedNames = context.pinnedNames;
 
+                        // [TTS-DIAG] 全局 unary dispatch 日志（验证 LeakyRelu 是否全丢弃）
+                        if (AexisGraphSession.s_ttsVerbose) UnityEngine.Debug.Log($"[TTS-UNARY] dispatch {layer.name} bottom={layer.bottomNames[0]} top={layer.topNames[0]}");
+
                         do
                         {
                                                 var src = AexisGraphSession.GetCmdTensor(blobs, layer.bottomNames[0]);
@@ -117,6 +125,25 @@ namespace Aexis.Execution
                                                     var outArr = owner.RentTempArray(cmd, src.width, src.height, outputDepth, AexisGraphSession.ResolveTensorTextureFormat(srcShape.dims));
                                                     owner.Ops.UnaryOpPack4(cmd, src.texture, outputDepth, opType, outArr, srcShape.dims >= 3 ? srcShape.c : 0);
                                                     blobs[layer.topNames[0]] = AexisGraphSession.CreateCmdTensorRef(outArr, srcShape, storageShape, owned: true, blobName: layer.topNames[0]);
+                                                    // [TTS-DIAG] tail unary LeakyReLU staging + 输入 nameID 日志
+                                                    if (src.width >= 16000)
+                                                    {
+                                                        if (AexisGraphSession.s_ttsVerbose) UnityEngine.Debug.Log($"[TTS-DIAG] UNARY {layer.name} top={layer.topNames[0]} bottom={layer.bottomNames[0]}({src.texture.nameID}) op={opType} outW={outArr.width} outD={outArr.depth}");
+                                                        try
+                                                        {
+                                                            if (s_tailUnaryRt == null || s_tailUnaryRt.width != outArr.width || s_tailUnaryRt.volumeDepth != outArr.depth)
+                                                            {
+                                                                if (s_tailUnaryRt != null) { s_tailUnaryRt.Release(); UnityEngine.Object.DestroyImmediate(s_tailUnaryRt); }
+                                                                var udd = new RenderTextureDescriptor(outArr.width, outArr.height, outArr.format, 0)
+                                                                { dimension = TextureDimension.Tex2DArray, volumeDepth = outArr.depth, enableRandomWrite = true, msaaSamples = 1 };
+                                                                s_tailUnaryRt = new RenderTexture(udd) { filterMode = FilterMode.Point, wrapMode = TextureWrapMode.Clamp };
+                                                                s_tailUnaryRt.Create();
+                                                            }
+                                                            for (int sl = 0; sl < outArr.depth; sl++)
+                                                                cmd.CopyTexture(outArr.nameID, sl, 0, s_tailUnaryRt, sl, 0);
+                                                        }
+                                                        catch (System.Exception udx) { UnityEngine.Debug.Log($"[TTS-DIAG] unary staging fail {layer.name}: {udx.Message}"); }
+                                                    }
                                                 }
                                                 if (shapes != null)
                                                     shapes[layer.topNames[0]] = srcShape;

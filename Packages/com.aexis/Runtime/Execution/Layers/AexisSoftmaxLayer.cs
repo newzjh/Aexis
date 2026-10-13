@@ -64,9 +64,9 @@ namespace Aexis.Execution
             var softBuf = softTensor?.buffer;
             if (softBuf != null)
             {
-                var axis = layer.GetInt(0, 0);
-                if (axis < 0)
-                    axis += softTensor.dims;
+                var softShape = new AexisGraphSession.BufferShape(softTensor.dims, softTensor.w, softTensor.h, softTensor.d, softTensor.c);
+                if (!AexisGraphSession.TryResolveSoftmaxNcnnAxis(layer, softShape, out var axis))
+                    throw new InvalidOperationException("Softmax buffer path axis is outside the descriptor-backed input rank: " + layer.name);
                 var outTensor = owner.RentTempTensorBuffer(
                     softTensor.dims,
                     softTensor.w,
@@ -164,6 +164,43 @@ namespace Aexis.Execution
                 return;
             }
 
+            if (AexisGraphSession.TryGetExistingTexture(textureBlobs, textureShapes, layer.bottomNames[0], out var flatSrcTex, out var flatSrcShape)
+                && flatSrcShape.dims >= 3
+                && AexisGraphSession.IsStrictLinearMatTexture(flatSrcTex))
+            {
+                if (!TryResolvePack4SoftmaxWidthAxis(layer, flatSrcShape, out var flatAxis))
+                    throw new NotSupportedException("Softmax axis is outside the flattened LinearMat rank: " + layer.name);
+
+                var flatStorage = AexisGraphSession.GetTextureStorageShape(flatSrcTex, flatSrcShape);
+                var flatPacks = Mathf.Max(1, Mathf.CeilToInt(flatSrcShape.c / 4f));
+                var flatDepth = flatSrcShape.dims == 4 ? Mathf.Max(1, flatSrcShape.d) : 1;
+                var flatInput = owner.RentTempArray(flatSrcShape.w, flatSrcShape.h, flatDepth * flatPacks,
+                    AexisGraphSession.ResolveTensorTextureFormat(flatSrcShape.dims));
+                try
+                {
+                    owner.Ops.ReshapeLinearMatToPack4(
+                        flatSrcTex.texture,
+                        flatStorage.w,
+                        flatStorage.h,
+                        flatSrcShape.w,
+                        flatSrcShape.h,
+                        flatSrcShape.d,
+                        flatSrcShape.c,
+                        flatSrcShape.dims,
+                        flatInput);
+                    var outFlat = owner.RentTempArray(flatSrcShape.w, flatSrcShape.h, flatDepth * flatPacks,
+                        AexisGraphSession.ResolveTensorTextureFormat(flatSrcShape.dims));
+                    owner.Ops.SoftmaxPack4Cdhw(flatInput, flatSrcShape.w, flatSrcShape.h, flatSrcShape.d, flatSrcShape.c, outFlat, flatAxis, layer.GetInt(10, 0));
+                    AexisGraphSession.SetTextureBlob(textureBlobs, textureShapes, layer.topNames[0], outFlat, flatSrcShape, flatSrcShape);
+                }
+                finally
+                {
+                    owner.ReturnTempArray(flatInput);
+                }
+                owner.Consume(textureBlobs, context.bufferBlobs, context.bufferRefs, context.bufferViews, context.remaining, layer.bottomNames, context.pinnedNames);
+                return;
+            }
+
             if (!owner.TryGetPack4Texture(layer.bottomNames[0], textureBlobs, textureShapes, bufferBlobs, bufferViews, out var srcTex, out var srcShape)
                 || !CanUsePack4Softmax(srcTex, srcShape))
             {
@@ -208,6 +245,62 @@ namespace Aexis.Execution
                 blobs[layer.topNames[0]] = AexisGraphSession.CreateCmdTensorRef(outPack4Linear, srcShape, storageShape, owned: true);
                 if (shapes != null)
                     shapes[layer.topNames[0]] = srcShape;
+                owner.ConsumeCmd(cmd, blobs, remaining, layer.bottomNames, pinnedNames, shapes);
+                return;
+            }
+
+            // A rank-3/rank-4 activation can reach Softmax as a flattened
+            // LinearMat texture (the broadcast select that masks attention
+            // scores emits exactly that layout). Materialize the Pack4 mapping
+            // from the linear storage, then normalize with the Pack4 kernel.
+            if (srcShape.dims >= 3 && AexisGraphSession.IsStrictLinearMatTexture(src))
+            {
+                if (!TryResolvePack4SoftmaxWidthAxis(layer, srcShape, out var flatAxis))
+                    throw new NotSupportedException("Softmax axis is outside the flattened LinearMat rank: " + layer.name);
+
+                var flatStorage = AexisGraphSession.GetCmdStorageShape(src, srcShape);
+                var flatPacks = Mathf.Max(1, Mathf.CeilToInt(srcShape.c / 4f));
+                var flatDepth = srcShape.dims == 4 ? Mathf.Max(1, srcShape.d) : 1;
+                var flatInput = owner.RentTempArray(cmd, srcShape.w, srcShape.h, flatDepth * flatPacks,
+                    AexisGraphSession.ResolveTensorTextureFormat(srcShape.dims),
+                    AexisGraphSession.GetStrictPack4ScratchIdentity(layer, "softmax-flattened-pack4-input"));
+                try
+                {
+                    owner.Ops.ReshapeLinearMatToPack4(
+                        cmd,
+                        src.texture,
+                        flatStorage.w,
+                        flatStorage.h,
+                        srcShape.w,
+                        srcShape.h,
+                        srcShape.d,
+                        srcShape.c,
+                        srcShape.dims,
+                        flatInput);
+                    var outFlat = owner.RentTempArray(cmd, srcShape.w, srcShape.h, flatDepth * flatPacks,
+                        AexisGraphSession.ResolveTensorTextureFormat(srcShape.dims),
+                        layer.topNames[0]);
+                    owner.Ops.SoftmaxPack4Cdhw(cmd, flatInput, srcShape.w, srcShape.h, srcShape.d, srcShape.c, outFlat, flatAxis, layer.GetInt(10, 0));
+                    blobs[layer.topNames[0]] = new AexisGraphSession.CmdTensorRef
+                    {
+                        texture = outFlat,
+                        width = srcShape.w,
+                        height = srcShape.h,
+                        packs = flatPacks,
+                        refs = 1,
+                        owned = true,
+                        hasLogicalShape = true,
+                        logicalShape = srcShape,
+                        hasStorageShape = true,
+                        storageShape = srcShape
+                    };
+                    if (shapes != null)
+                        shapes[layer.topNames[0]] = srcShape;
+                }
+                finally
+                {
+                    owner.ReturnTempArray(cmd, flatInput);
+                }
                 owner.ConsumeCmd(cmd, blobs, remaining, layer.bottomNames, pinnedNames, shapes);
                 return;
             }
@@ -330,15 +423,7 @@ namespace Aexis.Execution
             tensorAxis = -1;
             if (layer == null)
                 return false;
-
-            var axis = layer.GetInt(0, 0);
-            if (axis < 0)
-                axis += srcShape.dims;
-            if (axis < 0 || axis >= srcShape.dims)
-                return false;
-
-            tensorAxis = AexisGraphSession.MapNcnnAxisToTensorAxis(srcShape.dims, axis);
-            return tensorAxis >= 0 && tensorAxis < srcShape.dims;
+            return AexisGraphSession.TryResolveSoftmaxTensorAxis(layer, srcShape, out tensorAxis);
         }
 
         private static bool TryResolveContiguousSoftmax2D(AexisTensorBuffer tensor, int axis, out int rows, out int cols)

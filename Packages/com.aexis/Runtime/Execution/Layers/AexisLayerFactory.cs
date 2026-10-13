@@ -1205,12 +1205,23 @@ namespace Aexis.Execution
                 };
 
                 var runtimeProfile = BeginLayerRuntimeProfile("cmd");
+                bool profOn = AexisGraphSession.s_profileLayers;
+                var profCatMs = profOn ? AexisGraphSession.s_profCategoryMs : null;
+                var profCatCnt = profOn ? AexisGraphSession.s_profCategoryCount : null;
+                var profLayers = profOn ? AexisGraphSession.s_profLayerDetails : null;
                 for (var li = 0; li < Model.layers.Count; li++)
                 {
                     var layer = Model.layers[li];
                     var layerRepro = LayerRepros[li];
                     if (layerRepro == null)
                         throw new InvalidOperationException("layer repro missing: " + layer?.name);
+                    string profCat = null;
+                    System.Diagnostics.Stopwatch profSw = null;
+                    if (profOn)
+                    {
+                        profCat = CategorizeLayer(layer?.type.ToString() ?? "", layer?.name ?? "");
+                        profSw = System.Diagnostics.Stopwatch.StartNew();
+                    }
                     if (runtimeProfile == null)
                     {
                         SetCurrentExecutingLayer(layer);
@@ -1224,11 +1235,20 @@ namespace Aexis.Execution
                             ResetInt8ActivationQuantization();
                             ClearCurrentExecutingLayer();
                         }
+                        SnapshotCmdOutputIfTarget(cmd, layer, blobs);
                         if (DebugLog != null && (DebugLogAllLayerOutputs || HasStrideBlob(layer?.topNames)))
                         {
                             DebugLog("[LayerOutput] idx=" + li
                                 + " | name=" + (layer?.name ?? string.Empty)
                                 + " | path=" + DescribeCmdLayerOutputPath(layer, blobs, shapes));
+                        }
+                        if (profOn && profSw != null)
+                        {
+                            profSw.Stop();
+                            double ms = profSw.Elapsed.TotalMilliseconds;
+                            lock (profCatMs) { profCatMs[profCat] = profCatMs.TryGetValue(profCat, out var v) ? v + ms : ms; profCatCnt[profCat] = (profCatCnt.TryGetValue(profCat, out var c) ? c : 0) + 1; }
+                            var outTex = GetCmdTensor(blobs, layer.topNames[0]);
+                            lock (profLayers) { profLayers.Add(new AexisGraphSession.ProfLayerEntry { idx = li, cat = profCat, name = layer.name, type = layer.type.ToString() ?? "", ms = ms, outW = outTex.width, outH = outTex.height, outPacks = outTex.packs }); }
                         }
                         continue;
                     }
@@ -1253,6 +1273,14 @@ namespace Aexis.Execution
                     }
                     layerSw.Stop();
                     RecordLayerRuntime(runtimeProfile, li, layer, "cmd", layerSw.ElapsedTicks);
+                    if (profOn && profSw != null)
+                    {
+                        profSw.Stop();
+                        double ms = profSw.Elapsed.TotalMilliseconds;
+                        lock (profCatMs) { profCatMs[profCat] = profCatMs.TryGetValue(profCat, out var v) ? v + ms : ms; profCatCnt[profCat] = (profCatCnt.TryGetValue(profCat, out var c) ? c : 0) + 1; }
+                        var outTex = GetCmdTensor(blobs, layer.topNames[0]);
+                        lock (profLayers) { profLayers.Add(new ProfLayerEntry { idx = li, cat = profCat, name = layer.name, type = layer.type.ToString() ?? "", ms = ms, outW = outTex.width, outH = outTex.height, outPacks = outTex.packs }); }
+                    }
                 }
 
                 FinishLayerRuntimeProfile(runtimeProfile);
@@ -1374,12 +1402,23 @@ namespace Aexis.Execution
                 };
 
                 var runtimeProfile = BeginLayerRuntimeProfile("cmd");
+                bool profOn = AexisGraphSession.s_profileLayers;
+                var profCatMs = profOn ? AexisGraphSession.s_profCategoryMs : null;
+                var profCatCnt = profOn ? AexisGraphSession.s_profCategoryCount : null;
+                var profLayers = profOn ? AexisGraphSession.s_profLayerDetails : null;
                 for (var li = 0; li < Model.layers.Count; li++)
                 {
                     var layer = Model.layers[li];
                     var layerRepro = LayerRepros[li];
                     if (layerRepro == null)
                         throw new InvalidOperationException("layer repro missing: " + layer?.name);
+                    string profCat = null;
+                    System.Diagnostics.Stopwatch profSw = null;
+                    if (profOn)
+                    {
+                        profCat = CategorizeLayer(layer?.type.ToString() ?? "", layer?.name ?? "");
+                        profSw = System.Diagnostics.Stopwatch.StartNew();
+                    }
                     if (runtimeProfile == null)
                     {
                         SetCurrentExecutingLayer(layer);
@@ -1393,6 +1432,7 @@ namespace Aexis.Execution
                             ResetInt8ActivationQuantization();
                             ClearCurrentExecutingLayer();
                         }
+                        SnapshotCmdOutputIfTarget(cmd, layer, blobs);
                         if (DebugLog != null && (DebugLogAllLayerOutputs || HasStrideBlob(layer?.topNames)))
                         {
                             DebugLog("[LayerOutput] idx=" + li
@@ -1414,6 +1454,7 @@ namespace Aexis.Execution
                             ResetInt8ActivationQuantization();
                             ClearCurrentExecutingLayer();
                         }
+                        SnapshotCmdOutputIfTarget(cmd, layer, blobs);
                         if (DebugLog != null && (DebugLogAllLayerOutputs || HasStrideBlob(layer?.topNames)))
                         {
                             DebugLog("[LayerOutput] idx=" + li
@@ -1422,6 +1463,15 @@ namespace Aexis.Execution
                         }
                         layerSw.Stop();
                         RecordLayerRuntime(runtimeProfile, li, layer, "cmd", layerSw.ElapsedTicks);
+                    }
+
+                    if (profOn && profSw != null)
+                    {
+                        profSw.Stop();
+                        double ms = profSw.Elapsed.TotalMilliseconds;
+                        lock (profCatMs) { profCatMs[profCat] = profCatMs.TryGetValue(profCat, out var v) ? v + ms : ms; profCatCnt[profCat] = (profCatCnt.TryGetValue(profCat, out var c) ? c : 0) + 1; }
+                        var outTex = GetCmdTensor(blobs, layer.topNames[0]);
+                        lock (profLayers) { profLayers.Add(new AexisGraphSession.ProfLayerEntry { idx = li, cat = profCat, name = layer.name, type = layer.type.ToString() ?? "", ms = ms, outW = outTex.width, outH = outTex.height, outPacks = outTex.packs }); }
                     }
 
                     if (!string.IsNullOrWhiteSpace(stopAfterTopName)

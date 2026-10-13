@@ -1,5 +1,8 @@
 // Auto-generated kernel implementation group: AexisKernels.Pack4Conv.hlsl
 
+float4 AexisApplyFusedConvPRelu(float4 value, int outputPack);
+float AexisReadRawConvWeight(int index, int outputChannel);
+
 float4 AexisReadConvWeight4(int index)
 {
     if (_UseFp16ConvWeights == 0)
@@ -18,12 +21,51 @@ float4 AexisReadConvWeight4(int index)
 // model execution never relies on a temporary ComputeBuffer.
 float4 AexisReadPack4ConvWeight4(int index)
 {
+    if (_UseInt8ConvPack4Weights != 0)
+    {
+        uint packed = _ConvW4Int8Packed[index];
+        uint x = packed & 0xffu;
+        uint y = (packed >> 8) & 0xffu;
+        uint z = (packed >> 16) & 0xffu;
+        uint w = packed >> 24;
+        return float4(
+            x >= 128u ? (int)x - 256 : (int)x,
+            y >= 128u ? (int)y - 256 : (int)y,
+            z >= 128u ? (int)z - 256 : (int)z,
+            w >= 128u ? (int)w - 256 : (int)w) * _Int8ConvPack4WeightScale;
+    }
     if (_UseGfpganDynWeights == 0)
-        return _ConvW4[index];
+        return AexisReadConvWeight4(index);
 
     int x = index % _GfpganDynamicConvW4Width;
     int y = index / _GfpganDynamicConvW4Width;
     return _GfpganDynamicConvW4Tex[int3(x, y, 0)];
+}
+
+// The generic Pack4 kernel can vectorize regular convolutions while reading
+// the canonical scalar OIHW INT8 upload. This is intentionally separate from
+// the compact O4I4K SRV so 5x5 validation does not depend on a second weight
+// layout. It also preserves incomplete input packs, such as SESR's RGB head.
+float4 AexisReadGenericConvWeight4(
+    int packedIndex,
+    int outputChannel,
+    int inputChannelBase,
+    int kernelIndex,
+    int kernelArea)
+{
+    if (_UseInt8ConvWeights == 0)
+        return AexisReadPack4ConvWeight4(packedIndex);
+
+    float4 value = 0.0;
+    if (inputChannelBase + 0 < _InC)
+        value.x = AexisReadRawConvWeight((outputChannel * _InC + inputChannelBase + 0) * kernelArea + kernelIndex, outputChannel);
+    if (inputChannelBase + 1 < _InC)
+        value.y = AexisReadRawConvWeight((outputChannel * _InC + inputChannelBase + 1) * kernelArea + kernelIndex, outputChannel);
+    if (inputChannelBase + 2 < _InC)
+        value.z = AexisReadRawConvWeight((outputChannel * _InC + inputChannelBase + 2) * kernelArea + kernelIndex, outputChannel);
+    if (inputChannelBase + 3 < _InC)
+        value.w = AexisReadRawConvWeight((outputChannel * _InC + inputChannelBase + 3) * kernelArea + kernelIndex, outputChannel);
+    return value;
 }
 
 float4 AexisReadDepthWiseConvWeight4(int index)
@@ -74,7 +116,41 @@ float AexisReadRawConvWeight(int index, int outputChannel)
         return AexisReadPackedConvInt4(index) * _ConvWInt4Scales[outputChannel];
     if (_UseInt8ConvWeights == 0)
         return _ConvW[index];
-    return AexisReadPackedConvInt8(index) * _ConvWInt8Scales[outputChannel];
+    float scale = _UseInt8ConvWeightUniformScale != 0
+        ? _Int8ConvWeightUniformScale
+        : _ConvWInt8Scales[outputChannel];
+    return AexisReadPackedConvInt8(index) * scale;
+}
+
+float4 AexisReadRawConvWeight4(int outputChannelBase, int inputChannelBase, int kernelIndex)
+{
+    int kernelArea = 25;
+    float4 result = 0.0;
+    if (inputChannelBase + 0 < _InC)
+    {
+        result.x = AexisReadRawConvWeight(
+            ((outputChannelBase * _InC + inputChannelBase + 0) * kernelArea) + kernelIndex,
+            outputChannelBase);
+    }
+    if (inputChannelBase + 1 < _InC)
+    {
+        result.y = AexisReadRawConvWeight(
+            ((outputChannelBase * _InC + inputChannelBase + 1) * kernelArea) + kernelIndex,
+            outputChannelBase);
+    }
+    if (inputChannelBase + 2 < _InC)
+    {
+        result.z = AexisReadRawConvWeight(
+            ((outputChannelBase * _InC + inputChannelBase + 2) * kernelArea) + kernelIndex,
+            outputChannelBase);
+    }
+    if (inputChannelBase + 3 < _InC)
+    {
+        result.w = AexisReadRawConvWeight(
+            ((outputChannelBase * _InC + inputChannelBase + 3) * kernelArea) + kernelIndex,
+            outputChannelBase);
+    }
+    return result;
 }
 
 float AexisQuantizeActivationForInt8(float value)
@@ -86,6 +162,24 @@ float AexisQuantizeActivationForInt8(float value)
     return (float)(quantized - _Int8ActivationZeroPoint) * _Int8ActivationScale;
 }
 
+// Matches numpy.pad(mode="reflect") for the two-stage SESR tiling contract:
+// trailing-edge padding to a whole core grid followed by the context border.
+int AexisReflectIndex(int index, int extent)
+{
+    int n = max(1, extent);
+    if (n == 1) return 0;
+    int period = 2 * n - 2;
+    int folded = index % period;
+    if (folded < 0) folded += period;
+    return folded < n ? folded : period - folded;
+}
+
+int AexisResolveTiledReflectIndex(int index, int originalExtent, int paddedExtent)
+{
+    int padded = AexisReflectIndex(index, max(1, paddedExtent));
+    return AexisReflectIndex(padded, max(1, originalExtent));
+}
+
 void AexisPackRgbToPack4_Impl(uint3 id)
 {
     uint w, h, d;
@@ -93,14 +187,21 @@ void AexisPackRgbToPack4_Impl(uint3 id)
     if (id.x >= w || id.y >= h) return;
     uint tw, th;
     _AexisIn.GetDimensions(tw, th);
-    int sx = (int) (id.x + _OffsetX) * _ScaleX;
-    int sy = (int) (id.y + _OffsetY) * _ScaleY;
-    sx = clamp(sx, 0, (int)tw - 1);
-    sy = clamp(sy, 0, (int)th - 1);
+    // Convert the unsigned dispatch coordinates before applying a negative
+    // reflect offset.  Casting after the uint+int expression underflows at the
+    // left/top context border on D3D11.
+    int sx = (int)(((int)id.x + _OffsetX) * _ScaleX);
+    int sy = (int)(((int)id.y + _OffsetY) * _ScaleY);
+    sx = _InputReflectPad != 0
+        ? AexisResolveTiledReflectIndex(sx, (int)tw, _InputPaddedWidth)
+        : clamp(sx, 0, (int)tw - 1);
+    sy = _InputReflectPad != 0
+        ? AexisResolveTiledReflectIndex(sy, (int)th, _InputPaddedHeight)
+        : clamp(sy, 0, (int)th - 1);
     if (_FlipY != 0)
         sy = (int)th - 1 - sy;
     float4 v = _AexisIn[int2(sx, sy)];
-    v.xyz *= _InputValueScale;
+    v.xyz = v.xyz * _InputValueScale + _InputValueBias;
     _AexisOutArr[int3((int)id.x, (int)id.y, 0)] = float4(v.x, v.y, v.z, 0.0);
 }
 
@@ -113,25 +214,35 @@ void AexisPackRgbToNhwcPack4_Impl(uint3 id)
     uint tw, th;
     _AexisIn.GetDimensions(tw, th);
     int rgbChannel = (int)id.x;
-    int sx = (int)((id.y + _OffsetX) * _ScaleX);
-    sx = clamp(sx, 0, (int)tw - 1);
+    // `id.y` is uint. Cast before the negative SESR context offset so the
+    // NHWC reference pack and the direct NCHW pack sample identical reflected
+    // pixels at the left image border.
+    int sx = (int)(((int)id.y + _OffsetX) * _ScaleX);
+    sx = _InputReflectPad != 0
+        ? AexisResolveTiledReflectIndex(sx, (int)tw, _InputPaddedWidth)
+        : clamp(sx, 0, (int)tw - 1);
 
     float4 o = 0.0;
     [unroll]
     for (int lane = 0; lane < 4; lane++)
     {
         int logicalY = (int)id.z * 4 + lane;
-        if (logicalY >= (int)th)
-            continue;
-
+        // `logicalY` addresses the Pack4 *destination* tensor, which can be
+        // taller than the source when SESR adds reflect context.  Do not clip
+        // it against `th` (the unpadded source height): that previously left
+        // the lower reflect border uninitialised in whole-frame inference.
+        // The destination array bounds `id.z`; any storage-only tail lanes are
+        // outside the tensor shape and are never consumed by the convolution.
         int sy = (int)((logicalY + _OffsetY) * _ScaleY);
-        sy = clamp(sy, 0, (int)th - 1);
+        sy = _InputReflectPad != 0
+            ? AexisResolveTiledReflectIndex(sy, (int)th, _InputPaddedHeight)
+            : clamp(sy, 0, (int)th - 1);
         if (_FlipY != 0)
             sy = (int)th - 1 - sy;
 
         float4 v = _AexisIn[int2(sx, sy)];
         float value = rgbChannel == 0 ? v.x : (rgbChannel == 1 ? v.y : v.z);
-        AexisWriteLane(o, lane, value * _InputValueScale);
+        AexisWriteLane(o, lane, value * _InputValueScale + _InputValueBias);
     }
 
     _AexisOutArr[int3((int)id.x, (int)id.y, (int)id.z)] = o;
@@ -163,7 +274,7 @@ void AexisPackMaskToNhwcPack4_Impl(uint3 id)
 
         float4 v = _AexisIn[int2(sx, sy)];
         float m = max(v.x, max(v.y, v.z));
-        AexisWriteLane(o, lane, m >= _MaskThreshold ? _InputValueScale : 0.0);
+        AexisWriteLane(o, lane, m >= _MaskThreshold ? _InputValueScale + _InputValueBias : _InputValueBias);
     }
 
     _AexisOutArr[int3((int)id.x, (int)id.y, (int)id.z)] = o;
@@ -189,24 +300,24 @@ void AexisConv3x3Pack4_Impl(uint3 id, uint3 groupId, uint3 groupThreadId)
     int op1 = op + 1;
     bool hasOp1 = op1 < _OutPacks;
 
-    float4 bias0 = active ? _ConvB4[op] : 0.0;
-    float4 bias1 = hasOp1 ? _ConvB4[op1] : 0.0;
-    float4 sum00 = bias0;
-    float4 sum01 = bias0;
-    float4 sum10 = bias0;
-    float4 sum11 = bias0;
-    float4 sum20 = bias1;
-    float4 sum21 = bias1;
-    float4 sum30 = bias1;
-    float4 sum31 = bias1;
+    AEXIS_CONV_VECTOR bias0 = active ? _ConvB4[op] : 0.0;
+    AEXIS_CONV_VECTOR bias1 = hasOp1 ? _ConvB4[op1] : 0.0;
+    AEXIS_CONV_VECTOR sum00 = bias0;
+    AEXIS_CONV_VECTOR sum01 = bias0;
+    AEXIS_CONV_VECTOR sum10 = bias0;
+    AEXIS_CONV_VECTOR sum11 = bias0;
+    AEXIS_CONV_VECTOR sum20 = bias1;
+    AEXIS_CONV_VECTOR sum21 = bias1;
+    AEXIS_CONV_VECTOR sum30 = bias1;
+    AEXIS_CONV_VECTOR sum31 = bias1;
 
     uint iw, ih, idd;
     _ConvInArr.GetDimensions(iw, ih, idd);
-    int groupOx = (int)groupId.x * 16;
-    int groupOy = (int)groupId.y * 16;
+    int groupOx = (int)groupId.x * 32;
+    int groupOy = (int)groupId.y * 8;
     int groupSx = groupOx - _Pad;
     int groupSy = groupOy - _Pad;
-    int lane = (int)groupThreadId.y * 8 + (int)groupThreadId.x;
+    int lane = (int)groupThreadId.y * 16 + (int)groupThreadId.x;
     int localOx = (int)groupThreadId.x * 2;
     int localOy = (int)groupThreadId.y * 2;
 
@@ -214,13 +325,13 @@ void AexisConv3x3Pack4_Impl(uint3 id, uint3 groupId, uint3 groupThreadId)
 
     for (int ip0 = 0; ip0 < _InPacks; ip0++)
     {
-        for (int li = lane; li < 18 * 18; li += 64)
+        for (int li = lane; li < 34 * 10; li += 64)
         {
-            int tx = li % 18;
-            int ty = li / 18;
+            int tx = li % 34;
+            int ty = li / 34;
             int sx = groupSx + tx;
             int sy = groupSy + ty;
-            float4 v = 0.0;
+            AEXIS_CONV_VECTOR v = 0.0;
             if (sx >= 0 && sy >= 0 && sx < (int)iw && sy < (int)ih)
                 v = _ConvInArr[int3(sx, sy, ip0)];
             _ConvTile[li] = v;
@@ -240,17 +351,17 @@ void AexisConv3x3Pack4_Impl(uint3 id, uint3 groupId, uint3 groupThreadId)
             [unroll]
             for (int kx = 0; kx < 3; kx++)
             {
-                float4 v00 = _ConvTile[(localOy + ky) * 18 + (localOx + kx)];
-                float4 v01 = _ConvTile[(localOy + ky) * 18 + (localOx + kx + 1)];
-                float4 v10 = _ConvTile[(localOy + ky + 1) * 18 + (localOx + kx)];
-                float4 v11 = _ConvTile[(localOy + ky + 1) * 18 + (localOx + kx + 1)];
+                AEXIS_CONV_VECTOR v00 = _ConvTile[(localOy + ky) * 34 + (localOx + kx)];
+                AEXIS_CONV_VECTOR v01 = _ConvTile[(localOy + ky) * 34 + (localOx + kx + 1)];
+                AEXIS_CONV_VECTOR v10 = _ConvTile[(localOy + ky + 1) * 34 + (localOx + kx)];
+                AEXIS_CONV_VECTOR v11 = _ConvTile[(localOy + ky + 1) * 34 + (localOx + kx + 1)];
 
                 int k = ky * 3 + kx;
                 int wbase = k * 4;
-                float4 w00 = _ConvWeight0[wbase + 0];
-                float4 w01 = _ConvWeight0[wbase + 1];
-                float4 w02 = _ConvWeight0[wbase + 2];
-                float4 w03 = _ConvWeight0[wbase + 3];
+                AEXIS_CONV_VECTOR w00 = _ConvWeight0[wbase + 0];
+                AEXIS_CONV_VECTOR w01 = _ConvWeight0[wbase + 1];
+                AEXIS_CONV_VECTOR w02 = _ConvWeight0[wbase + 2];
+                AEXIS_CONV_VECTOR w03 = _ConvWeight0[wbase + 3];
 
                 sum00.x += dot(v00, w00);
                 sum00.y += dot(v00, w01);
@@ -274,10 +385,10 @@ void AexisConv3x3Pack4_Impl(uint3 id, uint3 groupId, uint3 groupThreadId)
 
                 if (hasOp1)
                 {
-                    float4 w10 = _ConvWeight1[wbase + 0];
-                    float4 w11 = _ConvWeight1[wbase + 1];
-                    float4 w12 = _ConvWeight1[wbase + 2];
-                    float4 w13 = _ConvWeight1[wbase + 3];
+                    AEXIS_CONV_VECTOR w10 = _ConvWeight1[wbase + 0];
+                    AEXIS_CONV_VECTOR w11 = _ConvWeight1[wbase + 1];
+                    AEXIS_CONV_VECTOR w12 = _ConvWeight1[wbase + 2];
+                    AEXIS_CONV_VECTOR w13 = _ConvWeight1[wbase + 3];
 
                     sum20.x += dot(v00, w10);
                     sum20.y += dot(v00, w11);
@@ -309,12 +420,20 @@ void AexisConv3x3Pack4_Impl(uint3 id, uint3 groupId, uint3 groupThreadId)
     sum01 = AexisApplyActivation(sum01);
     sum10 = AexisApplyActivation(sum10);
     sum11 = AexisApplyActivation(sum11);
+    sum00 = AexisApplyFusedConvPRelu(sum00, op);
+    sum01 = AexisApplyFusedConvPRelu(sum01, op);
+    sum10 = AexisApplyFusedConvPRelu(sum10, op);
+    sum11 = AexisApplyFusedConvPRelu(sum11, op);
     if (hasOp1)
     {
         sum20 = AexisApplyActivation(sum20);
         sum21 = AexisApplyActivation(sum21);
         sum30 = AexisApplyActivation(sum30);
         sum31 = AexisApplyActivation(sum31);
+        sum20 = AexisApplyFusedConvPRelu(sum20, op1);
+        sum21 = AexisApplyFusedConvPRelu(sum21, op1);
+        sum30 = AexisApplyFusedConvPRelu(sum30, op1);
+        sum31 = AexisApplyFusedConvPRelu(sum31, op1);
     }
 
     if (active)
@@ -331,6 +450,248 @@ void AexisConv3x3Pack4_Impl(uint3 id, uint3 groupId, uint3 groupThreadId)
             if (ox + 1 < (int)ow && oy + 1 < (int)oh) _ConvOutArr[int3(ox + 1, oy + 1, op1)] = sum31;
         }
     }
+}
+
+// Fixed 5x5 Pack4 path for the SESR head/tail convolution contract.  General
+// convolution cannot share these assumptions (full packs, square stride-1,
+// symmetric pad-2), so it remains below as the conservative fallback.
+void AexisConv5x5Pack4_Impl(uint3 id, uint3 groupId, uint3 groupThreadId)
+{
+    uint ow, oh, od;
+    _ConvOutArr.GetDimensions(ow, oh, od);
+    int ox = (int)id.x * 2;
+    int oy = (int)id.y * 2;
+    int op = (int)id.z * 2;
+    bool active = ox < (int)ow && oy < (int)oh && op >= 0 && op < _OutPacks;
+    int op1 = op + 1;
+    bool hasOp1 = op1 < _OutPacks;
+
+    AEXIS_CONV_VECTOR bias0 = active ? _ConvB4[op] : 0.0;
+    AEXIS_CONV_VECTOR bias1 = hasOp1 ? _ConvB4[op1] : 0.0;
+    AEXIS_CONV_VECTOR sum00 = bias0;
+    AEXIS_CONV_VECTOR sum01 = bias0;
+    AEXIS_CONV_VECTOR sum10 = bias0;
+    AEXIS_CONV_VECTOR sum11 = bias0;
+    AEXIS_CONV_VECTOR sum20 = bias1;
+    AEXIS_CONV_VECTOR sum21 = bias1;
+    AEXIS_CONV_VECTOR sum30 = bias1;
+    AEXIS_CONV_VECTOR sum31 = bias1;
+
+    uint iw, ih, idd;
+    _ConvInArr.GetDimensions(iw, ih, idd);
+    int groupOx = (int)groupId.x * 32;
+    int groupOy = (int)groupId.y * 8;
+    int groupSx = groupOx - _Pad;
+    int groupSy = groupOy - _Pad;
+    int lane = (int)groupThreadId.y * 16 + (int)groupThreadId.x;
+    int localOx = (int)groupThreadId.x * 2;
+    int localOy = (int)groupThreadId.y * 2;
+    bool hasOp0 = op >= 0 && op < _OutPacks;
+
+    for (int ip0 = 0; ip0 < _InPacks; ip0++)
+    {
+        for (int li = lane; li < 36 * 12; li += 64)
+        {
+            int tx = li % 36;
+            int ty = li / 36;
+            int sx = groupSx + tx;
+            int sy = groupSy + ty;
+            AEXIS_CONV_VECTOR v = 0.0;
+            if (sx >= 0 && sy >= 0 && sx < (int)iw && sy < (int)ih)
+            {
+                v = _ConvInArr[int3(sx, sy, ip0)];
+            }
+            _Conv5Tile[li] = v;
+        }
+
+        for (int wi = lane; wi < 25 * 4; wi += 64)
+        {
+            _Conv5Weight0[wi] = hasOp0 ? AexisReadPack4ConvWeight4(((op * _InPacks + ip0) * 25) * 4 + wi) : 0.0;
+            _Conv5Weight1[wi] = hasOp1 ? AexisReadPack4ConvWeight4(((op1 * _InPacks + ip0) * 25) * 4 + wi) : 0.0;
+        }
+
+        GroupMemoryBarrierWithGroupSync();
+
+        [unroll]
+        for (int ky = 0; ky < 5; ky++)
+        {
+            [unroll]
+            for (int kx = 0; kx < 5; kx++)
+            {
+                AEXIS_CONV_VECTOR v00 = _Conv5Tile[(localOy + ky) * 36 + (localOx + kx)];
+                AEXIS_CONV_VECTOR v01 = _Conv5Tile[(localOy + ky) * 36 + (localOx + kx + 1)];
+                AEXIS_CONV_VECTOR v10 = _Conv5Tile[(localOy + ky + 1) * 36 + (localOx + kx)];
+                AEXIS_CONV_VECTOR v11 = _Conv5Tile[(localOy + ky + 1) * 36 + (localOx + kx + 1)];
+
+                int wbase = (ky * 5 + kx) * 4;
+                AEXIS_CONV_VECTOR w00 = _Conv5Weight0[wbase + 0];
+                AEXIS_CONV_VECTOR w01 = _Conv5Weight0[wbase + 1];
+                AEXIS_CONV_VECTOR w02 = _Conv5Weight0[wbase + 2];
+                AEXIS_CONV_VECTOR w03 = _Conv5Weight0[wbase + 3];
+                sum00.x += dot(v00, w00); sum00.y += dot(v00, w01); sum00.z += dot(v00, w02); sum00.w += dot(v00, w03);
+                sum01.x += dot(v01, w00); sum01.y += dot(v01, w01); sum01.z += dot(v01, w02); sum01.w += dot(v01, w03);
+                sum10.x += dot(v10, w00); sum10.y += dot(v10, w01); sum10.z += dot(v10, w02); sum10.w += dot(v10, w03);
+                sum11.x += dot(v11, w00); sum11.y += dot(v11, w01); sum11.z += dot(v11, w02); sum11.w += dot(v11, w03);
+
+                if (hasOp1)
+                {
+                    AEXIS_CONV_VECTOR w10 = _Conv5Weight1[wbase + 0];
+                    AEXIS_CONV_VECTOR w11 = _Conv5Weight1[wbase + 1];
+                    AEXIS_CONV_VECTOR w12 = _Conv5Weight1[wbase + 2];
+                    AEXIS_CONV_VECTOR w13 = _Conv5Weight1[wbase + 3];
+                    sum20.x += dot(v00, w10); sum20.y += dot(v00, w11); sum20.z += dot(v00, w12); sum20.w += dot(v00, w13);
+                    sum21.x += dot(v01, w10); sum21.y += dot(v01, w11); sum21.z += dot(v01, w12); sum21.w += dot(v01, w13);
+                    sum30.x += dot(v10, w10); sum30.y += dot(v10, w11); sum30.z += dot(v10, w12); sum30.w += dot(v10, w13);
+                    sum31.x += dot(v11, w10); sum31.y += dot(v11, w11); sum31.z += dot(v11, w12); sum31.w += dot(v11, w13);
+                }
+            }
+        }
+
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    sum00 = AexisApplyActivation(sum00); sum01 = AexisApplyActivation(sum01);
+    sum10 = AexisApplyActivation(sum10); sum11 = AexisApplyActivation(sum11);
+    sum00 = AexisApplyFusedConvPRelu(sum00, op); sum01 = AexisApplyFusedConvPRelu(sum01, op);
+    sum10 = AexisApplyFusedConvPRelu(sum10, op); sum11 = AexisApplyFusedConvPRelu(sum11, op);
+    if (hasOp1)
+    {
+        sum20 = AexisApplyActivation(sum20); sum21 = AexisApplyActivation(sum21);
+        sum30 = AexisApplyActivation(sum30); sum31 = AexisApplyActivation(sum31);
+        sum20 = AexisApplyFusedConvPRelu(sum20, op1); sum21 = AexisApplyFusedConvPRelu(sum21, op1);
+        sum30 = AexisApplyFusedConvPRelu(sum30, op1); sum31 = AexisApplyFusedConvPRelu(sum31, op1);
+    }
+
+    if (!active) return;
+    _ConvOutArr[int3(ox, oy, op)] = sum00;
+    if (ox + 1 < (int)ow) _ConvOutArr[int3(ox + 1, oy, op)] = sum01;
+    if (oy + 1 < (int)oh) _ConvOutArr[int3(ox, oy + 1, op)] = sum10;
+    if (ox + 1 < (int)ow && oy + 1 < (int)oh) _ConvOutArr[int3(ox + 1, oy + 1, op)] = sum11;
+    if (!hasOp1) return;
+    _ConvOutArr[int3(ox, oy, op1)] = sum20;
+    if (ox + 1 < (int)ow) _ConvOutArr[int3(ox + 1, oy, op1)] = sum21;
+    if (oy + 1 < (int)oh) _ConvOutArr[int3(ox, oy + 1, op1)] = sum30;
+    if (ox + 1 < (int)ow && oy + 1 < (int)oh) _ConvOutArr[int3(ox + 1, oy + 1, op1)] = sum31;
+}
+
+// Raw OIHW INT8 counterpart for SESR's 5x5 head/tail. The scalar group kernel
+// computes one pixel/output-pack per invocation and repeats every input sample
+// for four lanes. This retains its byte-weight ABI and FP32 accumulation, but
+// reuses each float4 input and vector of four channel weights across 2x2 pixels
+// and two output packs. It also masks the fourth lane of SESR's RGB input.
+void AexisConv5x5RawInt8Pack4_Impl(uint3 id)
+{
+    uint ow, oh, od;
+    _ConvOutArr.GetDimensions(ow, oh, od);
+    int ox = (int)id.x * 2;
+    int oy = (int)id.y * 2;
+    int op = (int)id.z * 2;
+    if (ox >= (int)ow || oy >= (int)oh || op < 0 || op >= (int)od)
+        return;
+
+    int op1 = op + 1;
+    bool hasOp1 = op1 < (int)od;
+    bool hasX1 = ox + 1 < (int)ow;
+    bool hasY1 = oy + 1 < (int)oh;
+    float4 bias0 = float4(_ConvB[op * 4 + 0], _ConvB[op * 4 + 1], _ConvB[op * 4 + 2], _ConvB[op * 4 + 3]);
+    float4 bias1 = hasOp1
+        ? float4(_ConvB[op1 * 4 + 0], _ConvB[op1 * 4 + 1], _ConvB[op1 * 4 + 2], _ConvB[op1 * 4 + 3])
+        : 0.0;
+    float4 sum00 = bias0;
+    float4 sum01 = bias0;
+    float4 sum10 = bias0;
+    float4 sum11 = bias0;
+    float4 sum20 = bias1;
+    float4 sum21 = bias1;
+    float4 sum30 = bias1;
+    float4 sum31 = bias1;
+    int inPacks = (_InC + 3) / 4;
+
+    for (int ip = 0; ip < inPacks; ++ip)
+    {
+        int inputChannelBase = ip * 4;
+        for (int ky = 0; ky < 5; ++ky)
+        {
+            int iy0 = oy - 2 + ky;
+            int iy1 = iy0 + 1;
+            bool validY0 = iy0 >= 0 && iy0 < _InH;
+            bool validY1 = hasY1 && iy1 >= 0 && iy1 < _InH;
+            if (!validY0 && !validY1)
+                continue;
+
+            for (int kx = 0; kx < 5; ++kx)
+            {
+                int ix0 = ox - 2 + kx;
+                int ix1 = ix0 + 1;
+                bool validX0 = ix0 >= 0 && ix0 < _InW;
+                bool validX1 = hasX1 && ix1 >= 0 && ix1 < _InW;
+                if (!validX0 && !validX1)
+                    continue;
+
+                float4 v00 = (validX0 && validY0) ? _ConvInArr[int3(ix0, iy0, ip)] : 0.0;
+                float4 v01 = (validX1 && validY0) ? _ConvInArr[int3(ix1, iy0, ip)] : 0.0;
+                float4 v10 = (validX0 && validY1) ? _ConvInArr[int3(ix0, iy1, ip)] : 0.0;
+                float4 v11 = (validX1 && validY1) ? _ConvInArr[int3(ix1, iy1, ip)] : 0.0;
+                if (inputChannelBase + 3 >= _InC)
+                {
+                    if (inputChannelBase + 0 >= _InC) { v00.x = 0.0; v01.x = 0.0; v10.x = 0.0; v11.x = 0.0; }
+                    if (inputChannelBase + 1 >= _InC) { v00.y = 0.0; v01.y = 0.0; v10.y = 0.0; v11.y = 0.0; }
+                    if (inputChannelBase + 2 >= _InC) { v00.z = 0.0; v01.z = 0.0; v10.z = 0.0; v11.z = 0.0; }
+                    v00.w = 0.0; v01.w = 0.0; v10.w = 0.0; v11.w = 0.0;
+                }
+                // Keep the official QDQ graph's activation contract. Unlike the
+                // scalar group kernel this is evaluated once per source float4,
+                // then reused by all eight output channels below.
+                v00 = float4(AexisQuantizeActivationForInt8(v00.x), AexisQuantizeActivationForInt8(v00.y), AexisQuantizeActivationForInt8(v00.z), AexisQuantizeActivationForInt8(v00.w));
+                v01 = float4(AexisQuantizeActivationForInt8(v01.x), AexisQuantizeActivationForInt8(v01.y), AexisQuantizeActivationForInt8(v01.z), AexisQuantizeActivationForInt8(v01.w));
+                v10 = float4(AexisQuantizeActivationForInt8(v10.x), AexisQuantizeActivationForInt8(v10.y), AexisQuantizeActivationForInt8(v10.z), AexisQuantizeActivationForInt8(v10.w));
+                v11 = float4(AexisQuantizeActivationForInt8(v11.x), AexisQuantizeActivationForInt8(v11.y), AexisQuantizeActivationForInt8(v11.z), AexisQuantizeActivationForInt8(v11.w));
+
+                int kernelIndex = ky * 5 + kx;
+                float4 w00 = AexisReadRawConvWeight4(op * 4 + 0, inputChannelBase, kernelIndex);
+                float4 w01 = AexisReadRawConvWeight4(op * 4 + 1, inputChannelBase, kernelIndex);
+                float4 w02 = AexisReadRawConvWeight4(op * 4 + 2, inputChannelBase, kernelIndex);
+                float4 w03 = AexisReadRawConvWeight4(op * 4 + 3, inputChannelBase, kernelIndex);
+                sum00.x += dot(v00, w00); sum00.y += dot(v00, w01); sum00.z += dot(v00, w02); sum00.w += dot(v00, w03);
+                sum01.x += dot(v01, w00); sum01.y += dot(v01, w01); sum01.z += dot(v01, w02); sum01.w += dot(v01, w03);
+                sum10.x += dot(v10, w00); sum10.y += dot(v10, w01); sum10.z += dot(v10, w02); sum10.w += dot(v10, w03);
+                sum11.x += dot(v11, w00); sum11.y += dot(v11, w01); sum11.z += dot(v11, w02); sum11.w += dot(v11, w03);
+
+                if (hasOp1)
+                {
+                    float4 w10 = AexisReadRawConvWeight4(op1 * 4 + 0, inputChannelBase, kernelIndex);
+                    float4 w11 = AexisReadRawConvWeight4(op1 * 4 + 1, inputChannelBase, kernelIndex);
+                    float4 w12 = AexisReadRawConvWeight4(op1 * 4 + 2, inputChannelBase, kernelIndex);
+                    float4 w13 = AexisReadRawConvWeight4(op1 * 4 + 3, inputChannelBase, kernelIndex);
+                    sum20.x += dot(v00, w10); sum20.y += dot(v00, w11); sum20.z += dot(v00, w12); sum20.w += dot(v00, w13);
+                    sum21.x += dot(v01, w10); sum21.y += dot(v01, w11); sum21.z += dot(v01, w12); sum21.w += dot(v01, w13);
+                    sum30.x += dot(v10, w10); sum30.y += dot(v10, w11); sum30.z += dot(v10, w12); sum30.w += dot(v10, w13);
+                    sum31.x += dot(v11, w10); sum31.y += dot(v11, w11); sum31.z += dot(v11, w12); sum31.w += dot(v11, w13);
+                }
+            }
+        }
+    }
+
+    sum00 = AexisApplyActivation(sum00);
+    if (hasX1) sum01 = AexisApplyActivation(sum01);
+    if (hasY1) sum10 = AexisApplyActivation(sum10);
+    if (hasX1 && hasY1) sum11 = AexisApplyActivation(sum11);
+    _ConvOutArr[int3(ox, oy, op)] = sum00;
+    if (hasX1) _ConvOutArr[int3(ox + 1, oy, op)] = sum01;
+    if (hasY1) _ConvOutArr[int3(ox, oy + 1, op)] = sum10;
+    if (hasX1 && hasY1) _ConvOutArr[int3(ox + 1, oy + 1, op)] = sum11;
+
+    if (!hasOp1)
+        return;
+
+    sum20 = AexisApplyActivation(sum20);
+    if (hasX1) sum21 = AexisApplyActivation(sum21);
+    if (hasY1) sum30 = AexisApplyActivation(sum30);
+    if (hasX1 && hasY1) sum31 = AexisApplyActivation(sum31);
+    _ConvOutArr[int3(ox, oy, op1)] = sum20;
+    if (hasX1) _ConvOutArr[int3(ox + 1, oy, op1)] = sum21;
+    if (hasY1) _ConvOutArr[int3(ox, oy + 1, op1)] = sum30;
+    if (hasX1 && hasY1) _ConvOutArr[int3(ox + 1, oy + 1, op1)] = sum31;
 }
 
 void AexisConvPack4General_Impl(uint3 id)
@@ -361,6 +722,7 @@ void AexisConvPack4General_Impl(uint3 id)
 
     for (int ip0 = 0; ip0 < _InPacks; ip0++)
     {
+        int inputChannelBase = ip0 * 4;
         int weightBase0 = ((op * _InPacks + ip0) * kernelArea) * 4;
         int weightBase1 = ((op1 * _InPacks + ip0) * kernelArea) * 4;
 
@@ -389,10 +751,23 @@ void AexisConvPack4General_Impl(uint3 id)
 
                 int kernelIndex = ky * _KernelWVar + kx;
                 int baseIndex0 = weightBase0 + kernelIndex * 4;
-                float4 w00 = AexisReadConvWeight4(baseIndex0 + 0);
-                float4 w01 = AexisReadConvWeight4(baseIndex0 + 1);
-                float4 w02 = AexisReadConvWeight4(baseIndex0 + 2);
-                float4 w03 = AexisReadConvWeight4(baseIndex0 + 3);
+                // Keep the ordinary floating point path on its established
+                // compact O4I4K reader.  The raw-INT8 expansion has a different
+                // channel ABI and must be selected only by an INT8 dispatch.
+                // Routing normal FP16/FP32 5x5 SESR layers through that helper
+                // made their head/tail tensors collapse to zero on D3D11.
+                float4 w00 = _UseInt8ConvWeights != 0
+                    ? AexisReadGenericConvWeight4(baseIndex0 + 0, op * 4 + 0, inputChannelBase, kernelIndex, kernelArea)
+                    : AexisReadConvWeight4(baseIndex0 + 0);
+                float4 w01 = _UseInt8ConvWeights != 0
+                    ? AexisReadGenericConvWeight4(baseIndex0 + 1, op * 4 + 1, inputChannelBase, kernelIndex, kernelArea)
+                    : AexisReadConvWeight4(baseIndex0 + 1);
+                float4 w02 = _UseInt8ConvWeights != 0
+                    ? AexisReadGenericConvWeight4(baseIndex0 + 2, op * 4 + 2, inputChannelBase, kernelIndex, kernelArea)
+                    : AexisReadConvWeight4(baseIndex0 + 2);
+                float4 w03 = _UseInt8ConvWeights != 0
+                    ? AexisReadGenericConvWeight4(baseIndex0 + 3, op * 4 + 3, inputChannelBase, kernelIndex, kernelArea)
+                    : AexisReadConvWeight4(baseIndex0 + 3);
                 sum00.x += dot(v00, w00);
                 sum00.y += dot(v00, w01);
                 sum00.z += dot(v00, w02);
@@ -413,10 +788,18 @@ void AexisConvPack4General_Impl(uint3 id)
                 if (hasOp1)
                 {
                     int baseIndex1 = weightBase1 + kernelIndex * 4;
-                    float4 w10 = AexisReadConvWeight4(baseIndex1 + 0);
-                    float4 w11 = AexisReadConvWeight4(baseIndex1 + 1);
-                    float4 w12 = AexisReadConvWeight4(baseIndex1 + 2);
-                    float4 w13 = AexisReadConvWeight4(baseIndex1 + 3);
+                    float4 w10 = _UseInt8ConvWeights != 0
+                        ? AexisReadGenericConvWeight4(baseIndex1 + 0, op1 * 4 + 0, inputChannelBase, kernelIndex, kernelArea)
+                        : AexisReadConvWeight4(baseIndex1 + 0);
+                    float4 w11 = _UseInt8ConvWeights != 0
+                        ? AexisReadGenericConvWeight4(baseIndex1 + 1, op1 * 4 + 1, inputChannelBase, kernelIndex, kernelArea)
+                        : AexisReadConvWeight4(baseIndex1 + 1);
+                    float4 w12 = _UseInt8ConvWeights != 0
+                        ? AexisReadGenericConvWeight4(baseIndex1 + 2, op1 * 4 + 2, inputChannelBase, kernelIndex, kernelArea)
+                        : AexisReadConvWeight4(baseIndex1 + 2);
+                    float4 w13 = _UseInt8ConvWeights != 0
+                        ? AexisReadGenericConvWeight4(baseIndex1 + 3, op1 * 4 + 3, inputChannelBase, kernelIndex, kernelArea)
+                        : AexisReadConvWeight4(baseIndex1 + 3);
                     sum20.x += dot(v00, w10);
                     sum20.y += dot(v00, w11);
                     sum20.z += dot(v00, w12);
@@ -470,6 +853,183 @@ void AexisConvPack4General_Impl(uint3 id)
     if (hasX1 && hasY1) _ConvOutArr[int3(ox + 1, oy + 1, op1)] = sum31;
 }
 
+// Flat 1-output-per-thread variant of the general Pack4 convolution. One thread
+// computes exactly one output texel (one spatial pixel x, one channel pack). It
+// intentionally drops the 2x2 output tile: for narrow 1-row vocoder stages the
+// tiled kernel launches an 8x8 workgroup whose y-dimension threads immediately
+// bail (height==1), wasting ~7/8 of slots across all 12 SMs. Numerically this
+// mirrors only the sum00 path of AexisConvPack4General_Impl for (ox,oy,op), so
+// results are identical to the tiled kernel for the same output coordinate.
+void AexisConvPack4GeneralFlat_Impl(int ox, int oy, int op)
+{
+    uint ow, oh, od;
+    _ConvOutArr.GetDimensions(ow, oh, od);
+    if (ox < 0 || ox >= (int)ow || oy < 0 || oy >= (int)oh || op < 0 || op >= _OutPacks)
+        return;
+
+    int kernelArea = _KernelWVar * _KernelHVar;
+    float4 sum = _ConvB4[op];
+
+    for (int ip0 = 0; ip0 < _InPacks; ip0++)
+    {
+        int inputChannelBase = ip0 * 4;
+        int weightBase0 = ((op * _InPacks + ip0) * kernelArea) * 4;
+
+        for (int ky = 0; ky < _KernelHVar; ky++)
+        {
+            int iy0 = oy * _StrideHVar - _PadTopVar + ky * _DilationHVar;
+            bool validY0 = iy0 >= 0 && iy0 < _InH;
+            if (!validY0)
+                continue;
+
+            for (int kx = 0; kx < _KernelWVar; kx++)
+            {
+                int ix0 = ox * _StrideWVar - _PadLeftVar + kx * _DilationWVar;
+                bool validX0 = ix0 >= 0 && ix0 < _InW;
+                if (!validX0)
+                    continue;
+
+                float4 v00 = _ConvInArr[int3(ix0, iy0, ip0)];
+
+                int kernelIndex = ky * _KernelWVar + kx;
+                int baseIndex0 = weightBase0 + kernelIndex * 4;
+                float4 w00 = _UseInt8ConvWeights != 0
+                    ? AexisReadGenericConvWeight4(baseIndex0 + 0, op * 4 + 0, inputChannelBase, kernelIndex, kernelArea)
+                    : AexisReadConvWeight4(baseIndex0 + 0);
+                float4 w01 = _UseInt8ConvWeights != 0
+                    ? AexisReadGenericConvWeight4(baseIndex0 + 1, op * 4 + 1, inputChannelBase, kernelIndex, kernelArea)
+                    : AexisReadConvWeight4(baseIndex0 + 1);
+                float4 w02 = _UseInt8ConvWeights != 0
+                    ? AexisReadGenericConvWeight4(baseIndex0 + 2, op * 4 + 2, inputChannelBase, kernelIndex, kernelArea)
+                    : AexisReadConvWeight4(baseIndex0 + 2);
+                float4 w03 = _UseInt8ConvWeights != 0
+                    ? AexisReadGenericConvWeight4(baseIndex0 + 3, op * 4 + 3, inputChannelBase, kernelIndex, kernelArea)
+                    : AexisReadConvWeight4(baseIndex0 + 3);
+                sum.x += dot(v00, w00);
+                sum.y += dot(v00, w01);
+                sum.z += dot(v00, w02);
+                sum.w += dot(v00, w03);
+            }
+        }
+    }
+
+    sum = AexisApplyActivation(sum);
+    sum = AexisMaskConvOutputTail(sum, op);
+    _ConvOutArr[int3(ox, oy, op)] = sum;
+}
+
+// 1D register-tiled conv: each thread computes TILE_X=4 output pixels along x,
+// caching input texels in registers to reuse across adjacent outputs. This raises
+// arithmetic intensity from ~0.25 to ~0.66 FLOP/byte for narrow 1-row vocoder stages.
+// Only valid for logical height==1 (oy==0), stride==1, dilationH==1.
+#define AEXIS_TILE_X 4
+float4 AexisReadTileXConvInput(int ix, int ip0)
+{
+    if (ix < 0 || ix >= _InW) return 0.0;
+    return _InTileW > 0
+        ? _ConvInArr[int3(ix % _InTileW, ix / _InTileW, ip0)]
+        : _ConvInArr[int3(ix, 0, ip0)];
+}
+
+void AexisConvPack4GeneralTileX_Impl(int ox, int oy, int op)
+{
+    uint ow, oh, od;
+    _ConvOutArr.GetDimensions(ow, oh, od);
+    int logicalOutW = _OutTileW > 0 ? _OutW : (int)ow;
+    if (ox >= logicalOutW || op < 0 || op >= _OutPacks) return;
+
+    int kernelW = _KernelWVar;
+    int kernelH = _KernelHVar;
+    int padLeft = _PadLeftVar;
+
+    // Accumulators for TILE_X output pixels
+    float4 sum0 = _ConvB4[op];
+    float4 sum1 = _ConvB4[op];
+    float4 sum2 = _ConvB4[op];
+    float4 sum3 = _ConvB4[op];
+
+    // Input cache: up to TILE_X + kernelW - 1 values
+    float4 inCache[16];
+
+    for (int ip0 = 0; ip0 < _InPacks; ip0++)
+    {
+        // output[ox + t] uses input[ox + t - padLeft + kx * dilationW]
+        int inStart = ox - padLeft;
+        if (_DilationWVar == 1)
+        {
+            int cacheCount = AEXIS_TILE_X + kernelW - 1;
+            for (int c = 0; c < cacheCount; c++)
+                inCache[c] = AexisReadTileXConvInput(inStart + c, ip0);
+        }
+
+        // Compute dot products
+        int weightBase = ((op * _InPacks + ip0) * kernelW) * 4;
+        for (int kx = 0; kx < kernelW; kx++)
+        {
+            int wBase = weightBase + kx * 4;
+            float4 w00 = _UseInt8ConvWeights != 0
+                ? AexisReadGenericConvWeight4(wBase + 0, op * 4 + 0, ip0 * 4, kx, kernelW)
+                : AexisReadConvWeight4(wBase + 0);
+            float4 w01 = _UseInt8ConvWeights != 0
+                ? AexisReadGenericConvWeight4(wBase + 1, op * 4 + 1, ip0 * 4, kx, kernelW)
+                : AexisReadConvWeight4(wBase + 1);
+            float4 w02 = _UseInt8ConvWeights != 0
+                ? AexisReadGenericConvWeight4(wBase + 2, op * 4 + 2, ip0 * 4, kx, kernelW)
+                : AexisReadConvWeight4(wBase + 2);
+            float4 w03 = _UseInt8ConvWeights != 0
+                ? AexisReadGenericConvWeight4(wBase + 3, op * 4 + 3, ip0 * 4, kx, kernelW)
+                : AexisReadConvWeight4(wBase + 3);
+
+            float4 v0, v1, v2, v3;
+            if (_DilationWVar == 1)
+            {
+                v0 = inCache[0 + kx];
+                v1 = inCache[1 + kx];
+                v2 = inCache[2 + kx];
+                v3 = inCache[3 + kx];
+            }
+            else
+            {
+                int ix = inStart + kx * _DilationWVar;
+                v0 = AexisReadTileXConvInput(ix + 0, ip0);
+                v1 = AexisReadTileXConvInput(ix + 1, ip0);
+                v2 = AexisReadTileXConvInput(ix + 2, ip0);
+                v3 = AexisReadTileXConvInput(ix + 3, ip0);
+            }
+
+            sum0.x += dot(v0, w00); sum0.y += dot(v0, w01); sum0.z += dot(v0, w02); sum0.w += dot(v0, w03);
+            sum1.x += dot(v1, w00); sum1.y += dot(v1, w01); sum1.z += dot(v1, w02); sum1.w += dot(v1, w03);
+            sum2.x += dot(v2, w00); sum2.y += dot(v2, w01); sum2.z += dot(v2, w02); sum2.w += dot(v2, w03);
+            sum3.x += dot(v3, w00); sum3.y += dot(v3, w01); sum3.z += dot(v3, w02); sum3.w += dot(v3, w03);
+        }
+    }
+
+    // Apply activation and write outputs
+    sum0 = AexisApplyActivation(sum0);
+    sum1 = AexisApplyActivation(sum1);
+    sum2 = AexisApplyActivation(sum2);
+    sum3 = AexisApplyActivation(sum3);
+    sum0 = AexisMaskConvOutputTail(sum0, op);
+    sum1 = AexisMaskConvOutputTail(sum1, op);
+    sum2 = AexisMaskConvOutputTail(sum2, op);
+    sum3 = AexisMaskConvOutputTail(sum3, op);
+
+    if (_OutTileW > 0)
+    {
+        if (ox < logicalOutW) _ConvOutArr[int3(ox % _OutTileW, ox / _OutTileW, op)] = sum0;
+        if (ox + 1 < logicalOutW) _ConvOutArr[int3((ox + 1) % _OutTileW, (ox + 1) / _OutTileW, op)] = sum1;
+        if (ox + 2 < logicalOutW) _ConvOutArr[int3((ox + 2) % _OutTileW, (ox + 2) / _OutTileW, op)] = sum2;
+        if (ox + 3 < logicalOutW) _ConvOutArr[int3((ox + 3) % _OutTileW, (ox + 3) / _OutTileW, op)] = sum3;
+    }
+    else
+    {
+        if (ox < logicalOutW) _ConvOutArr[int3(ox, 0, op)] = sum0;
+        if (ox + 1 < logicalOutW) _ConvOutArr[int3(ox + 1, 0, op)] = sum1;
+        if (ox + 2 < logicalOutW) _ConvOutArr[int3(ox + 2, 0, op)] = sum2;
+        if (ox + 3 < logicalOutW) _ConvOutArr[int3(ox + 3, 0, op)] = sum3;
+    }
+}
+
 void AexisDeconvolutionPack4General_Impl(uint3 id)
 {
     uint ow, oh, od;
@@ -519,6 +1079,83 @@ void AexisDeconvolutionPack4General_Impl(uint3 id)
 
     sum = AexisApplyActivation(sum);
     _ConvOutArr[int3((int)id.x, (int)id.y, op)] = sum;
+}
+
+// Wide deconv tiling: each thread computes TILE_X=8 output pixels along x.
+// The point of this kernel over the 8x8 3D default is the 1D dispatch: for the
+// height==1 vocoder stages the 3D kernel leaves 7/8 of its y-threads idle.
+// Input texels are read straight from _ConvInArr (the texture cache handles the
+// reuse); an earlier register cache was capped at 4 entries, which silently
+// dropped taps for stride=2/kernel=8 stages where 6 distinct inputs feed a tile.
+#define AEXIS_DECONV_TILE_X 8
+void AexisDeconvolutionPack4GeneralTileX_Impl(int baseOx, int oy, int op)
+{
+    uint ow, oh, od;
+    _ConvOutArr.GetDimensions(ow, oh, od);
+    int logicalOutW = _OutTileW > 0 ? _OutW : (int)ow;
+    if (baseOx >= logicalOutW || op < 0 || op >= _OutPacks) return;
+
+    int kernelW = _KernelWVar;
+    int strideW = _StrideWVar;
+    int padLeft = _PadLeftVar;
+
+    // Accumulators for TILE_X output pixels
+    float4 sums[AEXIS_DECONV_TILE_X];
+    for (int t = 0; t < AEXIS_DECONV_TILE_X; t++)
+        sums[t] = _ConvB4[op];
+
+    for (int ip0 = 0; ip0 < _InPacks; ip0++)
+    {
+        int weightBase = ((op * _InPacks + ip0) * kernelW) * 4;
+        // Share each tap's weights across the output pixels in this tile. The
+        // kx loop remains in ascending order for every sums[t] accumulator.
+        for (int kx = 0; kx < kernelW; kx++)
+        {
+            int baseIndex = weightBase + kx * 4;
+            float4 w0 = AexisReadConvWeight4(baseIndex + 0);
+            float4 w1 = AexisReadConvWeight4(baseIndex + 1);
+            float4 w2 = AexisReadConvWeight4(baseIndex + 2);
+            float4 w3 = AexisReadConvWeight4(baseIndex + 3);
+            for (int t = 0; t < AEXIS_DECONV_TILE_X; t++)
+            {
+                int ox = baseOx + t;
+                int borderedX = ox + padLeft;
+                int ixNumerator = borderedX - kx;
+                if (ixNumerator < 0) continue;
+                if ((ixNumerator % strideW) != 0) continue;
+                int ix = ixNumerator / strideW;
+                if (ix >= _InW) continue;
+
+                float4 inV = _InTileW > 0
+                    ? _ConvInArr[int3(ix % _InTileW, ix / _InTileW, ip0)]
+                    : _ConvInArr[int3(ix, oy, ip0)];
+                sums[t].x += dot(inV, w0);
+                sums[t].y += dot(inV, w1);
+                sums[t].z += dot(inV, w2);
+                sums[t].w += dot(inV, w3);
+            }
+        }
+    }
+
+    // Apply activation and write outputs
+    // 2D layout: when _OutTileW > 0, write to (ox % _OutTileW, ox / _OutTileW) instead of (ox, oy)
+    // This allows outputs wider than maxTextureSize (16384) by wrapping into multiple rows.
+    for (int t = 0; t < AEXIS_DECONV_TILE_X; t++)
+    {
+        int ox = baseOx + t;
+        if (ox >= logicalOutW) break;
+        sums[t] = AexisApplyActivation(sums[t]);
+        if (_OutTileW > 0)
+        {
+            int wx = ox % _OutTileW;
+            int wy = ox / _OutTileW;
+            _ConvOutArr[int3(wx, wy, op)] = sums[t];
+        }
+        else
+        {
+            _ConvOutArr[int3(ox, oy, op)] = sums[t];
+        }
+    }
 }
 
 // General 2D Pack4 convolution uses immutable scalar ncnn weights. Activations and
@@ -796,25 +1433,25 @@ void AexisWinograd23TransformInputPack4_Impl(uint3 id)
     int sy = gy * 2 - 1;
     int cstep = _WinoInCstep;
 
-    float4 v00 = (sx + 0 >= 0 && sy + 0 >= 0 && sx + 0 < _WinoW && sy + 0 < _WinoH) ? _WinoInArr[int3(sx + 0, sy + 0, gz)] : 0.0;
-    float4 v01 = sx + 1 < _WinoW ? _WinoInArr[int3(sx + 1, sy + 0, gz)] : 0.0;
-    float4 v02 = sx + 2 < _WinoW ? _WinoInArr[int3(sx + 2, sy + 0, gz)] : 0.0;
-    float4 v03 = sx + 3 < _WinoW ? _WinoInArr[int3(sx + 3, sy + 0, gz)] : 0.0;
-
-    float4 v10 = sy + 1 < _WinoH ? _WinoInArr[int3(sx + 0, sy + 1, gz)] : 0.0;
-    float4 v11 = sy + 1 < _WinoH && sx + 1 < _WinoW ? _WinoInArr[int3(sx + 1, sy + 1, gz)] : 0.0;
-    float4 v12 = sy + 1 < _WinoH && sx + 2 < _WinoW ? _WinoInArr[int3(sx + 2, sy + 1, gz)] : 0.0;
-    float4 v13 = sy + 1 < _WinoH && sx + 3 < _WinoW ? _WinoInArr[int3(sx + 3, sy + 1, gz)] : 0.0;
-
-    float4 v20 = sy + 2 < _WinoH ? _WinoInArr[int3(sx + 0, sy + 2, gz)] : 0.0;
-    float4 v21 = sy + 2 < _WinoH && sx + 1 < _WinoW ? _WinoInArr[int3(sx + 1, sy + 2, gz)] : 0.0;
-    float4 v22 = sy + 2 < _WinoH && sx + 2 < _WinoW ? _WinoInArr[int3(sx + 2, sy + 2, gz)] : 0.0;
-    float4 v23 = sy + 2 < _WinoH && sx + 3 < _WinoW ? _WinoInArr[int3(sx + 3, sy + 2, gz)] : 0.0;
-
-    float4 v30 = sy + 3 < _WinoH ? _WinoInArr[int3(sx + 0, sy + 3, gz)] : 0.0;
-    float4 v31 = sy + 3 < _WinoH && sx + 1 < _WinoW ? _WinoInArr[int3(sx + 1, sy + 3, gz)] : 0.0;
-    float4 v32 = sy + 3 < _WinoH && sx + 2 < _WinoW ? _WinoInArr[int3(sx + 2, sy + 3, gz)] : 0.0;
-    float4 v33 = sy + 3 < _WinoH && sx + 3 < _WinoW ? _WinoInArr[int3(sx + 3, sy + 3, gz)] : 0.0;
+    // Every coordinate must be bounds checked.  The old fast path only checked
+    // the positive edge for most samples, so the first/last tile could read a
+    // negative row/column on D3D11 and contaminate the residual branch.
+    float4 v00 = AexisWinoReadInput(sx + 0, sy + 0, gz);
+    float4 v01 = AexisWinoReadInput(sx + 1, sy + 0, gz);
+    float4 v02 = AexisWinoReadInput(sx + 2, sy + 0, gz);
+    float4 v03 = AexisWinoReadInput(sx + 3, sy + 0, gz);
+    float4 v10 = AexisWinoReadInput(sx + 0, sy + 1, gz);
+    float4 v11 = AexisWinoReadInput(sx + 1, sy + 1, gz);
+    float4 v12 = AexisWinoReadInput(sx + 2, sy + 1, gz);
+    float4 v13 = AexisWinoReadInput(sx + 3, sy + 1, gz);
+    float4 v20 = AexisWinoReadInput(sx + 0, sy + 2, gz);
+    float4 v21 = AexisWinoReadInput(sx + 1, sy + 2, gz);
+    float4 v22 = AexisWinoReadInput(sx + 2, sy + 2, gz);
+    float4 v23 = AexisWinoReadInput(sx + 3, sy + 2, gz);
+    float4 v30 = AexisWinoReadInput(sx + 0, sy + 3, gz);
+    float4 v31 = AexisWinoReadInput(sx + 1, sy + 3, gz);
+    float4 v32 = AexisWinoReadInput(sx + 2, sy + 3, gz);
+    float4 v33 = AexisWinoReadInput(sx + 3, sy + 3, gz);
 
     float4 m00 = v00 - v02;
     float4 m01 = v10 - v12;
@@ -982,6 +1619,10 @@ void AexisWinograd23TransformOutputPack4_Impl(uint3 id)
     v01 = AexisApplyActivation(v01);
     v10 = AexisApplyActivation(v10);
     v11 = AexisApplyActivation(v11);
+    v00 = AexisApplyFusedConvPRelu(v00, gz);
+    v01 = AexisApplyFusedConvPRelu(v01, gz);
+    v10 = AexisApplyFusedConvPRelu(v10, gz);
+    v11 = AexisApplyFusedConvPRelu(v11, gz);
 
     int x = gx * 2;
     int y = gy * 2;
@@ -1139,7 +1780,7 @@ void AexisPackRgbToPack4Gfpgan_Impl(uint3 id)
     if (_FlipY != 0)
         sy = (int)th - 1 - sy;
     float4 v = _AexisIn[int2(sx, sy)];
-    v.xyz *= _InputValueScale;
+    v.xyz = v.xyz * _InputValueScale + _InputValueBias;
     v.xyz = v.xyz * 2.0 - 1.0;
     _AexisOutArr[int3((int)id.x, (int)id.y, 0)] = float4(v.x, v.y, v.z, 0.0);
 }
@@ -1329,6 +1970,26 @@ uint AexisGfpganNoiseHash(uint value)
     value *= 0x846ca68bu;
     value ^= value >> 16;
     return value;
+}
+
+// Channel PReLU fused into the direct Pack4 3x3 convolution. The immutable
+// slope buffer is shared with the standalone PReLU kernel; keeping the math in
+// this final write step avoids a separate full-resolution feature-map pass.
+float4 AexisApplyFusedConvPRelu(float4 value, int outputPack)
+{
+    if (_ConvUsePRelu == 0)
+        return value;
+
+    int baseChannel = outputPack * 4;
+    int slopeCount = max(1, _PReluSlopePack4Count);
+    float4 slope = slopeCount == 1
+        ? _PReluSlopePack4Buf[0].xxxx
+        : float4(
+            _PReluSlopePack4Buf[clamp(baseChannel + 0, 0, slopeCount - 1)],
+            _PReluSlopePack4Buf[clamp(baseChannel + 1, 0, slopeCount - 1)],
+            _PReluSlopePack4Buf[clamp(baseChannel + 2, 0, slopeCount - 1)],
+            _PReluSlopePack4Buf[clamp(baseChannel + 3, 0, slopeCount - 1)]);
+    return max(value, 0.0) + min(value, 0.0) * slope;
 }
 
 void AexisGfpganAddNoisePack4_Impl(uint3 id)

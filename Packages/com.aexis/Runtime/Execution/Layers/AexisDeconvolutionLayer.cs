@@ -12,6 +12,10 @@ namespace Aexis.Execution
     {
         public AexisDeconvolutionLayer() : base(AexisLayerTypes.Deconvolution, supportsBufferPath: true, supportsCommandBufferPath: true) { }
 
+        // [TTS-DIAG] deconv 输出回读字典（debug 专用）。
+        private static readonly Dictionary<string, RenderTexture> s_deconvOutRt = new Dictionary<string, RenderTexture>();
+        public static IReadOnlyDictionary<string, RenderTexture> GetDeconvOutRt() => s_deconvOutRt;
+
         public override AexisGraphSession.LayerLoadMetrics LoadLayer(AexisGraphSession owner, AexisGraphModel.Layer layer, AexisWeightReader br)
         {
                         var bytesStart = br.Position;
@@ -63,7 +67,22 @@ namespace Aexis.Execution
                                                                        && pack.group == 1
                                                                        && pack.kernelW > 0
                                                                        && pack.kernelH > 0;
-                                        if (canUseGeneralTexturePack)
+                                        // 1D (kernelH==1) transposed convolutions dominate the TTS vocoder
+                                        // upsampling stages. They never satisfy the square-kernel general
+                                        // gate, and TTS sessions leave EnableGeneralTextureConvolution at
+                                        // its default false, so without this the pack4-rt path silently
+                                        // falls back to the scalar-channel Deconvolution2dGroupPack4
+                                        // kernel. Pack the O4I4K weights (identical layout for kernelH==1)
+                                        // so DeconvolutionPack4General selects the flat / register-tiled
+                                        // deconv kernels instead.
+                                        var canUseGeneral1DTexturePack = pack.group == 1
+                                                                         && pack.kernelH == 1
+                                                                         && pack.kernelW > 0
+                                                                         && (pack.inC & 3) == 0
+                                                                         && (pack.outC & 3) == 0
+                                                                         && w != null
+                                                                         && w.Length == pack.outC * pack.inC * pack.kernelW * pack.kernelH;
+                                        if (canUseGeneralTexturePack || canUseGeneral1DTexturePack)
                                         {
                                             phaseSw.Restart();
                                             var w4 = AexisGraphSession.PackWeightsToO4I4K2D(w, pack.outC, pack.inC, pack.kernelW, pack.kernelH, pack.outPacks, pack.inPacks);
@@ -230,24 +249,36 @@ namespace Aexis.Execution
             var src = AexisGraphSession.GetCmdTensor(blobs, layer.bottomNames[0]);
             if (!SupportsCommandBufferPack4(deconv, out var reason))
                 throw new InvalidOperationException(BuildCmdUnsupportedMessage(layer, src, srcShape, reason));
-            if (!MatchesCommandBufferPack4Source(src, srcShape, deconv))
+            var tiledTailInput = owner.IsVocoderTail8192TilingLayer(layer.name)
+                && MatchesCommandBufferTiledPack4Source(src, srcShape, deconv);
+            if (!tiledTailInput && !MatchesCommandBufferPack4Source(src, srcShape, deconv))
                 throw new InvalidOperationException(BuildCmdUnsupportedMessage(layer, src, srcShape, "source is not a matching Pack4 texture-array"));
 
             var outW = AexisGraphSession.ComputeDeconvOut(srcShape.w, deconv.kernelW, deconv.dilationW, deconv.strideW, deconv.padLeft, deconv.padRight, deconv.outputPadRight);
             var outH = AexisGraphSession.ComputeDeconvOut(srcShape.h, deconv.kernelH, deconv.dilationH, deconv.strideH, deconv.padTop, deconv.padBottom, deconv.outputPadBottom);
             var outShape = new AexisGraphSession.BufferShape(3, outW, outH, 1, Mathf.Max(1, deconv.outC));
+            var tileTailOutput = owner.IsVocoderTail8192TilingLayer(layer.name)
+                && outW > 8192 && outH == 1 && outW % 8192 == 0;
+            var storageShape = tileTailOutput
+                ? new AexisGraphSession.BufferShape(3, 8192, outW / 8192, 1, Mathf.Max(1, deconv.outC))
+                : outShape;
 
             ComputeTexture outArr = null;
             try
             {
-                outArr = owner.RentTempArray(cmd, outW, outH, deconv.outPacks, AexisGraphSession.ResolveTensorTextureFormat(outShape.dims));
+                if ((tileTailOutput || tiledTailInput) && (deconv.group != 1 || (deconv.outC & 3) != 0
+                    || deconv.packedWeight4 == null || deconv.packedBias4 == null
+                    || deconv.strideW < 2 || deconv.strideH != 1 || deconv.kernelH != 1))
+                    throw new InvalidOperationException(BuildCmdUnsupportedMessage(layer, src, srcShape,
+                        "tiled vocoder requires packed 1D TileX deconvolution weights"));
+                outArr = owner.RentTempArray(cmd, storageShape.w, storageShape.h, deconv.outPacks, AexisGraphSession.ResolveTensorTextureFormat(outShape.dims));
                 if (deconv.group == 1
                     && (deconv.outC & 3) == 0
                     && deconv.packedWeight4 != null
                     && deconv.packedBias4 != null)
                 {
                     owner.Ops.SetFp16ConvWeights(owner.UsesFp16WeightStorage ? deconv.packedWeight4Fp16 : null);
-                    owner.Ops.DeconvolutionPack4General(cmd, src.texture, deconv.inPacks, deconv.packedWeight4, deconv.packedBias4, deconv.outPacks, deconv.kernelW, deconv.kernelH, deconv.strideW, deconv.strideH, deconv.padLeft, deconv.padTop, deconv.dilationW, deconv.dilationH, deconv.activationType, deconv.activationSlope, outArr);
+                    owner.Ops.DeconvolutionPack4General(cmd, src.texture, deconv.inPacks, deconv.packedWeight4, deconv.packedBias4, deconv.outPacks, deconv.kernelW, deconv.kernelH, deconv.strideW, deconv.strideH, deconv.padLeft, deconv.padTop, deconv.dilationW, deconv.dilationH, deconv.activationType, deconv.activationSlope, outArr, tileTailOutput ? outW : 0, tiledTailInput ? srcShape.w : 0);
                 }
                 else
                 {
@@ -257,7 +288,8 @@ namespace Aexis.Execution
                         deconv.kernelW, deconv.kernelH, deconv.strideW, deconv.strideH, deconv.padLeft, deconv.padTop,
                         deconv.dilationW, deconv.dilationH, deconv.activationType, deconv.activationSlope, outArr);
                 }
-                blobs[layer.topNames[0]] = AexisGraphSession.CreateCmdTensorRef(outArr, outShape, outShape, owned: true);
+                // [TTS-DIAG] deconv 输出 staging 已禁用（OOM 精简）。
+                blobs[layer.topNames[0]] = AexisGraphSession.CreateCmdTensorRef(outArr, outShape, storageShape, owned: true);
                 outArr = null;
                 if (shapes != null)
                     shapes[layer.topNames[0]] = outShape;
@@ -301,6 +333,20 @@ namespace Aexis.Execution
                 && src.height == shape.h
                 && src.packs == deconv.inPacks
                 && AexisGraphSession.BufferShapeEquals(shape, AexisGraphSession.GetCmdStorageShape(src, shape));
+        }
+
+        private static bool MatchesCommandBufferTiledPack4Source(AexisGraphSession.CmdTensorRef src, AexisGraphSession.BufferShape shape, AexisGraphSession.DeconvPack deconv)
+        {
+            if (src == null || src.texture == null || src.texture.dimension != TextureDimension.Tex2DArray
+                || AexisGraphSession.IsStrictLinearMatTexture(src) || shape.dims != 3
+                || shape.d != 1 || shape.h != 1 || shape.c != deconv.inC
+                || shape.w <= 8192 || shape.w % 8192 != 0
+                || src.width != 8192 || src.height != shape.w / 8192
+                || src.packs != deconv.inPacks)
+                return false;
+            var storage = AexisGraphSession.GetCmdStorageShape(src, shape);
+            return storage.dims == 3 && storage.w == 8192
+                && storage.h == shape.w / 8192 && storage.d == 1 && storage.c == shape.c;
         }
 
         private static string BuildCmdUnsupportedMessage(AexisGraphModel.Layer layer, AexisGraphSession.CmdTensorRef src, AexisGraphSession.BufferShape logicalShape, string reason)

@@ -192,7 +192,8 @@ namespace Aexis.Execution
                     if (canUseLinearMat)
                     {
                         var storageShape = AexisGraphSession.ResolveLinearMatStorageShape(outShape);
-                        var outMat = owner.RentTempMat(cmd, storageShape.w, storageShape.h, AexisGraphSession.ResolveLinearMatTextureFormat());
+                        var outMat = owner.RentTempMat(cmd, storageShape.w, storageShape.h,
+                            AexisGraphSession.ResolveLinearMatTextureFormat(), layer.topNames[0]);
                         owner.Ops.PermuteLinearMat2D(cmd, src.texture, srcShape.w, srcShape.h, axes, outMat);
                         blobs[layer.topNames[0]] = AexisGraphSession.CreateCmdTensorRef(outMat, outShape, storageShape, owned: true);
                     }
@@ -209,7 +210,8 @@ namespace Aexis.Execution
 
                             var outPacks4D = Mathf.Max(1, Mathf.CeilToInt(outShape.c / 4f));
                             var outDepth4D = Mathf.Max(1, outShape.d) * outPacks4D;
-                            var outArr4D = owner.RentTempArray(cmd, outShape.w, outShape.h, outDepth4D, AexisGraphSession.ResolveTensorTextureFormat(outShape.dims));
+                            var outArr4D = owner.RentTempArray(cmd, outShape.w, outShape.h, outDepth4D,
+                                AexisGraphSession.ResolveTensorTextureFormat(outShape.dims), layer.topNames[0]);
                             owner.Ops.PermutePack4Cdhw(
                                 cmd,
                                 src.texture,
@@ -229,7 +231,8 @@ namespace Aexis.Execution
                         {
                             var outChannels = srcShape.dims == 2 ? 1 : outShape.c;
                             var outPacks = Mathf.Max(1, Mathf.CeilToInt(outChannels / 4f));
-                            var outArr = owner.RentTempArray(cmd, outShape.w, outShape.h, outPacks, RenderTextureFormat.ARGBHalf);
+                            var outArr = owner.RentTempArray(cmd, outShape.w, outShape.h, outPacks,
+                                RenderTextureFormat.ARGBHalf, layer.topNames[0]);
                             owner.Ops.PermutePack4(cmd, src.texture, srcShape.w, srcShape.h, srcShape.dims == 2 ? 1 : srcShape.c, axes, outShape.w, outShape.h, outChannels, outArr);
                             var storageShape = srcShape.dims == 2
                                 ? new AexisGraphSession.BufferShape(3, outShape.w, outShape.h, 1, 1)
@@ -575,7 +578,8 @@ namespace Aexis.Execution
                 return false;
 
             var outPacks = Mathf.Max(1, Mathf.CeilToInt(outShape.c / 4f));
-            var outRt = owner.RentTempArray(cmd, foldStorageShape.w, foldStorageShape.h, outPacks, AexisGraphSession.ResolveTensorTextureFormat(outShape.dims));
+            var outRt = owner.RentTempArray(cmd, foldStorageShape.w, foldStorageShape.h, outPacks,
+                AexisGraphSession.ResolveTensorTextureFormat(outShape.dims), layer.topNames[0]);
             owner.Ops.PermutePack4CdhwFoldD(
                 cmd,
                 src.texture,
@@ -621,7 +625,8 @@ namespace Aexis.Execution
 
             var outPacks = Mathf.Max(1, Mathf.CeilToInt(outShape.c / 4f));
             var outSlices = Mathf.Max(1, outShape.d) * outPacks;
-            var outRt = owner.RentTempArray(cmd, outShape.w, outShape.h, outSlices, AexisGraphSession.ResolveTensorTextureFormat(outShape.dims));
+            var outRt = owner.RentTempArray(cmd, outShape.w, outShape.h, outSlices,
+                AexisGraphSession.ResolveTensorTextureFormat(outShape.dims), layer.topNames[0]);
             owner.Ops.PermutePack4FoldDToCdhw(
                 cmd,
                 src.texture,

@@ -14,6 +14,8 @@ namespace Aexis.Execution
 
         public override void ExecuteBuffer(AexisGraphSession owner, AexisGraphModel.Layer layer, AexisLayerBufferContext context)
         {
+            if (owner.IsFusedReluLayer(layer.name))
+                return;
             if (!owner.ShouldForceCurrentLayerBufferPath()
                 && owner.TryGetPack4Texture(
                     layer.bottomNames[0],
@@ -68,6 +70,8 @@ namespace Aexis.Execution
 
         public override void ExecuteRenderTexturePath(AexisGraphSession owner, AexisGraphModel.Layer layer, AexisLayerBufferContext context)
         {
+            if (owner.IsFusedReluLayer(layer.name))
+                return;
             var textureBlobs = context.textureBlobs;
             var textureShapes = context.textureShapes;
             var bufferBlobs = context.bufferBlobs;
@@ -99,6 +103,8 @@ namespace Aexis.Execution
 
         public override void ExecuteCommandBuffer(AexisGraphSession owner, AexisGraphModel.Layer layer, AexisLayerCommandBufferContext context)
         {
+            if (owner.IsFusedReluLayer(layer.name))
+                return;
                         var cmd = context.commandBuffer;
                         var blobs = context.blobs;
                         var shapes = context.shapes;

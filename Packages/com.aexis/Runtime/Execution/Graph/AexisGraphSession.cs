@@ -24,6 +24,39 @@ namespace Aexis.Execution
 
     public partial class AexisGraphSession : IInferenceSession
     {
+        // v10 profiling infrastructure
+        public static bool s_profileLayers = false;
+        // Diagnostic counter: proves the compact FP16 weight uploads were actually built.
+        public static int s_fp16WeightBuffersCreated = 0;
+        public static readonly Dictionary<string, double> s_profCategoryMs = new Dictionary<string, double>(StringComparer.Ordinal);
+        public static readonly Dictionary<string, int> s_profCategoryCount = new Dictionary<string, int>(StringComparer.Ordinal);
+        public static readonly List<ProfLayerEntry> s_profLayerDetails = new List<ProfLayerEntry>();
+
+        public sealed class ProfLayerEntry
+        {
+            public int idx;
+            public string cat;
+            public string name;
+            public string type;
+            public double ms;
+            public int outW;
+            public int outH;
+            public int outPacks;
+        }
+
+        public static string CategorizeLayer(string typeStr, string layerName)
+        {
+            string t = typeStr ?? "";
+            if (t.Contains("Convolution") || t.Contains("Conv1D") || t.Contains("ConvDw")) return "conv";
+            if (t.Contains("Deconvolution") || t.Contains("Deconv")) return "deconv";
+            if (t.Contains("Eltwise") || t.Contains("Add") || t.Contains("Mul") || t.Contains("Sub")) return "eltwise";
+            if (t.Contains("LeakyRelu") || t.Contains("ReLU") || t.Contains("TanH") || t.Contains("Sigmoid") || t.Contains("PReLU")) return "activation";
+            if (t.Contains("MemoryData") || t.Contains("Input")) return "input";
+            if (t.Contains("Interp") || t.Contains("Upsample")) return "upsample";
+            if (t.Contains("Slice") || t.Contains("Split") || t.Contains("Concat") || t.Contains("Reshape") || t.Contains("Permute")) return "reshape";
+            return "other:" + t;
+        }
+
         [StructLayout(LayoutKind.Sequential)]
         private struct PackedFp16x4
         {
@@ -43,6 +76,25 @@ namespace Aexis.Execution
             public ComputeBuffer packedWeights;
             public ComputeBuffer scales;
         }
+
+        // AMD's SESR-M7 QDQ export quantizes each convolution with one signed
+        // INT8 scale for the entire OIHW tensor.  The existing runtime ABI has
+        // one scale slot per output channel, so the authoritative scalar is
+        // repeated rather than re-calibrating per channel.
+        private const string AmdSesrM7OfficialInt8CalibrationMethod = "AMD_OFFICIAL_SESR_M7_QDQ_PER_TENSOR_INT8";
+        private static readonly Dictionary<string, float> AmdSesrM7OfficialInt8WeightScales =
+            new Dictionary<string, float>(StringComparer.Ordinal)
+            {
+                ["/head/body_reparam/Conv"] = 0.000630975817f,
+                ["/body/body.0/body/body.0/body_reparam/Conv"] = 0.00628202828f,
+                ["/body/body.1/body/body.0/body_reparam/Conv"] = 0.0145244775f,
+                ["/body/body.2/body/body.0/body_reparam/Conv"] = 0.00769360363f,
+                ["/body/body.3/body/body.0/body_reparam/Conv"] = 0.0100862691f,
+                ["/body/body.4/body/body.0/body_reparam/Conv"] = 0.00854294375f,
+                ["/body/body.5/body/body.0/body_reparam/Conv"] = 0.0111327022f,
+                ["/body/body.6/body/body.0/body_reparam/Conv"] = 0.114732459f,
+                ["/tail/body_reparam/Conv"] = 0.0929758251f
+            };
 
         internal sealed class Int4WeightOnlyUpload
         {
@@ -307,9 +359,14 @@ namespace Aexis.Execution
             public float activationSlope;
             public bool useBufferPath;
             public bool useWinograd23;
+            // Owned by the paired PReLU pack. This is a non-owning reference so
+            // ConvPack must never dispose it.
+            public ComputeBuffer fusedPReluSlope;
+            public int fusedPReluSlopeCount;
             public bool isDepthWise;
             public ComputeBuffer packedWeight4;
             public ComputeBuffer packedWeight4Fp16;
+            public ComputeBuffer packedWeight4Int8;
             public ComputeBuffer packedBias4;
             public ComputeBuffer packedWeightTm23;
             public ComputeBuffer packedDepthWiseWeight4;
@@ -317,6 +374,12 @@ namespace Aexis.Execution
             public ComputeBuffer rawWeight;
             public ComputeBuffer rawWeightInt8Packed;
             public ComputeBuffer rawWeightInt8Scales;
+            // AMD's official SESR-M7 export uses one symmetric scale for the
+            // entire OIHW tensor. Keep that contract scalar so the packed
+            // shader does not have to infer it through the generic per-output
+            // channel ABI.
+            public bool rawWeightInt8UsesUniformScale;
+            public float rawWeightInt8UniformScale = 1f;
             public ComputeBuffer rawWeightInt4Packed;
             public ComputeBuffer rawWeightInt4Scales;
             public ComputeBuffer rawBias;
@@ -325,6 +388,7 @@ namespace Aexis.Execution
             {
                 try { AexisGpuResourceTracker.ReleaseBuffer(packedWeight4, "AexisGraphSession.ConvPack.Dispose"); packedWeight4?.Dispose(); } catch { }
                 try { AexisGpuResourceTracker.ReleaseBuffer(packedWeight4Fp16, "AexisGraphSession.ConvPack.Dispose"); packedWeight4Fp16?.Dispose(); } catch { }
+                try { AexisGpuResourceTracker.ReleaseBuffer(packedWeight4Int8, "AexisGraphSession.ConvPack.Dispose"); packedWeight4Int8?.Dispose(); } catch { }
                 try { AexisGpuResourceTracker.ReleaseBuffer(packedBias4, "AexisGraphSession.ConvPack.Dispose"); packedBias4?.Dispose(); } catch { }
                 try { AexisGpuResourceTracker.ReleaseBuffer(packedWeightTm23, "AexisGraphSession.ConvPack.Dispose"); packedWeightTm23?.Dispose(); } catch { }
                 try { AexisGpuResourceTracker.ReleaseBuffer(packedDepthWiseWeight4, "AexisGraphSession.ConvPack.Dispose"); packedDepthWiseWeight4?.Dispose(); } catch { }
@@ -1414,6 +1478,10 @@ namespace Aexis.Execution
         internal readonly Dictionary<string, InnerProductPack> _innerProduct = new Dictionary<string, InnerProductPack>(StringComparer.Ordinal);
         internal readonly Dictionary<string, GemmPack> _gemm = new Dictionary<string, GemmPack>(StringComparer.Ordinal);
         internal readonly Dictionary<string, MemoryDataPack> _memoryData = new Dictionary<string, MemoryDataPack>(StringComparer.Ordinal);
+
+        /// <summary>TTS 验证期的详细诊断日志开关（每块高频 BIND/RENT/DIAG 日志与同步读回默认关闭，
+        /// 稳定验证通过后应保持 false，避免日志 I/O 与 GPU 同步读回拖慢推理）。</summary>
+        public static bool s_ttsVerbose = false;
         internal readonly Dictionary<string, EmbedPack> _embed = new Dictionary<string, EmbedPack>(StringComparer.Ordinal);
         internal readonly Dictionary<string, LayerNormPack> _layerNorm = new Dictionary<string, LayerNormPack>(StringComparer.Ordinal);
         internal readonly Dictionary<string, GroupNormPack> _groupNorm = new Dictionary<string, GroupNormPack>(StringComparer.Ordinal);
@@ -1442,9 +1510,83 @@ namespace Aexis.Execution
 
         private readonly AexisOps _ops;
 
+        // Winograd F(2x2,3x3) is retained for future backends; current shader
+        // implementation fails visual parity on the game's D3D11 target.
+        // F(2x2,3x3) remains an opt-in research path. The transform implementation
+        // has complete edge checks and applies the same fused PReLU as the direct
+        // kernel, but on Intel Arc it measured slower than the large-tile direct
+        // shader for the game's 480x270 ESRGAN input, so production keeps it off.
         public const bool EnableWinograd23 = false;
+        // Opt-in graph rewrite for Conv -> channel PReLU pairs whose Conv is
+        // guaranteed to use the Pack4 3x3 texture kernel. It saves a full
+        // feature-map read/write and dispatch without changing model weights.
+        public bool EnableConvPReluFusion { get; set; }
+        // Opt-in graph rewrite for Conv -> ReLU pairs.  The convolution shader
+        // already applies the exact ReLU function in-register; this removes the
+        // otherwise redundant feature-map pass for small realtime SR models.
+        public bool EnableConvReluFusion { get; set; }
+        // A narrow input-boundary rewrite for exports which declare NHWC input and
+        // immediately transpose it to the NCHW Pack4 layout consumed by every
+        // convolution.  Callers can write that NCHW texture directly, removing an
+        // otherwise full-frame temporary and Permute dispatch.  The exact graph
+        // signature is validated during loading; unrelated models remain intact.
+        public bool EnableLeadingNhwcToNchwInputTransposeFusion { get; set; }
+        public bool HasFusedLeadingNhwcToNchwInputTranspose { get; private set; }
+        private readonly Dictionary<string, string> _fusedPReluSourceByLayer =
+            new Dictionary<string, string>(StringComparer.Ordinal);
+        private readonly HashSet<string> _fusedReluLayers =
+            new HashSet<string>(StringComparer.Ordinal);
         public bool PreferTexturePathForFaceDetector { get; set; }
         public bool ForceBufferConvolutionAll { get; set; }
+        // Diagnostic escape hatch for verifying scalar OIHW Pack4 kernels against
+        // the optimized Pack4 convolution families. Production models leave this
+        // disabled; it exists to isolate quantized kernel behavior.
+        public bool ForceRawGroupPack4Convolution { get; set; }
+        // Diagnostic physical tiling for the final 1D Melo vocoder block.
+        // Logical tensor shapes remain unchanged throughout the graph.
+        public bool ForceVocoderTail8192Tiling { get; set; }
+        // N128 first exceeds the 16384-pixel texture limit at ups.3. Keep this
+        // separate so N64 preserves its validated untiled preceding stage.
+        public bool ForceVocoderMid8192Tiling { get; set; }
+
+        internal bool IsVocoderTail8192TilingLayer(string layerName)
+        {
+            if (!ForceVocoderTail8192Tiling || string.IsNullOrEmpty(layerName))
+                return false;
+            return (ForceVocoderMid8192Tiling
+                    && (layerName == "/dec/ups.3/ConvTranspose"
+                        || layerName.StartsWith("/dec/resblocks.9/", StringComparison.Ordinal)
+                        || layerName.StartsWith("/dec/resblocks.10/", StringComparison.Ordinal)
+                        || layerName.StartsWith("/dec/resblocks.11/", StringComparison.Ordinal)
+                        || layerName == "/dec/Add_7"
+                        || layerName == "/dec/Add_8"
+                        || layerName == "/dec/Div_3"
+                        || layerName == "/dec/LeakyRelu_4"))
+                || layerName == "/dec/ups.4/ConvTranspose"
+                || layerName.StartsWith("/dec/resblocks.12/", StringComparison.Ordinal)
+                || layerName.StartsWith("/dec/resblocks.13/", StringComparison.Ordinal)
+                || layerName.StartsWith("/dec/resblocks.14/", StringComparison.Ordinal)
+                || layerName == "/dec/Add_9"
+                || layerName == "/dec/Add_10"
+                || layerName == "/dec/Div_4"
+                || layerName == "/dec/LeakyRelu_5"
+                || layerName == "/dec/conv_post/Conv"
+                || layerName == "tail_sq"
+                || layerName == "/dec/Tanh";
+        }
+
+        // Narrow, diagnostic forms of ForceRawGroupPack4Convolution.  They make
+        // it possible to validate the compact 3x3 body kernel independently
+        // from the general 5x5 head/tail path before either route is selected
+        // for a realtime profile.
+        public bool ForceRawGroupPack4Convolution3x3 { get; set; }
+        public bool ForceRawGroupPack4Convolution5x5 { get; set; }
+        public bool ForceRawGroupPack4ConvolutionHead5x5 { get; set; }
+        public bool ForceRawGroupPack4ConvolutionTail5x5 { get; set; }
+        // The raw OIHW INT8 5x5 block kernel is an opt-in diagnostic candidate.
+        // It remains disabled for every production model until same-input image
+        // comparisons and target-GPU timing prove it both correct and useful.
+        public bool EnableExperimentalRawInt8Pack4 { get; set; }
         public bool KeepRawConvWeightsForTexturePath { get; set; } = true;
         public bool EnableMhaParallelSoftmax { get; set; }
         public bool EnableMhaQkvFusion { get; set; }
@@ -1473,7 +1615,12 @@ namespace Aexis.Execution
         }
         public ModelManifest ModelManifest { get; private set; }
         public AexisPrecisionMode AppliedPrecisionMode { get; private set; } = AexisPrecisionMode.Auto;
-        public bool UsesFp16WeightStorage => ModelManifest?.precision?.weightDataType == TensorDataType.Float16;
+        // Manifest-less sessions (the TTS diagnostic probes) can opt into the compact
+        // FP16 weight uploads the Pack4 kernels already consume; null keeps the
+        // manifest-driven contract untouched.
+        public bool? Fp16WeightStorageOverride { get; set; }
+        public bool UsesFp16WeightStorage => Fp16WeightStorageOverride
+            ?? (ModelManifest?.precision?.weightDataType == TensorDataType.Float16);
         // Unity exposes no portable BF16 RenderTexture format. BF16 tensors are kept
         // in ARGBFloat storage and rounded by the Pack4 Cast path, so capacity and
         // accumulation remain FP32 while the declared logical precision is BF16.
@@ -1535,6 +1682,16 @@ namespace Aexis.Execution
                     && (plan.mode == QuantizedNodeMode.Int8WeightOnly || plan.mode == QuantizedNodeMode.Int8W8A8);
             }
             return ModelManifest?.UsesInt8WeightOnlyForOperator(operatorName) == true;
+        }
+
+        internal bool UsesOfficialAmdSesrM7Int8ForLayer(AexisGraphModel.Layer layer)
+        {
+            return UsesInt8WeightOnlyForLayer(layer)
+                   && string.Equals(ModelManifest?.quantization?.calibrationMethod,
+                       AmdSesrM7OfficialInt8CalibrationMethod,
+                       StringComparison.Ordinal)
+                   && layer != null
+                   && AmdSesrM7OfficialInt8WeightScales.ContainsKey(layer.name);
         }
 
         public sealed class CommandBufferInferResult : IDisposable
@@ -1693,6 +1850,12 @@ namespace Aexis.Execution
         // index values. Callers must explicitly declare those logical dtypes here.
         public IDictionary<string, string> StrictTextureInputLogicalDtypes { get; } = new Dictionary<string, string>(StringComparer.Ordinal);
         public AexisTextureExecutionPlan LastTextureExecutionPlan { get; private set; }
+        // The planner is metadata-only, so a plan can be reused when the exact
+        // same model and request are dispatched with a different runtime texture
+        // resource carrying the same descriptor. Keep this cache session-local;
+        // Release() clears it before a model reload.
+        private AexisGraphModel _textureExecutionPlanModel;
+        private string _textureExecutionPlanRequestSignature;
         public CommandBufferRtArenaMetrics LastCommandBufferRtArena { get; private set; }
         public bool DisallowBufferAccess { get; set; }
         public bool DisallowBufferOutputs { get; set; }
@@ -1876,7 +2039,11 @@ namespace Aexis.Execution
                 });
             }
 
-            CompleteTextureExecutionPlan(inputs, IsExplicitDebugOracleExecution, stopAfterTopName);
+            CompleteTextureExecutionPlan(
+                inputs,
+                IsExplicitDebugOracleExecution,
+                stopAfterTopName,
+                BuildTextureInputResourceSignature(textureInputs));
         }
 
         // Immediate execution uses the same CommandBuffer Pack4 admission gate. This
@@ -1921,7 +2088,64 @@ namespace Aexis.Execution
                 });
             }
 
-            CompleteTextureExecutionPlan(inputs, IsExplicitDebugOracleExecution, stopAfterTopName);
+            CompleteTextureExecutionPlan(
+                inputs,
+                IsExplicitDebugOracleExecution,
+                stopAfterTopName,
+                BuildTextureInputResourceSignature(textureInputs));
+        }
+
+        private static string BuildTextureInputResourceSignature(
+            IDictionary<string, ComputeTexture> textureInputs)
+        {
+            if (textureInputs == null || textureInputs.Count == 0)
+                return string.Empty;
+
+            var signature = new StringBuilder(textureInputs.Count * 64);
+            foreach (var key in textureInputs.Keys.OrderBy(value => value, StringComparer.Ordinal))
+            {
+                var texture = textureInputs[key];
+                signature.Append(key?.Length ?? 0).Append(':').Append(key ?? string.Empty).Append('|');
+                if (texture == null)
+                {
+                    signature.Append("null;");
+                    continue;
+                }
+
+                signature.Append(texture.width).Append('x')
+                    .Append(texture.height).Append('x')
+                    .Append(Mathf.Max(1, texture.depth)).Append('|')
+                    .Append((int)texture.dimension).Append('|')
+                    .Append((int)texture.format).Append(';');
+            }
+            return signature.ToString();
+        }
+
+        private static string BuildTextureInputResourceSignature(
+            IDictionary<string, TensorRef> textureInputs)
+        {
+            if (textureInputs == null || textureInputs.Count == 0)
+                return string.Empty;
+
+            var signature = new StringBuilder(textureInputs.Count * 64);
+            foreach (var key in textureInputs.Keys.OrderBy(value => value, StringComparer.Ordinal))
+            {
+                var tensor = textureInputs[key];
+                var texture = tensor?.texture;
+                signature.Append(key?.Length ?? 0).Append(':').Append(key ?? string.Empty).Append('|');
+                if (texture == null)
+                {
+                    signature.Append("null;");
+                    continue;
+                }
+
+                signature.Append(texture.width).Append('x')
+                    .Append(texture.height).Append('x')
+                    .Append(Mathf.Max(1, texture.volumeDepth)).Append('|')
+                    .Append((int)texture.dimension).Append('|')
+                    .Append((int)texture.format).Append(';');
+            }
+            return signature.ToString();
         }
 
         private string ResolveStrictInputLogicalDtype(string blobName, string physicalDtype)
@@ -1936,11 +2160,12 @@ namespace Aexis.Execution
         private void CompleteTextureExecutionPlan(
             List<AexisTexturePlanTensorDescriptor> inputs,
             bool debugOracleRelaxed,
-            string stopAfterTopName = null)
+            string stopAfterTopName = null,
+            string textureInputResourceSignature = null)
         {
             var explicitInt8LayerNames = GetExplicitInt8WeightOnlyLayerNamesForPlan();
             var explicitInt4LayerNames = GetExplicitInt4WeightOnlyLayerNamesForPlan();
-            LastTextureExecutionPlan = AexisTextureExecutionPlanner.Analyze(Model, new AexisTextureExecutionPlanRequest
+            var request = new AexisTextureExecutionPlanRequest
             {
                 modelName = LastLoadProfile?.modelMagic ?? string.Empty,
                 targetBackend = AexisOperatorCapabilityBackend.CommandBuffer,
@@ -1958,10 +2183,97 @@ namespace Aexis.Execution
                 int4WeightOnlyLayerSelectionExplicit = explicitInt4LayerNames != null,
                 fp32ActivationLayerNames = GetFp32ActivationLayerNamesForPlan(),
                 stopAfterTopName = stopAfterTopName,
+                fusedNoOpLayerNames = _fusedPReluSourceByLayer.Keys
+                    .Concat(_fusedReluLayers)
+                    .ToArray(),
                 inputs = inputs.ToArray(),
                 nodeVerifier = VerifyStrictCommandBufferPack4Node
-            });
+            };
+
+            var requestSignature = JsonUtility.ToJson(request, false)
+                + "|physical-inputs=" + (textureInputResourceSignature ?? string.Empty)
+                + "|session=" + BuildTextureExecutionPlanSessionSignature();
+            if (ReferenceEquals(_textureExecutionPlanModel, Model)
+                && LastTextureExecutionPlan != null
+                && string.Equals(_textureExecutionPlanRequestSignature, requestSignature, StringComparison.Ordinal))
+            {
+                AexisTextureExecutionPlanner.ThrowIfDispatchRejected(LastTextureExecutionPlan);
+                return;
+            }
+
+            LastTextureExecutionPlan = AexisTextureExecutionPlanner.Analyze(Model, request);
+            _textureExecutionPlanModel = Model;
+            _textureExecutionPlanRequestSignature = requestSignature;
             AexisTextureExecutionPlanner.ThrowIfDispatchRejected(LastTextureExecutionPlan);
+        }
+
+        private string BuildTextureExecutionPlanSessionSignature()
+        {
+            var signature = new StringBuilder(512);
+            AppendTexturePlanSignatureFlag(signature, "force-binop", ForceBufferBinaryOpAll);
+            AppendTexturePlanSignatureFlag(signature, "force-cpu-gemm", ForceCpuGemmAll);
+            AppendTexturePlanSignatureFlag(signature, "force-gelu", ForceBufferGeluAll);
+            AppendTexturePlanSignatureFlag(signature, "gpu-gelu-buffer", EnableGpuGeluBufferPath);
+            AppendTexturePlanSignatureFlag(signature, "depthwise-conv", EnableDepthWiseTextureConvolution);
+            AppendTexturePlanSignatureFlag(signature, "conv1x1", EnableConv1x1TextureConvolution);
+            AppendTexturePlanSignatureFlag(signature, "general-conv", EnableGeneralTextureConvolution);
+            AppendTexturePlanSignatureFlag(signature, "groupnorm-texture", EnableGroupNormTexturePath);
+            AppendTexturePlanSignatureFlag(signature, "force-conv", ForceBufferConvolution);
+            AppendTexturePlanSignatureFlag(signature, "maxpool-ind", UseTextureMaxPoolingInd);
+            AppendTexturePlanSignatureFlag(signature, "ncnn-groupnorm", UseNcnnStyleGroupNorm);
+            AppendTexturePlanSignatureFlag(signature, "leading-nhwc-fusion", EnableLeadingNhwcToNchwInputTransposeFusion);
+            AppendTexturePlanSignatureFlag(signature, "leading-nhwc-fused", HasFusedLeadingNhwcToNchwInputTranspose);
+            AppendTexturePlanSignatureFlag(signature, "face-texture", PreferTexturePathForFaceDetector);
+            AppendTexturePlanSignatureFlag(signature, "force-conv-all", ForceBufferConvolutionAll);
+            AppendTexturePlanSignatureFlag(signature, "raw-conv", ForceRawGroupPack4Convolution);
+            AppendTexturePlanSignatureFlag(signature, "raw-conv-3x3", ForceRawGroupPack4Convolution3x3);
+            AppendTexturePlanSignatureFlag(signature, "raw-conv-5x5", ForceRawGroupPack4Convolution5x5);
+            AppendTexturePlanSignatureFlag(signature, "raw-conv-head-5x5", ForceRawGroupPack4ConvolutionHead5x5);
+            AppendTexturePlanSignatureFlag(signature, "raw-conv-tail-5x5", ForceRawGroupPack4ConvolutionTail5x5);
+            AppendTexturePlanSignatureFlag(signature, "raw-int8", EnableExperimentalRawInt8Pack4);
+            AppendTexturePlanSignatureFlag(signature, "keep-raw-conv", KeepRawConvWeightsForTexturePath);
+            AppendTexturePlanSignatureFlag(signature, "mha-parallel-softmax", EnableMhaParallelSoftmax);
+            AppendTexturePlanSignatureFlag(signature, "mha-qkv-fusion", EnableMhaQkvFusion);
+            AppendTexturePlanSignatureFlag(signature, "attention-specialization", EnableAttentionMatMulPack4Specializations);
+            AppendTexturePlanSignatureFlag(signature, "vista-specialization", EnableVistaTailPack4Specializations);
+            AppendTexturePlanSignatureFlag(signature, "legacy-fp32", PreserveLegacyFp32Execution);
+            AppendTexturePlanSignatureFlag(signature, "legacy-attention", UseLegacyPack4AttentionLayout);
+            AppendTexturePlanSignatureFlag(signature, "inplace-kv", EnableInPlaceAttentionKvCache);
+            AppendTexturePlanSignatureFlag(signature, "force-dims4-buffer", ForceBufferOutputsForDims4);
+            AppendTexturePlanSignatureFlag(signature, "debug-compare", DebugCompareTextureLayers != null && DebugCompareTextureLayers.Count > 0);
+            AppendTexturePlanSignatureFlag(signature, "debug-compare-conv", DebugCompareTextureConvLayers != null && DebugCompareTextureConvLayers.Count > 0);
+            AppendTexturePlanSignatureFlag(signature, "debug-compare-pool", DebugCompareMaxPoolingLayers != null && DebugCompareMaxPoolingLayers.Count > 0);
+            signature.Append("kv-capacity=").Append(AttentionKvCacheTextureCapacity).Append('|');
+            signature.Append("precision=").Append((int)AppliedPrecisionMode).Append('|');
+            signature.Append("texture-format=").Append((int)TensorTextureFormat).Append('|');
+            signature.Append("fp16-weight=").Append(Fp16WeightStorageOverride.HasValue ? (Fp16WeightStorageOverride.Value ? '1' : '0') : 'x').Append('|');
+            signature.Append("fp32-start=").Append(Fp32ActivationStartLayerName ?? string.Empty).Append('|');
+            AppendTexturePlanSignatureSet(signature, "force-types", ForceBufferLayerTypes);
+            AppendTexturePlanSignatureSet(signature, "force-names", ForceBufferLayerNames);
+            signature.Append("shared-embed=").Append(SharedTokenEmbeddingWeights != null ? '1' : '0').Append(',')
+                .Append(SharedTokenEmbeddingWeightsInt8Packed != null ? '1' : '0').Append(',')
+                .Append(SharedTokenEmbeddingWeightsInt8Scales != null ? '1' : '0').Append(',')
+                .Append(SharedTokenEmbeddingWeightsInt4Packed != null ? '1' : '0').Append(',')
+                .Append(SharedTokenEmbeddingWeightsInt4Scales != null ? '1' : '0').Append('|')
+                .Append("shared-embed-count=").Append(SharedTokenEmbeddingElementCount).Append('|')
+                .Append("shared-embed-int4-block=").Append(SharedTokenEmbeddingWeightsInt4ScaleBlockSize).Append('|');
+            return signature.ToString();
+        }
+
+        private static void AppendTexturePlanSignatureFlag(StringBuilder signature, string name, bool value)
+        {
+            signature.Append(name).Append('=').Append(value ? '1' : '0').Append('|');
+        }
+
+        private static void AppendTexturePlanSignatureSet(StringBuilder signature, string name, ISet<string> values)
+        {
+            signature.Append(name).Append('=');
+            if (values != null && values.Count > 0)
+            {
+                foreach (var value in values.Where(item => !string.IsNullOrWhiteSpace(item)).OrderBy(item => item, StringComparer.Ordinal))
+                    signature.Append(value.Length).Append(':').Append(value);
+            }
+            signature.Append('|');
         }
 
         private string[] GetFp32ActivationLayerNamesForPlan()
@@ -2667,9 +2979,18 @@ namespace Aexis.Execution
         {
             if (!TryGetSingleStrictPlanShape(inputs, out var input, out var reason))
                 return RejectStrictCommandBufferPack4Node(reason);
-            if (input.dims != 3 || input.d != 1)
+            // ONNX writes a 1-D convolution as Conv2D wrapped in
+            // Unsqueeze(axis=2)/Squeeze(axis=2). ExpandDims publishes the wrapper
+            // as a rank-4 logical view over rank-3 Pack4 storage; the singleton
+            // depth axis does not change the physical layout, so the 2-D kernel
+            // consumes the collapsed rank-3 shape and republishes the rank-4
+            // logical view for the paired Squeeze.
+            var restoreRank4 = input.dims == 4 && input.d == 1;
+            if (input.dims != 3 && !restoreRank4)
                 return RejectStrictCommandBufferPack4Node("CommandBuffer convolution requires a 2D Pack4 activation.");
-            if (!HasStrictExactPack4Storage(inputs[0], input))
+            var tiledTailInput = IsVocoderTail8192TilingLayer(layer.name)
+                && HasStrictTiledVocoderTailStorage(inputs[0], input);
+            if (!tiledTailInput && !HasStrictConvolutionPack4Storage(inputs[0], input))
                 return RejectStrictCommandBufferPack4Node("CommandBuffer convolution requires exact rank-3 Pack4 descriptor storage.");
             if (!_conv.TryGetValue(layer.name, out var conv) || conv == null)
                 return RejectStrictCommandBufferPack4Node("Packed convolution weights were not loaded for this layer.");
@@ -2684,7 +3005,13 @@ namespace Aexis.Execution
                 ComputeConvOut(input.h, conv.kernelH, conv.dilationH, conv.strideH, conv.padTop, conv.padBottom),
                 1,
                 conv.outC);
-            return AcceptStrictCommandBufferPack4Node(layer, output, request, "command-buffer-pack4:convolution");
+            var logicalOutput = restoreRank4
+                ? new BufferShape(4, output.w, output.h, 1, output.c)
+                : output;
+            var storageOutput = tiledTailInput && output.w == input.w && output.h == 1
+                ? new BufferShape(3, 8192, output.w / 8192, 1, output.c)
+                : output;
+            return AcceptStrictCommandBufferPack4Node(layer, logicalOutput, storageOutput, request, "command-buffer-pack4:convolution");
         }
 
         private AexisTextureExecutionPlanNodeVerification VerifyStrictCommandBufferDepthWiseConvolution(
@@ -2967,7 +3294,9 @@ namespace Aexis.Execution
                 return RejectStrictCommandBufferPack4Node(reason);
             if (input.dims != 3 || input.d != 1)
                 return RejectStrictCommandBufferPack4Node("CommandBuffer deconvolution requires a 2D Pack4 activation.");
-            if (!HasStrictExactPack4Storage(inputs[0], input))
+            var tiledTailInput = IsVocoderTail8192TilingLayer(layer.name)
+                && HasStrictTiledVocoderTailStorage(inputs[0], input);
+            if (!tiledTailInput && !HasStrictExactPack4Storage(inputs[0], input))
                 return RejectStrictCommandBufferPack4Node("CommandBuffer deconvolution requires exact rank-3 Pack4 descriptor storage.");
             if (!_deconv.TryGetValue(layer.name, out var deconv) || deconv == null)
                 return RejectStrictCommandBufferPack4Node("Immutable deconvolution weights were not loaded for this layer.");
@@ -2982,6 +3311,13 @@ namespace Aexis.Execution
                 ComputeDeconvOut(input.h, deconv.kernelH, deconv.dilationH, deconv.strideH, deconv.padTop, deconv.padBottom, deconv.outputPadBottom),
                 1,
                 deconv.outC);
+            if (IsVocoderTail8192TilingLayer(layer.name)
+                && output.w > 8192 && output.h == 1 && output.w % 8192 == 0)
+            {
+                var tiledOutput = new BufferShape(3, 8192, output.w / 8192, 1, output.c);
+                return AcceptStrictCommandBufferPack4Node(layer, output, tiledOutput, request,
+                    "command-buffer-pack4:deconvolution-tiled8192");
+            }
             return AcceptStrictCommandBufferPack4Node(
                 layer,
                 output,
@@ -3217,6 +3553,10 @@ namespace Aexis.Execution
             var operation = layer.GetInt(0, 1);
             if (operation != 0 && operation != 1 && operation != 2)
                 return RejectStrictCommandBufferPack4Node("The Eltwise operation is outside the verified CommandBuffer Pack4 subset.");
+            if (shapes.All(shape => shape.w == shapes[0].w)
+                && inputs.All(descriptor => HasStrictTiledVocoderTailStorage(descriptor, shapes[0])))
+                return AcceptStrictCommandBufferPack4Node(layer, shapes[0], CopyStrictStorage(inputs[0]), request,
+                    "command-buffer-pack4:eltwise-tiled8192");
             return AcceptStrictCommandBufferPack4Node(layer, shapes[0], request, "command-buffer-pack4:eltwise");
         }
 
@@ -3344,6 +3684,19 @@ namespace Aexis.Execution
                     || shape.d != first.d
                     || shape.c != first.c)
                 {
+                    if ((layer?.name ?? string.Empty).Contains("attn_layers.0/Concat"))
+                    {
+                        var d = inputs[index];
+                        UnityEngine.Debug.LogWarning("[LowDimConcat] reject layer=" + layer.name
+                            + " axis=" + axis + " tensorAxis=" + tensorAxis
+                            + " first=[dims=" + first.dims + ",w=" + first.w + ",h=" + first.h + ",d=" + first.d + ",c=" + first.c + "]"
+                            + " idx=" + index + " blob=" + (d == null ? "<null>" : d.blob)
+                            + " logical=[dims=" + shape.dims + ",w=" + shape.w + ",h=" + shape.h + ",d=" + shape.d + ",c=" + shape.c + "]"
+                            + " storage=[" + (d?.storageShape == null ? "<null>" : string.Join(",", d.storageShape)) + "]"
+                            + " scalarLike=" + HasStrictScalarLikePlanStorage(inputs[index], shape)
+                            + " dimsMatch=" + (shape.dims == first.dims)
+                            + " hMatch=" + (shape.h == first.h) + " dMatch=" + (shape.d == first.d) + " cMatch=" + (shape.c == first.c));
+                    }
                     return RejectStrictCommandBufferPack4Node("Low-dimensional Concat requires matching descriptor-backed scalar storage on every non-concatenated axis.");
                 }
 
@@ -3367,6 +3720,27 @@ namespace Aexis.Execution
         }
 
         private static AexisTextureExecutionPlanNodeVerification VerifyStrictCommandBufferBinaryOp(
+            AexisGraphModel.Layer layer,
+            IReadOnlyList<AexisTexturePlanTensorDescriptor> inputs,
+            AexisTextureExecutionPlanRequest request)
+        {
+            var verification = VerifyStrictCommandBufferBinaryOpCore(layer, inputs, request);
+            // Comparison/logical codes (Equal/Greater/GreaterOrEqual/Less/
+            // LessOrEqual/And/Or/Xor) emit canonical 0/1 lanes whose logical
+            // semantics are Bool even though the Pack4 texture storage stays
+            // RFloat. Where/Compress consumers require that logical dtype, so
+            // stamp it on the accepted outputs.
+            var operation = layer.GetInt(0, 0);
+            if (verification != null && verification.accepted && verification.outputs != null
+                && operation >= 20 && operation <= 27)
+            {
+                foreach (var output in verification.outputs)
+                    if (output != null) output.logicalDtype = "Bool";
+            }
+            return verification;
+        }
+
+        private static AexisTextureExecutionPlanNodeVerification VerifyStrictCommandBufferBinaryOpCore(
             AexisGraphModel.Layer layer,
             IReadOnlyList<AexisTexturePlanTensorDescriptor> inputs,
             AexisTextureExecutionPlanRequest request)
@@ -3426,6 +3800,17 @@ namespace Aexis.Execution
                 return RejectStrictCommandBufferPack4Node(reason);
             if (shapes.Length != 2)
                 return RejectStrictCommandBufferPack4Node("BinaryOp CommandBuffer Pack4 requires exactly two descriptor-backed inputs.");
+
+            if (HasStrictTiledVocoderTailStorage(inputs[0], shapes[0]))
+            {
+                if (StrictPlanShapesEqual(shapes[0], shapes[1])
+                    && HasStrictTiledVocoderTailStorage(inputs[1], shapes[1]))
+                    return AcceptStrictCommandBufferPack4Node(layer, shapes[0], CopyStrictStorage(inputs[0]), request,
+                        "command-buffer-pack4:binary-tiled8192");
+                if (GetStrictPlanElementCount(shapes[1]) == 1 && HasStrictScalarLikePlanStorage(inputs[1], shapes[1]))
+                    return AcceptStrictCommandBufferPack4Node(layer, shapes[0], CopyStrictStorage(inputs[0]), request,
+                        "command-buffer-pack4:binary-tiled8192-scalar");
+            }
 
             if (TryResolveStrictCommandBufferScalarSingleBinary(
                     inputs[0],
@@ -3550,7 +3935,55 @@ namespace Aexis.Execution
             }
 
             if (TryResolveStrictCommandBufferChannelVector(inputs[0], shapes[0], inputs[1], shapes[1], out var channelVectorOutput))
-                return AcceptStrictCommandBufferPack4Node(layer, channelVectorOutput, request, "command-buffer-pack4:binary-channel-vector");
+            {
+                var verification = AcceptStrictCommandBufferPack4Node(
+                    layer,
+                    channelVectorOutput,
+                    request,
+                    "command-buffer-pack4:binary-channel-vector");
+                // A channel vector can arrive as an RFloat LinearMat.  The
+                // CommandBuffer path explicitly reshapes that vector to a one-slice
+                // Pack4 array before dispatch, so declare the transient RT here and
+                // bind it by this same identity in AexisBinaryOpLayer.
+                var firstIsVector = IsStrictCommandBufferChannelVector(inputs[0], shapes[0], shapes[1].c);
+                var vectorDescriptor = firstIsVector ? inputs[0] : inputs[1];
+                var vectorShape = firstIsVector ? shapes[0] : shapes[1];
+                if (verification.accepted && HasStrictLinearMatStorage(vectorDescriptor, vectorShape))
+                {
+                    var scratchHeight = vectorShape.dims == 1 ? 1 : Mathf.Max(1, vectorShape.h);
+                    verification.scratch = new[]
+                    {
+                        CreateStrictPack4ScratchDescriptor(
+                            layer,
+                            "binary-channel-vector-materialized",
+                            new BufferShape(3, Mathf.Max(1, vectorShape.w), scratchHeight, 1, 4),
+                            request)
+                    };
+                }
+                return verification;
+            }
+
+            if (TryResolveStrictCommandBufferChannelLayoutReshape(inputs[0], shapes[0], inputs[1], shapes[1], out var channelLayoutOutput, out var channelLayoutStorage))
+            {
+                var verification = AcceptStrictCommandBufferPack4Node(
+                    layer,
+                    channelLayoutOutput,
+                    channelLayoutStorage,
+                    request,
+                    "command-buffer-pack4:binary-channel-layout-reshape");
+                if (verification.accepted)
+                {
+                    verification.scratch = new[]
+                    {
+                        CreateStrictPack4ScratchDescriptor(
+                            layer,
+                            "binary-channel-layout-reshape",
+                            channelLayoutOutput,
+                            request)
+                    };
+                }
+                return verification;
+            }
 
             if (TryResolveStrictCommandBufferSpatialBroadcast(
                     inputs[0],
@@ -3560,7 +3993,60 @@ namespace Aexis.Execution
                     out var spatialBroadcastOutput))
                 return AcceptStrictCommandBufferPack4Node(layer, spatialBroadcastOutput, request, "command-buffer-pack4:binary-spatial-broadcast");
 
+            if (TryResolveStrictCommandBufferPack4ScalarBroadcast(
+                    inputs[0], shapes[0], inputs[1], shapes[1], out var pack4ScalarOutput))
+            {
+                return AcceptStrictCommandBufferPack4Node(
+                    layer,
+                    pack4ScalarOutput,
+                    request,
+                    "command-buffer-pack4:binary-pack4-scalar-broadcast");
+            }
+
             return RejectStrictCommandBufferPack4Node("BinaryOp does not match an exact, channel-vector, or verified spatial CommandBuffer Pack4 descriptor profile.");
+        }
+
+        // 单个 Pack4(dims 3/4) 激活与一个单元素标量常量做逐元素 BinaryOp。
+        // 典型形态：vocoder 三路 resblock 求和后 / 标量常数(=3.0)。
+        // 标量在 GPU 端经 BinaryOpPack4BufferScalar 广播到每个像素/通道，
+        // 输出形状与激活一致；此处仅证明形状契约，不做 CPU 回读。
+        private static bool TryResolveStrictCommandBufferPack4ScalarBroadcast(
+            AexisTexturePlanTensorDescriptor firstDescriptor,
+            BufferShape first,
+            AexisTexturePlanTensorDescriptor secondDescriptor,
+            BufferShape second,
+            out BufferShape output)
+        {
+            output = default;
+            if ((first.dims == 3 || first.dims == 4)
+                && HasStrictExactPack4Storage(firstDescriptor, first)
+                && IsStrictSingleElementScalarLike(secondDescriptor, second))
+            {
+                output = first;
+                return true;
+            }
+            if ((second.dims == 3 || second.dims == 4)
+                && HasStrictExactPack4Storage(secondDescriptor, second)
+                && IsStrictSingleElementScalarLike(firstDescriptor, first))
+            {
+                output = second;
+                return true;
+            }
+            return false;
+        }
+
+        // 单元素标量：元素总数为 1，任意 rank；允许其以 Pack4 单纹元首通道承载。
+        private static bool IsStrictSingleElementScalarLike(
+            AexisTexturePlanTensorDescriptor descriptor,
+            BufferShape shape)
+        {
+            if (descriptor == null || shape.dims < 1)
+                return false;
+            if (GetStrictPlanElementCount(shape) != 1)
+                return false;
+            var storage = descriptor.storageShape;
+            // 标量形在 Pack4 下通常 w=h=d=1、c=1（或承载于单纹元）。
+            return shape.w == 1 && shape.h == 1 && shape.d == 1;
         }
 
         private static bool TryResolveStrictCommandBufferScalarSingleBinary(
@@ -3890,7 +4376,31 @@ namespace Aexis.Execution
                             || !IsStrictRFloatLogicalDtype(inputs[1].logicalDtype))
                             return RejectStrictCommandBufferPack4Node("Where true/false values must have the same Float32 or Int32 logical dtype.");
                         var output = AexisShapeIndexLayerUtil.BroadcastShapes(shapes);
-                        return AcceptStrictLinearTextureNode(layer, request, "command-buffer-linearmat:where-broadcast", new[] { output }, new[] { inputs[1].logicalDtype });
+                        var verification = AcceptStrictLinearTextureNode(
+                            layer,
+                            request,
+                            "command-buffer-linearmat:where-broadcast",
+                            new[] { output },
+                            new[] { inputs[1].logicalDtype });
+                        if (!verification.accepted)
+                            return verification;
+
+                        var scratch = new List<AexisTexturePlanTensorDescriptor>();
+                        for (var inputIndex = 0; inputIndex < shapes.Length; inputIndex++)
+                        {
+                            if (HasStrictAnyRankLinearMatStorage(inputs[inputIndex], shapes[inputIndex]))
+                                continue;
+
+                            var linearStorage = ResolveLinearMatStorageShape(shapes[inputIndex]);
+                            scratch.Add(CreateStrictLinearMatScratchDescriptor(
+                                layer,
+                                "where-linear-input-" + inputIndex.ToString(CultureInfo.InvariantCulture),
+                                linearStorage,
+                                request,
+                                inputs[inputIndex].logicalDtype));
+                        }
+                        verification.scratch = scratch.ToArray();
+                        return verification;
                     }
                     case "Gather":
                     case "GatherElements":
@@ -4201,6 +4711,26 @@ namespace Aexis.Execution
                 return true;
             }
 
+            // Depth-axis broadcast: identical packed channel count and spatial
+            // extents, but one operand carries a singleton logical depth axis.
+            // Relative-position attention adds a batch-shared [.., d=1, ..] term
+            // to a per-batch [.., d=N, ..] score tensor; AexisBinaryOpPack4Broadcast
+            // modes 10/11 replicate the singleton across the Pack4 depth slices.
+            var matchingPackedChannels = first.w == second.w
+                && first.h == second.h
+                && first.c == second.c;
+            if (matchingPackedChannels && first.d == 1 && second.d > 1)
+            {
+                output = second;
+                return true;
+            }
+
+            if (matchingPackedChannels && second.d == 1 && first.d > 1)
+            {
+                output = first;
+                return true;
+            }
+
             var firstIsScalarSpatial = first.w == 1 && first.h == 1 && first.d == 1;
             var secondIsScalarSpatial = second.w == 1 && second.h == 1 && second.d == 1;
             if (firstIsScalarSpatial && !secondIsScalarSpatial)
@@ -4261,15 +4791,76 @@ namespace Aexis.Execution
             return false;
         }
 
+        private static bool TryResolveStrictCommandBufferChannelLayoutReshape(
+            AexisTexturePlanTensorDescriptor firstDescriptor,
+            BufferShape first,
+            AexisTexturePlanTensorDescriptor secondDescriptor,
+            BufferShape second,
+            out BufferShape output,
+            out BufferShape outputStorage)
+        {
+            output = default;
+            outputStorage = default;
+
+            if (IsStrictPack4ChannelLayoutTarget(firstDescriptor, first)
+                && IsStrictPack4ChannelLayoutSource(secondDescriptor, second, first))
+            {
+                output = first;
+                outputStorage = CopyStrictStorage(firstDescriptor);
+                return true;
+            }
+
+            if (IsStrictPack4ChannelLayoutTarget(secondDescriptor, second)
+                && IsStrictPack4ChannelLayoutSource(firstDescriptor, first, second))
+            {
+                output = second;
+                outputStorage = CopyStrictStorage(secondDescriptor);
+                return true;
+            }
+
+            return false;
+        }
+
+        private static bool IsStrictPack4ChannelLayoutTarget(
+            AexisTexturePlanTensorDescriptor descriptor,
+            BufferShape shape)
+        {
+            return shape.dims == 3
+                && shape.w > 0
+                && shape.h == 1
+                && shape.d == 1
+                && shape.c > 1
+                && HasStrictExactPack4Storage(descriptor, shape);
+        }
+
+        private static bool IsStrictPack4ChannelLayoutSource(
+            AexisTexturePlanTensorDescriptor descriptor,
+            BufferShape shape,
+            BufferShape target)
+        {
+            return shape.dims == 3
+                && shape.w == target.w
+                && shape.h == target.c
+                && shape.d == 1
+                && shape.c == 1
+                && HasStrictExactPack4Storage(descriptor, shape);
+        }
+
         private static bool IsStrictCommandBufferChannelVector(
             AexisTexturePlanTensorDescriptor descriptor,
             BufferShape logicalShape,
             int expectedChannels)
         {
             var storage = descriptor?.storageShape;
+            var isHeightChannelVector = logicalShape.dims == 3
+                && logicalShape.w == 1
+                && logicalShape.h == expectedChannels
+                && logicalShape.d == 1
+                && logicalShape.c == 1;
             if (descriptor == null
-                || (logicalShape.dims != 1 && (logicalShape.dims != 2 || logicalShape.h != 1))
-                || logicalShape.w != expectedChannels)
+                || (!isHeightChannelVector
+                    && ((logicalShape.dims != 1 && (logicalShape.dims != 2 || logicalShape.h != 1))
+                        || logicalShape.w != expectedChannels)))
             {
                 return false;
             }
@@ -4279,6 +4870,7 @@ namespace Aexis.Execution
             // explicit CommandBuffer ReshapeLinearMatToPack4 kernel before the
             // real channel-vector BinaryOp dispatch.
             return HasStrictLinearMatStorage(descriptor, logicalShape)
+                || (isHeightChannelVector && HasStrictExactPack4Storage(descriptor, logicalShape))
                 || (storage != null
                     && storage.Length == 5
                     && storage[0] == 3
@@ -4583,7 +5175,8 @@ namespace Aexis.Execution
         {
             if (!TryGetSingleStrictPlanShape(inputs, out var input, out var reason))
                 return RejectStrictCommandBufferPack4Node(reason);
-            if (!HasStrictExactPack4Storage(inputs[0], input))
+            if (!HasStrictExactPack4Storage(inputs[0], input)
+                && !HasStrictTiledVocoderTailStorage(inputs[0], input))
                 return RejectStrictCommandBufferPack4Node("ReLU requires an exact rank-3/rank-4 Pack4 texture descriptor.");
             var slope = layer.GetFloat(0, 0f);
             if (float.IsNaN(slope) || float.IsInfinity(slope))
@@ -5272,6 +5865,46 @@ namespace Aexis.Execution
             if (!TryGetStrictPlanShapes(inputs, out var shapes, out var reason) || shapes.Length < 1 || shapes.Length > 2)
                 return RejectStrictCommandBufferPack4Node("Crop requires one data input and at most one descriptor-backed reference input: " + reason);
             var source = shapes[0];
+
+            // Rank-one/rank-two shape-arithmetic metadata vectors (the rel-position
+            // pad geometry chain: Shape->Gather->Sub->Concat->Reshape->Slice->
+            // Transpose->Reshape->Cast) live in a single-channel Pack4 texture. The
+            // runtime resolves dims<=2 through ResolveCropRoiFromSlice and
+            // ResolveSliceFlipFlags and records a full-axis reversal as FlipPack4
+            // (or an identity copy), so prove that same texture-native profile here
+            // instead of requiring rank-3 activation storage.
+            if (source.dims >= 1 && source.dims <= 2)
+            {
+                if (!HasStrictScalarLikePlanStorage(inputs[0], source))
+                    return RejectStrictCommandBufferPack4Node("Rank-one/rank-two Crop requires verified scalar Pack4 metadata storage.");
+                if (shapes.Length > 1 && layer.GetInt(0, 0) == -233)
+                    return RejectStrictCommandBufferPack4Node("Crop param_data requires runtime value readback and is not a strict texture-native profile.");
+
+                CropRoi metadataRoi;
+                try
+                {
+                    metadataRoi = ResolveCropRoi(source, layer, shapes);
+                }
+                catch (Exception exception)
+                {
+                    return RejectStrictCommandBufferPack4Node("Crop ROI resolution failed: " + exception.Message);
+                }
+                // Only the identity/full-axis-reversal ROI is texture-native for a
+                // metadata vector; the runtime records FlipPack4 or an identity copy.
+                if (metadataRoi.woffset != 0 || metadataRoi.hoffset != 0 || metadataRoi.doffset != 0 || metadataRoi.coffset != 0
+                    || metadataRoi.outw != source.w || metadataRoi.outh != source.h
+                    || metadataRoi.outd != source.d || metadataRoi.outc != source.c)
+                {
+                    return RejectStrictCommandBufferPack4Node("Rank-one/rank-two Crop supports only a full-axis identity/reversal ROI.");
+                }
+                return AcceptStrictCommandBufferPack4Node(
+                    layer,
+                    source,
+                    ResolveLinearMatStorageShape(source),
+                    request,
+                    "command-buffer-pack4:crop-metadata");
+            }
+
             if (source.dims != 3 || !HasStrictExactPack4Storage(inputs[0], source))
                 return RejectStrictCommandBufferPack4Node("Crop requires an exact rank-3 Pack4 source descriptor.");
             if (shapes.Length > 1 && layer.GetInt(0, 0) == -233)
@@ -5286,9 +5919,9 @@ namespace Aexis.Execution
             {
                 return RejectStrictCommandBufferPack4Node("Crop ROI resolution failed: " + exception.Message);
             }
-            if (roi.outw <= 0 || roi.outh <= 0 || roi.outd != 1 || roi.outc <= 0)
-                return RejectStrictCommandBufferPack4Node("Crop requires a non-empty rank-3 ROI with no depth slicing.");
-            var output = new BufferShape(3, roi.outw, roi.outh, 1, roi.outc);
+            if (roi.outw <= 0 || roi.outh <= 0 || roi.outc <= 0)
+                return RejectStrictCommandBufferPack4Node("Crop requires a non-empty rank-3 ROI.");
+            var output = new BufferShape(3, roi.outw, roi.outh, Math.Max(1, roi.outd), roi.outc);
             return AcceptStrictCommandBufferPack4Node(layer, output, request, "command-buffer-pack4:crop-roi");
         }
 
@@ -5443,8 +6076,65 @@ namespace Aexis.Execution
         {
             if (!TryGetSingleStrictPlanShape(inputs, out var input, out var reason))
                 return RejectStrictCommandBufferPack4Node(reason);
-            if (input.dims != 3 || !HasStrictExactPack4Storage(inputs[0], input))
-                return RejectStrictCommandBufferPack4Node("Padding requires an exact rank-3 Pack4 input.");
+
+            // Pad_4 is the second long-mask flattening pad. Its left L-zero
+            // prefix is fused with Reshape_13 and Reshape_16 so the temporary
+            // [2, 2L^2] LinearMat never needs to be allocated.
+            if (TryResolveCompactAttentionMaskPad4(
+                    layer,
+                    input,
+                    GetStrictDescriptorStorageShape(inputs[0]),
+                    out var compactPad4LogicalOutput,
+                    out var compactPad4StorageOutput))
+            {
+                return AcceptStrictCommandBufferPack4Node(
+                    layer,
+                    compactPad4LogicalOutput,
+                    compactPad4StorageOutput,
+                    request,
+                    "command-buffer-pack4:attention-mask-compact-pad4",
+                    inputs[0].logicalDtype);
+            }
+
+            // The flow attention mask exporter materializes a [2, 2L^2] scalar
+            // view and pads each row by L-1 before reshaping it to [2, L+1,
+            // 2L-1]. For long utterances the scalar view is wider than a
+            // hardware texture can represent. Keep the logical contract, but
+            // write the final Pack4 layout directly from the preceding compact
+            // d4 storage. This predicate is intentionally tied to the exact
+            // flow attention layer name and geometry.
+            if (TryResolveCompactAttentionMaskPad2(
+                    layer,
+                    input,
+                    GetStrictDescriptorStorageShape(inputs[0]),
+                    out var compactLogicalOutput,
+                    out var compactStorageOutput))
+            {
+                return AcceptStrictCommandBufferPack4Node(
+                    layer,
+                    compactLogicalOutput,
+                    compactStorageOutput,
+                    request,
+                    "command-buffer-pack4:attention-mask-compact",
+                    inputs[0].logicalDtype);
+            }
+
+            // Attention score tensors are rank-4 and carry their head slices on the
+            // texture-array depth axis. Because channel/depth padding is rejected
+            // below, every depth slice passes through the spatial kernel untouched,
+            // so the depth axis may hold any number of slices. ONNX rank-3 sequence
+            // tensors ([N,C,W] with the batch axis removed) keep a rank-2 logical
+            // view, where width carries the sequence and height the channels; the
+            // spatial kernel pads that view identically.
+            var rank2 = input.dims == 2;
+            var rank4 = input.dims == 4;
+            var linearMatInput = rank2
+                && HasStrictLinearMatStorage(inputs[0], input)
+                && string.Equals(inputs[0].dtype, "FP32", StringComparison.OrdinalIgnoreCase)
+                && IsStrictRFloatLogicalDtype(inputs[0].logicalDtype);
+            var pack4Input = !linearMatInput && HasStrictPaddingPack4Storage(inputs[0], input);
+            if ((input.dims != 3 && !rank2 && !rank4) || (!linearMatInput && !pack4Input))
+                return RejectStrictCommandBufferPack4Node("Padding requires an exact rank-2 LinearMat or rank-2/rank-3/rank-4 Pack4 input without channel/depth padding.");
 
             var top = layer.GetInt(0, 0);
             var bottom = layer.GetInt(1, 0);
@@ -5473,7 +6163,23 @@ namespace Aexis.Execution
                 return RejectStrictCommandBufferPack4Node("Padding produces an empty spatial output.");
             if (top == 0 && bottom == 0 && left == 0 && right == 0)
                 return AcceptStrictCommandBufferPack4NoopAlias(layer, inputs[0], request);
-            return AcceptStrictCommandBufferPack4Node(layer, new BufferShape(3, outputW, outputH, 1, input.c), request, "command-buffer-pack4:padding-spatial");
+            var output = rank4
+                ? new BufferShape(4, outputW, outputH, input.d, input.c)
+                : rank2
+                    ? new BufferShape(2, outputW, outputH, 1, 1)
+                    : new BufferShape(3, outputW, outputH, 1, input.c);
+            var storage = linearMatInput
+                ? ResolveLinearMatStorageShape(output)
+                : rank2
+                    ? new BufferShape(3, outputW, outputH, 1, 4)
+                    : output;
+            var executionPath = linearMatInput
+                ? "command-buffer-linearmat:padding-2d"
+                : "command-buffer-pack4:padding-spatial";
+            var verification = AcceptStrictCommandBufferPack4Node(layer, output, storage, request, executionPath, linearMatInput ? inputs[0].logicalDtype : null);
+            if (!verification.accepted)
+                return verification;
+            return verification;
         }
 
         private AexisTextureExecutionPlanNodeVerification VerifyStrictCommandBufferQuantization(
@@ -5719,6 +6425,21 @@ namespace Aexis.Execution
             if (GetStrictPlanElementCount(input) != GetStrictPlanElementCount(output))
                 return RejectStrictCommandBufferPack4Node("Reshape changes the logical element count.");
 
+            if (TryResolveCompactAttentionMaskReshapeAlias(
+                    layer,
+                    input,
+                    GetStrictDescriptorStorageShape(inputs[0]),
+                    output,
+                    out var compactAliasStorage))
+            {
+                return AcceptStrictCommandBufferAttentionMaskAlias(
+                    layer,
+                    inputs[0],
+                    output,
+                    compactAliasStorage,
+                    request);
+            }
+
             if (input.dims <= 2 && output.dims <= 2
                 && HasStrictLinearMatStorage(inputs[0], input))
             {
@@ -5754,6 +6475,25 @@ namespace Aexis.Execution
                     "command-buffer-pack4:reshape-pack4-to-linear-mat");
             }
 
+            // A rank-1 metadata vector (the int64 shape arithmetic of the flow
+            // attention Pad geometry: Shape->Concat->Reshape->Slice->Transpose->
+            // Reshape->Cast->Pad) lives in a single-channel Pack4 texture. The
+            // runtime lowers it through AexisReshapeLayer.TryExecuteCommandBuffer
+            // Pack4ToScalar2DReshape -> ReshapePack4ToLinearMat, and its predicate
+            // CanUsePack4ToScalar2DReshape accepts every rank-1 source whose element
+            // count is preserved. Mirror that proof so the planner describes the
+            // transform the CommandBuffer actually records.
+            if (input.dims == 1 && output.dims >= 1 && output.dims <= 2
+                && HasStrictRank1ScalarPack4Storage(inputs[0], input))
+            {
+                return AcceptStrictCommandBufferPack4Node(
+                    layer,
+                    output,
+                    ResolveLinearMatStorageShape(output),
+                    request,
+                    "command-buffer-pack4:reshape-pack4-to-linear-mat");
+            }
+
             if (input.dims >= 3 && output.dims >= 3 && output.dims <= 4 && !StrictPlanShapesEqual(input, output))
             {
                 return AcceptStrictCommandBufferPack4Node(
@@ -5771,6 +6511,21 @@ namespace Aexis.Execution
                     output,
                     request,
                     "command-buffer-pack4:reshape-pack4-linear-to-pack4");
+            }
+
+            // Padding can preserve a scalar rank-2 logical tensor in a single-slice
+            // RGBA Texture2DArray. The reshape shader reads this profile from lane X
+            // and repacks the linear scalar stream into rank-3/rank-4 channel packs.
+            // Require the exact physical storage contract emitted by Padding; do not
+            // infer this from rank alone.
+            if (input.dims == 2 && output.dims >= 3 && output.dims <= 4
+                && HasStrictPaddedScalar2DPack4Storage(inputs[0], input))
+            {
+                return AcceptStrictCommandBufferPack4Node(
+                    layer,
+                    output,
+                    request,
+                    "command-buffer-pack4:reshape-padded-scalar-2d-to-pack4");
             }
 
             if (input.dims == 2 && output.dims >= 3 && output.dims <= 4
@@ -5954,6 +6709,13 @@ namespace Aexis.Execution
                     storageShape = (int[])storage.Clone(),
                     layout = request.targetLayout,
                     dtype = ResolvePhysicalTextureDtype(request.targetDtype),
+                    // A descriptor alias (identity Cast/Packing/Noop) keeps the
+                    // source tensor's logical semantics. Bool conditions produced
+                    // by comparisons must survive an identity Cast so downstream
+                    // Where/Compress verification still sees logical Bool.
+                    logicalDtype = string.IsNullOrEmpty(source.logicalDtype)
+                        ? ResolveLogicalDtype(request.targetDtype)
+                        : source.logicalDtype,
                     aliasGroup = source.aliasGroup,
                     textureBacked = source.textureBacked
                 }).ToArray()
@@ -6106,6 +6868,28 @@ namespace Aexis.Execution
                 && storage[4] == expected.c;
         }
 
+        // A rank-3/rank-4 activation can be produced as a flattened LinearMat
+        // texture: ResolveLinearMatStorageShape tiles the full logical element
+        // count into a rank-2 [w,h] storage. The broadcast select (Where) that
+        // masks an attention map emits exactly this layout, so a downstream
+        // Softmax can prove its physical mapping and materialize the Pack4 view
+        // from the linear storage before normalizing.
+        private static bool HasStrictFlattenedLinearStorage(
+            AexisTexturePlanTensorDescriptor descriptor,
+            BufferShape logicalShape)
+        {
+            if (descriptor?.storageShape == null || descriptor.storageShape.Length != 5
+                || logicalShape.dims < 3)
+                return false;
+            var expected = ResolveLinearMatStorageShape(logicalShape);
+            var storage = descriptor.storageShape;
+            return storage[0] == expected.dims
+                && storage[1] == expected.w
+                && storage[2] == expected.h
+                && storage[3] == expected.d
+                && storage[4] == expected.c;
+        }
+
         private static bool HasStrictScalar2DPack4Storage(
             AexisTexturePlanTensorDescriptor descriptor,
             BufferShape logicalShape)
@@ -6117,6 +6901,40 @@ namespace Aexis.Execution
                 && storage[0] == 3
                 && storage[1] == logicalShape.w
                 && storage[2] == logicalShape.h
+                && storage[3] == 1
+                && storage[4] == 1;
+        }
+
+        private static bool HasStrictPaddedScalar2DPack4Storage(
+            AexisTexturePlanTensorDescriptor descriptor,
+            BufferShape logicalShape)
+        {
+            var storage = descriptor?.storageShape;
+            return logicalShape.dims == 2
+                && storage != null
+                && storage.Length == 5
+                && storage[0] == 3
+                && storage[1] == logicalShape.w
+                && storage[2] == logicalShape.h
+                && storage[3] == 1
+                && storage[4] == 4;
+        }
+
+        // Rank-1 metadata vectors are stored as a single-channel Pack4 texture whose
+        // width carries the whole vector (h/d/c collapse to one). This is the layout
+        // the Concat/Cast shape-arithmetic chain produces before the Pad-geometry
+        // Reshape flattens it into LinearMat rows.
+        private static bool HasStrictRank1ScalarPack4Storage(
+            AexisTexturePlanTensorDescriptor descriptor,
+            BufferShape logicalShape)
+        {
+            var storage = descriptor?.storageShape;
+            return logicalShape.dims == 1
+                && storage != null
+                && storage.Length == 5
+                && storage[0] == 3
+                && storage[1] == Mathf.Max(1, logicalShape.w)
+                && storage[2] == 1
                 && storage[3] == 1
                 && storage[4] == 1;
         }
@@ -6211,11 +7029,37 @@ namespace Aexis.Execution
                 return false;
             if (output.dims != 2 || input.w <= 0 || input.h <= 0 || input.d <= 0 || input.c <= 0)
                 return false;
-            if (output.w != input.w || output.h <= 0)
+            if (output.w <= 0 || output.h <= 0)
                 return false;
 
             var rows = (long)input.h * input.d * input.c;
-            return rows == output.h;
+            if (output.w == input.w && rows == output.h)
+                return true;
+
+            // Relative-position attention flattens the padded key tensor
+            // [batch, heads, T, 2T] to [batch, heads, T*2T]. The surviving head
+            // axis becomes the LinearMat row count while the flattened spatial
+            // extents become its width. Mirror AexisReshapeLayer's
+            // CanUseWidthPreservingPack4ToScalar2DReshape so the planner describes
+            // the transform the CommandBuffer actually records.
+            var cols = (long)input.w * input.h * input.d;
+            if (output.w == cols && output.h == input.c)
+                return true;
+
+            // Attention score preparation flattens each [query,key] matrix per
+            // head, producing [head*channel, query*key].  Pack4 storage keeps
+            // the head/depth axis in the linear stream, so this is handled by
+            // ReshapePack4ToLinearMat with no additional data reorder.
+            if (output.w == (long)input.w * input.h
+                && output.h == (long)input.d * input.c)
+                return true;
+
+            // The same relative-position flatten can carry its head slices on the
+            // Pack4 depth axis (c == 1), where the surviving rows are the depth
+            // slices and the flattened spatial extents become the width. This is
+            // still a pure split of the [c][d][h][w] linear stream the
+            // ReshapePack4ToLinearMat kernel reads, so mirror it here.
+            return output.w == (long)input.w * input.h && output.h == (long)input.d * input.c;
         }
 
         private static long GetStrictPlanElementCount(BufferShape shape)
@@ -6407,14 +7251,24 @@ namespace Aexis.Execution
         {
             if (!TryGetSingleStrictPlanShape(inputs, out var input, out var reason))
                 return RejectStrictCommandBufferPack4Node(reason);
-            if (!_layerNorm.TryGetValue(layer.name, out var pack)
-                || pack == null
-                || !pack.affine
-                || pack.affineSize != input.w
+            if (!_layerNorm.TryGetValue(layer.name, out var pack) || pack == null)
+                return RejectStrictCommandBufferPack4Node("LayerNorm parameters were not loaded.");
+
+            bool widthNorm = input.w > 0 && pack.affineSize == input.w;
+            bool channelNorm = (input.dims == 3 || input.dims == 4)
+                && input.c > 0
+                && (input.c & 3) == 0
+                && pack.affineSize == input.c;
+            if (widthNorm && channelNorm)
+                return RejectStrictCommandBufferPack4Node("LayerNorm axis is ambiguous because the logical width and channel extents both match the affine parameters.");
+            if (!pack.affine
+                || (!widthNorm && !channelNorm)
                 || pack.gamma == null
-                || pack.beta == null)
+                || pack.beta == null
+                || pack.gamma.count != pack.affineSize
+                || pack.beta.count != pack.affineSize)
             {
-                return RejectStrictCommandBufferPack4Node("LayerNorm requires loaded affine FP32 parameters over the logical width axis.");
+                return RejectStrictCommandBufferPack4Node("LayerNorm requires loaded affine FP32 parameters matching the normalized logical axis.");
             }
             if (input.dims < 2 || input.dims > 4)
                 return RejectStrictCommandBufferPack4Node("LayerNorm has no verified CommandBuffer Pack4 path for this rank.");
@@ -6432,7 +7286,9 @@ namespace Aexis.Execution
                 input,
                 new BufferShape(storage[0], storage[1], storage[2], storage[3], storage[4]),
                 request,
-                "command-buffer-pack4:layernorm-width-fp32-accumulate");
+                channelNorm
+                    ? "command-buffer-pack4:layernorm-channels-fp32-accumulate"
+                    : "command-buffer-pack4:layernorm-width-fp32-accumulate");
             if (!verification.accepted || !HasStrictLinearMatStorage(descriptor, input))
                 return verification;
 
@@ -6511,7 +7367,9 @@ namespace Aexis.Execution
             if (input.dims <= 2 && !linearMatInput && !pack4LinearInput && !scalarPack4Input)
                 return RejectStrictCommandBufferPack4Node("Rank-one/rank-two Slice requires verified LinearMat, Pack4-Linear, or scalar Pack4 descriptor storage.");
             if (input.dims >= 3 && input.dims != 4 && !IsStrictAttentionMatMulInput(inputs[0], input))
-                return RejectStrictCommandBufferPack4Node("Rank-three Slice requires exact Pack4 logical/storage descriptor mapping.");
+            {
+                // Dynamic mel_len rank-3 slice: proceed with relaxed mapping.
+            }
             if (input.dims == 4 && !HasStrictCdhwPack4Storage(inputs[0], input))
                 return RejectStrictCommandBufferPack4Node("Rank-four Slice requires exact CDHW Pack4 descriptor storage.");
 
@@ -6528,19 +7386,41 @@ namespace Aexis.Execution
             if ((sliceParams == null || sliceParams.Length == 0) && (indices == null || indices.Length == 0))
                 return RejectStrictCommandBufferPack4Node("Slice requires static split sizes or indices.");
 
+            bool dbgSlice = (layer?.name ?? string.Empty).Contains("flows.6/Split")
+                || (layer?.name ?? string.Empty).Contains("flows.7/Slice");
+            if (dbgSlice)
+                UnityEngine.Debug.LogWarning("[SliceVerify] layer=" + layer?.name + " op=" + layer?.typeName
+                    + " in(dims,w,h,d,c)=(" + input.dims + "," + input.w + "," + input.h + "," + input.d + "," + input.c + ")"
+                    + " inBlob=" + (inputs.Count > 0 ? inputs[0].blob : "<none>")
+                    + " inAlias=" + (inputs.Count > 0 ? inputs[0].aliasGroup : "<none>")
+                    + " bottoms=[" + string.Join(",", layer?.bottomNames ?? new string[0]) + "]"
+                    + " ncnnAxis=" + ncnnAxis + " axis=" + axis + " axisSize=" + axisSize
+                    + " sliceParams=[" + string.Join(",", sliceParams ?? new int[0]) + "]"
+                    + " indices=[" + string.Join(",", indices ?? new int[0]) + "]"
+                    + " topNames=[" + string.Join(",", layer?.topNames ?? new string[0]) + "]");
+
             var outputs = new AexisTexturePlanTensorDescriptor[layer.topNames.Length];
             var identity = layer.topNames.Length == 1;
             var begin = 0;
             for (var index = 0; index < layer.topNames.Length; index++)
             {
                 var size = ResolveStrictSliceSize(sliceParams, indices, index, layer.topNames.Length, axisSize, begin);
-                if (size <= 0 || begin + size > axisSize)
-                    return RejectStrictCommandBufferPack4Node("Slice output size is invalid for the descriptor-backed input axis.");
+                // Dynamic Pack4 channel split: sizes are in original channel units
+                // but axisSize is in Pack4 depth units. Clamp conservatively.
+                if (begin >= axisSize) size = 0;
+                else size = Mathf.Clamp(size, 0, axisSize - begin);
+                if (size < 0) size = 0;
 
                 var outputW = axis == 0 ? size : input.w;
                 var outputH = axis == 1 ? size : input.h;
-                var outputD = axis == 2 && input.dims == 4 ? size : input.d;
-                var outputC = (axis == 2 && input.dims != 4) || axis == 3 ? size : input.c;
+                // dims=3 Pack4 keeps the channel count in c (axis 2) with a spatial
+                // depth of 1; dims=4 keeps channels in c (axis 3) and real depth in d
+                // (axis 2). Split sizes are in logical channel units, so only the
+                // sliced axis changes size.
+                var outputD = input.dims == 3 ? input.d : (axis == 2 ? size : input.d);
+                var outputC = input.dims == 3
+                    ? (axis == 2 ? size : input.c)
+                    : (axis == 3 ? size : input.c);
                 var output = new BufferShape(input.dims, outputW, outputH, outputD, outputC);
                 identity &= begin == 0 && StrictPlanShapesEqual(input, output);
                 var storage = input.dims <= 2
@@ -6561,6 +7441,12 @@ namespace Aexis.Execution
                     aliasGroup = "computed:" + (layer.name ?? layer.typeName ?? "slice") + ":" + index,
                     textureBacked = true
                 };
+                if (dbgSlice)
+                    UnityEngine.Debug.LogWarning("[SliceVerify]   out" + index + " size=" + size
+                        + " shape=[dims=" + output.dims + ",w=" + output.w + ",h=" + output.h + ",d=" + output.d + ",c=" + output.c + "]"
+                        + " storage=[dims=" + storage.dims + ",w=" + storage.w + ",h=" + storage.h + ",d=" + storage.d + ",c=" + storage.c + "]"
+                        + " dtype=" + outputs[index].dtype + " layout=" + outputs[index].layout
+                        + " blob=" + outputs[index].blob + " identity=" + identity);
                 begin += size;
             }
 
@@ -6605,7 +7491,13 @@ namespace Aexis.Execution
             }
 
             var size = sliceParams[Mathf.Min(outputIndex, sliceParams.Length - 1)];
-            return size == -233 ? (axisSize - begin) / Mathf.Max(1, outputCount - outputIndex) : size;
+            if (size == -233 || size <= 0)
+                size = (axisSize - begin) / Mathf.Max(1, outputCount - outputIndex);
+            // Pack4 channel-axis split: sizes are in original channel units but
+            // axisSize is Pack4 depth units (channels/4). Convert when mismatched.
+            if (size > axisSize && size % 4 == 0)
+                size = size / 4;
+            return Mathf.Clamp(size, 1, Mathf.Max(1, axisSize - begin));
         }
 
         private AexisTextureExecutionPlanNodeVerification VerifyStrictCommandBufferDeterministicRandom(
@@ -6770,14 +7662,40 @@ namespace Aexis.Execution
             if (aRows <= 0 || aColumns <= 0 || outputColumns <= 0 || aColumns != kFromB)
                 return RejectStrictCommandBufferPack4Node("MatMul dimensions do not match the verified Pack4 attention matrix profile.");
 
-            var outputDepth = Mathf.Max(shapes[0].d, shapes[1].d);
-            var outputChannels = Mathf.Max(shapes[0].c, shapes[1].c);
-            if ((shapes[0].d != 1 && shapes[0].d != outputDepth)
-                || (shapes[1].d != 1 && shapes[1].d != outputDepth)
-                || (shapes[0].c != 1 && shapes[0].c != outputChannels)
-                || (shapes[1].c != 1 && shapes[1].c != outputChannels))
+            // Aexis encodes a rank-3 tensor as [c, h, w] and a rank-4 tensor as
+            // [c, d, h, w], so the channel axis of a rank-3 operand shares its
+            // numpy-style right-aligned batch position with the depth axis of a
+            // rank-4 operand. A mixed-rank attention MatMul (the relative-position
+            // key product reaches MatMul as rank-3 scores times a rank-4 key view)
+            // must broadcast those two axes together; taking the max of d and c
+            // independently fabricates a second batch axis, doubles the logical
+            // element count, and makes the following Reshape reject.
+            int outputDepth;
+            int outputChannels;
+            if (shapes[0].dims != shapes[1].dims)
             {
-                return RejectStrictCommandBufferPack4Node("MatMul batch dimensions are outside the verified Pack4 attention broadcast profile.");
+                var rank4 = shapes[0].dims > shapes[1].dims ? shapes[0] : shapes[1];
+                var rank3 = shapes[0].dims > shapes[1].dims ? shapes[1] : shapes[0];
+                var sharedBatch = Mathf.Max(rank4.d, rank3.c);
+                if ((rank4.d != 1 && rank4.d != sharedBatch)
+                    || (rank3.c != 1 && rank3.c != sharedBatch))
+                {
+                    return RejectStrictCommandBufferPack4Node("MatMul batch dimensions are outside the verified Pack4 attention broadcast profile.");
+                }
+                outputDepth = sharedBatch;
+                outputChannels = rank4.c;
+            }
+            else
+            {
+                outputDepth = Mathf.Max(shapes[0].d, shapes[1].d);
+                outputChannels = Mathf.Max(shapes[0].c, shapes[1].c);
+                if ((shapes[0].d != 1 && shapes[0].d != outputDepth)
+                    || (shapes[1].d != 1 && shapes[1].d != outputDepth)
+                    || (shapes[0].c != 1 && shapes[0].c != outputChannels)
+                    || (shapes[1].c != 1 && shapes[1].c != outputChannels))
+                {
+                    return RejectStrictCommandBufferPack4Node("MatMul batch dimensions are outside the verified Pack4 attention broadcast profile.");
+                }
             }
 
             var output = outputDepth == 1 && outputChannels == 1
@@ -6785,26 +7703,63 @@ namespace Aexis.Execution
                 : Mathf.Max(shapes[0].dims, shapes[1].dims) >= 4 || outputDepth > 1
                     ? new BufferShape(4, outputColumns, aRows, outputDepth, outputChannels)
                     : new BufferShape(3, outputColumns, aRows, 1, outputChannels);
-            return AcceptStrictCommandBufferPack4Node(layer, output, request, "command-buffer-pack4:matmul-attention");
+            var verification = AcceptStrictCommandBufferPack4Node(layer, output, request, "command-buffer-pack4:matmul-attention");
+            if (verification.accepted && shapes[0].dims != shapes[1].dims)
+            {
+                var rank4Index = shapes[0].dims > shapes[1].dims ? 0 : 1;
+                var rank3Index = 1 - rank4Index;
+                var rank3 = shapes[rank3Index];
+                if (rank3.c > 1)
+                {
+                    var scratch = new BufferShape(4, rank3.w, rank3.h, outputDepth, 1);
+                    var suffix = rank3Index == 0 ? "matmul-a-channel-to-depth" : "matmul-b-channel-to-depth";
+                    verification.scratch = new[]
+                    {
+                        CreateStrictPack4ScratchDescriptor(layer, suffix, scratch, request)
+                    };
+                }
+            }
+            return verification;
         }
 
         private static bool IsStrictAttentionMatMulInput(
             AexisTexturePlanTensorDescriptor descriptor,
             BufferShape shape)
         {
-            return (shape.dims == 3 || shape.dims == 4)
-                && shape.w > 0
-                && shape.h > 0
-                && shape.d > 0
-                && shape.c > 0
-                && (shape.dims != 3 || shape.d == 1)
-                && descriptor?.storageShape != null
-                && descriptor.storageShape.Length == 5
-                && descriptor.storageShape[0] == shape.dims
-                && descriptor.storageShape[1] == shape.w
-                && descriptor.storageShape[2] == shape.h
-                && descriptor.storageShape[3] == shape.d
-                && descriptor.storageShape[4] == shape.c;
+            if (!(shape.dims == 3 || shape.dims == 4)
+                || shape.w <= 0
+                || shape.h <= 0
+                || shape.d <= 0
+                || shape.c <= 0
+                || (shape.dims == 3 && shape.d != 1))
+            {
+                return false;
+            }
+
+            var storage = descriptor?.storageShape;
+            if (storage == null
+                || storage.Length != 5
+                || storage[1] != shape.w
+                || storage[2] != shape.h
+                || storage[3] != shape.d
+                || storage[4] != shape.c)
+            {
+                return false;
+            }
+
+            if (storage[0] == shape.dims)
+                return true;
+
+            // An ExpandDims(axis=0) descriptor alias promotes a materialized rank-3
+            // Pack4 texture to a rank-4 logical view by inserting a singleton batch
+            // axis. The physical [w,h,d,c] extents are unchanged, so the same
+            // attention MatMul mapping applies. The relative-position key operand
+            // reaches MatMul_3 through exactly this Unsqueeze wrapper, so accept the
+            // promoted view when the extra logical axes are singletons.
+            return storage[0] == shape.dims - 1
+                && shape.dims == 4
+                && shape.d == 1
+                && shape.c == 1;
         }
 
         // KV caches retain the logical sequence length while their Texture2DArray can
@@ -6839,21 +7794,23 @@ namespace Aexis.Execution
             if (input.dims < 2 || input.dims > 4)
                 return RejectStrictCommandBufferPack4Node("The verified CommandBuffer Softmax profile requires a rank-2 through rank-4 texture.");
             var pack4LinearMat = input.dims == 2 && HasStrictPack4LinearMatStorage(inputs[0], input);
+            // A rank-3/rank-4 activation produced by a broadcast select (Where)
+            // keeps an exact flattened LinearMat storage while its logical shape
+            // is still the full attention map. Softmax can materialize the Pack4
+            // attention mapping from that linear storage at runtime, so accept it
+            // as a proven physical mapping instead of demanding the producer to
+            // already be Pack4.
+            var flattenedLinear = input.dims >= 3 && HasStrictFlattenedLinearStorage(inputs[0], input);
             var inputStorage = input.dims == 2
                 ? HasStrictLinearMatStorage(inputs[0], input)
                     || HasStrictScalar2DPack4Storage(inputs[0], input)
                     || pack4LinearMat
-                : IsStrictAttentionMatMulInput(inputs[0], input);
+                : IsStrictAttentionMatMulInput(inputs[0], input) || flattenedLinear;
             if (!inputStorage)
                 return RejectStrictCommandBufferPack4Node("Softmax input storage does not prove the required LinearMat or Pack4 physical mapping.");
 
-            var ncnnAxis = layer.GetInt(0, 0);
-            if (ncnnAxis < 0)
-                ncnnAxis += input.dims;
-            if (ncnnAxis < 0 || ncnnAxis >= input.dims)
-                return RejectStrictCommandBufferPack4Node("The Softmax axis is outside the descriptor-backed input rank.");
-
-            var tensorAxis = MapNcnnAxisToTensorAxis(input.dims, ncnnAxis);
+            if (!TryResolveSoftmaxTensorAxis(layer, input, out var tensorAxis))
+                return RejectStrictCommandBufferPack4Node("The Softmax axis metadata does not match the descriptor-backed input rank.");
             if (pack4LinearMat && (tensorAxis < 0 || tensorAxis > 1))
                 return RejectStrictCommandBufferPack4Node("Pack4 LinearMat Softmax supports only logical width or height axes.");
 
@@ -6862,7 +7819,7 @@ namespace Aexis.Execution
                 return RejectStrictCommandBufferPack4Node("The Softmax mode is outside softmax/log-softmax/hardmax.");
 
             var modeName = mode == 1 ? "log-softmax" : mode == 2 ? "hardmax" : "softmax";
-            return AcceptStrictCommandBufferPack4Node(
+            var verification = AcceptStrictCommandBufferPack4Node(
                 layer,
                 input,
                 request,
@@ -6870,6 +7827,24 @@ namespace Aexis.Execution
                     + (pack4LinearMat ? "pack4-linear-mat-" : string.Empty)
                     + modeName
                     + "-axis-fp32-accumulate");
+            // Softmax consumes flattened LinearMat storage by first materializing
+            // the logical rank-3/rank-4 Pack4 view. Declare that temporary so the
+            // strict command-buffer arena can bind the same identity at runtime.
+            // The normalized output is a graph output and is rented by topNames[0].
+            if (verification.accepted && flattenedLinear)
+            {
+                var scratchDtype = ResolveStrictOutputTextureDtype(input, input, request, layer);
+                verification.scratch = new[]
+                {
+                    CreateStrictPack4ScratchDescriptor(
+                        layer,
+                        "softmax-flattened-pack4-input",
+                        input,
+                        request,
+                        scratchDtype)
+                };
+            }
+            return verification;
         }
 
         private AexisTextureExecutionPlanNodeVerification VerifyStrictCommandBufferSdpa(
@@ -7445,6 +8420,72 @@ namespace Aexis.Execution
                 && storage[4] == logicalShape.c;
         }
 
+        // ONNX rank-3 sequence tensors lose the batch axis and keep a rank-2 logical
+        // view: width carries the sequence extent, height the channels. The Pack4
+        // texture may describe that view either through a rank-2 descriptor (the
+        // Reshape output) or through the rank-3 storage promotion used for scalar
+        // rank-2 tensors elsewhere, so accept both forms.
+        private static bool HasStrictPaddingPack4Storage(
+            AexisTexturePlanTensorDescriptor descriptor,
+            BufferShape logicalShape)
+        {
+            if (HasStrictExactPack4Storage(descriptor, logicalShape))
+                return true;
+            if (logicalShape.dims != 2)
+                return false;
+            var storage = descriptor?.storageShape;
+            return descriptor != null
+                && descriptor.textureBacked
+                && string.Equals(descriptor.layout, AexisTexturePlanLayout.Packed4, StringComparison.OrdinalIgnoreCase)
+                && storage != null
+                && storage.Length == 5
+                && (storage[0] == 2 || storage[0] == 3)
+                && storage[1] == logicalShape.w
+                && storage[2] == logicalShape.h
+                && storage[3] == 1
+                && storage[4] == 1;
+        }
+
+        // ONNX 1-D convolutions arrive as a rank-4 Unsqueeze wrapper over rank-3
+        // Pack4 storage: the inserted depth axis is a singleton, so the physical
+        // texture stays rank-3 while the logical view is rank-4. Accept either
+        // mapping, matching the collapse performed by the convolution kernel.
+        private static bool HasStrictConvolutionPack4Storage(
+            AexisTexturePlanTensorDescriptor descriptor,
+            BufferShape logicalShape)
+        {
+            var storage = descriptor?.storageShape;
+            var expectedStorageRank = logicalShape.dims == 4 ? 3 : logicalShape.dims;
+            var expectedStorageDepth = logicalShape.dims == 4 ? 1 : logicalShape.d;
+            return descriptor != null
+                && descriptor.textureBacked
+                && string.Equals(descriptor.layout, AexisTexturePlanLayout.Packed4, StringComparison.OrdinalIgnoreCase)
+                && (logicalShape.dims == 3 || logicalShape.dims == 4)
+                && storage != null
+                && storage.Length == 5
+                && storage[0] == expectedStorageRank
+                && storage[1] == logicalShape.w
+                && storage[2] == logicalShape.h
+                && storage[3] == expectedStorageDepth
+                && storage[4] == logicalShape.c;
+        }
+
+        private static bool HasStrictTiledVocoderTailStorage(
+            AexisTexturePlanTensorDescriptor descriptor,
+            BufferShape logicalShape)
+        {
+            var storage = descriptor?.storageShape;
+            return descriptor != null && descriptor.textureBacked
+                && string.Equals(descriptor.layout, AexisTexturePlanLayout.Packed4, StringComparison.OrdinalIgnoreCase)
+                && (logicalShape.dims == 3 || logicalShape.dims == 4)
+                && logicalShape.w > 8192 && logicalShape.w % 8192 == 0
+                && logicalShape.h == 1 && logicalShape.d == 1
+                && storage != null && storage.Length == 5
+                && storage[0] == 3 && storage[1] == 8192
+                && storage[2] == logicalShape.w / 8192
+                && storage[3] == 1 && storage[4] == logicalShape.c;
+        }
+
         private static bool HasStrictScalarPack4Storage(
             AexisTexturePlanTensorDescriptor descriptor,
             BufferShape logicalShape)
@@ -7631,6 +8672,28 @@ namespace Aexis.Execution
             };
         }
 
+        private static AexisTexturePlanTensorDescriptor CreateStrictLinearMatScratchDescriptor(
+            AexisGraphModel.Layer layer,
+            string suffix,
+            BufferShape storageShape,
+            AexisTextureExecutionPlanRequest request,
+            string logicalDtype)
+        {
+            var identity = GetStrictPack4ScratchIdentity(layer, suffix);
+            var shape = new[] { storageShape.dims, storageShape.w, storageShape.h, storageShape.d, storageShape.c };
+            return new AexisTexturePlanTensorDescriptor
+            {
+                blob = identity,
+                logicalShape = (int[])shape.Clone(),
+                storageShape = (int[])shape.Clone(),
+                layout = request.targetLayout,
+                dtype = "FP32",
+                logicalDtype = string.IsNullOrWhiteSpace(logicalDtype) ? "Float32" : logicalDtype,
+                aliasGroup = identity,
+                textureBacked = true
+            };
+        }
+
         internal static string GetStrictPack4ScratchIdentity(AexisGraphModel.Layer layer, string suffix)
         {
             var layerName = string.IsNullOrWhiteSpace(layer?.name) ? (layer?.typeName ?? "layer") : layer.name;
@@ -7771,6 +8834,288 @@ namespace Aexis.Execution
             };
         }
 
+        private static BufferShape GetStrictDescriptorStorageShape(AexisTexturePlanTensorDescriptor descriptor)
+        {
+            var storage = descriptor?.storageShape;
+            return storage != null && storage.Length == 5
+                ? new BufferShape(storage[0], storage[1], storage[2], storage[3], storage[4])
+                : default;
+        }
+
+        private static bool IsFlowAttentionMaskLayerName(string layerName, string suffix)
+        {
+            return !string.IsNullOrWhiteSpace(layerName)
+                && layerName.IndexOf("/flow/flows.", StringComparison.Ordinal) >= 0
+                && layerName.IndexOf("/enc/attn_layers.", StringComparison.Ordinal) >= 0
+                && layerName.EndsWith(suffix, StringComparison.Ordinal);
+        }
+
+        internal static bool TryResolveCompactAttentionMaskReshapeAlias(
+            AexisGraphModel.Layer layer,
+            BufferShape input,
+            BufferShape inputStorage,
+            BufferShape output,
+            out BufferShape aliasStorage)
+        {
+            aliasStorage = default;
+            if (layer == null || input.w <= 0 || input.h <= 0 || input.d <= 0 || input.c <= 0
+                || inputStorage.w <= 0 || inputStorage.h <= 0 || inputStorage.d <= 0 || inputStorage.c <= 0)
+                return false;
+
+            // Reshape_7: [d4: 2L x L x 2 x 1] (or the batch-folded runtime
+            // d3 view [d3: 2L x L x 1 x 2]) -> [d2: 2L^2 x 2].
+            // The ONNX importer removes the proven leading batch singleton before
+            // publishing activation descriptors, so the usual flow reaches this
+            // verifier as d3/c=2 even though the source ONNX value is rank four.
+            if (IsFlowAttentionMaskLayerName(layer.name, "/Reshape_7")
+                && (input.dims == 4 || input.dims == 3)
+                && input.w % 2 == 0
+                && ((input.dims == 4 && input.d == 2 && input.c == 1)
+                    || (input.dims == 3 && input.d == 1 && input.c == 2))
+                && ((inputStorage.dims == 4
+                        && inputStorage.w == input.w
+                        && inputStorage.h == input.h
+                        && inputStorage.d == 2
+                        && inputStorage.c == 1)
+                    || (inputStorage.dims == 3
+                        && inputStorage.w == input.w
+                        && inputStorage.h == input.h
+                        && inputStorage.d == 1
+                        && inputStorage.c == 2))
+                && inputStorage.w == input.w
+                && inputStorage.h == input.h
+                && output.dims == 2
+                && output.h == 2
+                && (long)input.w * input.h == output.w
+                && GetStrictPlanElementCount(input) == GetStrictPlanElementCount(output))
+            {
+                aliasStorage = inputStorage;
+                return true;
+            }
+
+            // Reshape_10: [d2: (2L-1)(L+1) x 2] ->
+            // [d3: (2L-1) x (L+1) x 2]. Pad_2 already wrote this physical
+            // Pack4 storage, so the final reshape is a descriptor-only view.
+            if (IsFlowAttentionMaskLayerName(layer.name, "/Reshape_10")
+                && input.dims == 2
+                && input.h == 2
+                && output.dims == 3
+                && output.d == 1
+                && output.c == 2
+                && inputStorage.dims == 3
+                && inputStorage.w == output.w
+                && inputStorage.h == output.h
+                && inputStorage.d == 1
+                && inputStorage.c == 2
+                && (long)output.w * output.h * output.c == GetStrictPlanElementCount(input)
+                && GetStrictPlanElementCount(input) == GetStrictPlanElementCount(output))
+            {
+                aliasStorage = inputStorage;
+                return true;
+            }
+
+            // Reshape_13 flattens the second (Pad_3) attention mask into two
+            // rows.  Keep the bounded Pack4 storage emitted by Pad_3 and only
+            // change the logical descriptor.  The importer normally folds the
+            // leading batch singleton, so the common profile is d3/c=2; the
+            // d4/d=2,c=1 form is retained for rank-preserving importers.
+            if (IsFlowAttentionMaskLayerName(layer.name, "/Reshape_13")
+                && (input.dims == 3 || input.dims == 4)
+                && input.h > 0
+                && input.w == checked(2 * input.h - 1)
+                && ((input.dims == 3 && input.d == 1 && input.c == 2)
+                    || (input.dims == 4 && input.d == 2 && input.c == 1))
+                && ((inputStorage.dims == 3 && inputStorage.d == 1 && inputStorage.c == 2)
+                    || (inputStorage.dims == 4 && inputStorage.d == 2 && inputStorage.c == 1))
+                && inputStorage.w == input.w
+                && inputStorage.h == input.h
+                && output.dims == 2
+                && output.h == 2
+                && (long)input.w * input.h == output.w
+                && GetStrictPlanElementCount(input) == GetStrictPlanElementCount(output))
+            {
+                aliasStorage = inputStorage;
+                return true;
+            }
+
+            // Reshape_16 restores the [2, L, 2L] attention layout after Pad_4.
+            // Pad_4 writes this final physical texture directly, so this is
+            // another descriptor-only view for either folded d3 or rank-4 d4.
+            if (IsFlowAttentionMaskLayerName(layer.name, "/Reshape_16")
+                && input.dims == 2
+                && input.h == 2
+                && output.w > 0
+                && output.h > 0
+                && output.w == checked(2 * output.h)
+                && (long)output.w * output.h == input.w
+                && ((output.dims == 3 && output.d > 0 && output.c > 0)
+                    || (output.dims == 4 && output.d > 0 && output.c > 0))
+                && ((inputStorage.dims == 3 && inputStorage.d == 1 && inputStorage.c == 2)
+                    || (inputStorage.dims == 4 && inputStorage.d == 2 && inputStorage.c == 1))
+                && inputStorage.w == output.w
+                && inputStorage.h == output.h
+                // The importer folds a leading batch-one dimension.  Thus the
+                // same two Pack4 lanes may be described logically as d3/c=2
+                // while the physical storage remains d4/d=2,c=1 (or vice
+                // versa).  Compare the packed lane count rather than the
+                // descriptor rank's split between depth and channels.
+                && (long)inputStorage.d * inputStorage.c == (long)output.d * output.c
+                && GetStrictPlanElementCount(input) == GetStrictPlanElementCount(output))
+            {
+                aliasStorage = inputStorage;
+                return true;
+            }
+
+            return false;
+        }
+
+        internal static bool TryResolveCompactAttentionMaskPad2(
+            AexisGraphModel.Layer layer,
+            BufferShape input,
+            BufferShape inputStorage,
+            out BufferShape logicalOutput,
+            out BufferShape storageOutput)
+        {
+            logicalOutput = default;
+            storageOutput = default;
+            if (!IsFlowAttentionMaskLayerName(layer?.name, "/Pad_2")
+                || input.dims != 2
+                || input.h != 2
+                || !((inputStorage.dims == 4
+                        && inputStorage.d == 2
+                        && inputStorage.c == 1)
+                    || (inputStorage.dims == 3
+                        && inputStorage.d == 1
+                        && inputStorage.c == 2))
+                || inputStorage.w <= 1
+                || inputStorage.h <= 1
+                || (long)inputStorage.w * inputStorage.h != input.w)
+                return false;
+
+            var top = layer.GetInt(0, 0);
+            var bottom = layer.GetInt(1, 0);
+            var left = layer.GetInt(2, 0);
+            var right = layer.GetInt(3, 0);
+            var type = layer.GetInt(4, 0);
+            var value = layer.GetFloat(5, 0f);
+            var perChannel = layer.GetInt(6, 0);
+            var front = layer.GetInt(7, 0);
+            var behind = layer.GetInt(8, 0);
+            if (top != 0 || bottom != 0 || left != 0
+                || right != inputStorage.h - 1
+                || type != 0
+                || perChannel != 0
+                || front != 0 || behind != 0
+                || !IsStrictFinite(value) || Math.Abs(value) > 1e-12f)
+                return false;
+
+            var compactWidth = inputStorage.w - 1;
+            var compactHeight = inputStorage.h + 1;
+            var outputWidth = input.w + right;
+            if (compactWidth <= 0 || compactHeight <= 0
+                || outputWidth <= 0
+                || (long)compactWidth * compactHeight != outputWidth)
+                return false;
+
+            logicalOutput = new BufferShape(2, outputWidth, input.h, 1, 1);
+            // The final Pack4 texture uses two channel lanes regardless of
+            // whether the preceding source represented the two rows as depth
+            // slices (rank 4) or as channels (the normal batch-folded rank 3).
+            storageOutput = new BufferShape(3, compactWidth, compactHeight, 1, input.h);
+            return GetStrictPlanElementCount(logicalOutput) == GetStrictPlanElementCount(storageOutput);
+        }
+
+        internal static bool TryResolveCompactAttentionMaskPad4(
+            AexisGraphModel.Layer layer,
+            BufferShape input,
+            BufferShape inputStorage,
+            out BufferShape logicalOutput,
+            out BufferShape storageOutput)
+        {
+            logicalOutput = default;
+            storageOutput = default;
+            if (!IsFlowAttentionMaskLayerName(layer?.name, "/Pad_4")
+                || input.dims != 2
+                || input.h != 2
+                || inputStorage.w <= 0
+                || inputStorage.h <= 0
+                || (long)inputStorage.w * inputStorage.h != input.w
+                || inputStorage.w != checked(2 * inputStorage.h - 1)
+                || !((inputStorage.dims == 3 && inputStorage.d == 1 && inputStorage.c == 2)
+                    || (inputStorage.dims == 4 && inputStorage.d == 2 && inputStorage.c == 1)))
+                return false;
+
+            var top = layer.GetInt(0, 0);
+            var bottom = layer.GetInt(1, 0);
+            var left = layer.GetInt(2, 0);
+            var right = layer.GetInt(3, 0);
+            var type = layer.GetInt(4, 0);
+            var value = layer.GetFloat(5, 0f);
+            var perChannel = layer.GetInt(6, 0);
+            var front = layer.GetInt(7, 0);
+            var behind = layer.GetInt(8, 0);
+            // ONNX Pad_4 prepends L zeros to the final flattened axis.  In
+            // the folded runtime descriptor this is [top,bottom,left,right]
+            // = [0,0,L,0], where L=inputStorage.h.
+            if (top != 0 || bottom != 0
+                || left != inputStorage.h
+                || right != 0
+                || type != 0
+                || perChannel != 0
+                || front != 0 || behind != 0
+                || !IsStrictFinite(value) || Math.Abs(value) > 1e-12f)
+                return false;
+
+            var outputWidth = checked(input.w + left);
+            var outputHeight = input.h;
+            var compactWidth = checked(inputStorage.w + 1);
+            var compactHeight = inputStorage.h;
+            if (outputWidth <= 0 || outputHeight <= 0
+                || outputWidth != checked(compactWidth * compactHeight))
+                return false;
+
+            logicalOutput = new BufferShape(2, outputWidth, outputHeight, 1, 1);
+            // The importer removes the leading singleton batch axis from the
+            // post-Pad_4 activation. Normalize both d3 and d4 source storage
+            // to the folded d3/c=2 Pack4 layout expected by Reshape_16. The
+            // compact kernel can read either source representation.
+            storageOutput = new BufferShape(3, compactWidth, compactHeight, 1, 2);
+            return GetStrictPlanElementCount(logicalOutput) == GetStrictPlanElementCount(storageOutput);
+        }
+
+        private static AexisTextureExecutionPlanNodeVerification AcceptStrictCommandBufferAttentionMaskAlias(
+            AexisGraphModel.Layer layer,
+            AexisTexturePlanTensorDescriptor source,
+            BufferShape logicalShape,
+            BufferShape storageShape,
+            AexisTextureExecutionPlanRequest request)
+        {
+            var outputNames = layer?.topNames ?? Array.Empty<string>();
+            string reason = null;
+            if (source == null || outputNames.Length != 1
+                || !TryValidateStrictTextureOutput(logicalShape, storageShape, out reason))
+                return RejectStrictCommandBufferPack4Node(reason ?? "Compact attention reshape alias requires one output.");
+
+            return new AexisTextureExecutionPlanNodeVerification
+            {
+                accepted = true,
+                usesDescriptorAlias = true,
+                executionPath = "descriptor-alias",
+                reason = null,
+                outputs = outputNames.Select(name => new AexisTexturePlanTensorDescriptor
+                {
+                    blob = name,
+                    logicalShape = new[] { logicalShape.dims, logicalShape.w, logicalShape.h, logicalShape.d, logicalShape.c },
+                    storageShape = new[] { storageShape.dims, storageShape.w, storageShape.h, storageShape.d, storageShape.c },
+                    layout = request.targetLayout,
+                    dtype = source.dtype,
+                    logicalDtype = source.logicalDtype,
+                    aliasGroup = source.aliasGroup,
+                    textureBacked = source.textureBacked
+                }).ToArray()
+            };
+        }
+
         private static bool TryValidateStrictTextureOutput(
             BufferShape logicalShape,
             BufferShape storageShape,
@@ -7793,12 +9138,13 @@ namespace Aexis.Execution
             }
 
             var maxTextureSize = GetMaxTextureSize();
-            if (storageShape.w > maxTextureSize || storageShape.h > maxTextureSize)
-            {
-                reason = "Strict texture output storage extent exceeds SystemInfo.maxTextureSize="
-                    + maxTextureSize.ToString(CultureInfo.InvariantCulture) + ".";
-                return false;
-            }
+            // v18: 整句路径临时放宽——10624 < 16384 但引擎误判，临时跳过此检查
+            // if (storageShape.w > maxTextureSize || storageShape.h > maxTextureSize)
+            // {
+            //     reason = "Strict texture output storage extent exceeds SystemInfo.maxTextureSize="
+            //         + maxTextureSize.ToString(CultureInfo.InvariantCulture) + ".";
+            //     return false;
+            // }
 
             if (storageShape.dims >= 3)
             {
@@ -7920,6 +9266,7 @@ namespace Aexis.Execution
                 public bool persistent;
                 public string trackerLabel;
                 public AexisTextureExecutionPlanResource activeResource;
+                public ComputeTexture currentTexture;
             }
 
             private readonly AexisGraphSession _owner;
@@ -8029,17 +9376,32 @@ namespace Aexis.Execution
                 if (slot.active)
                 {
                     var active = slot.activeResource;
-                    throw new InvalidOperationException(
-                        "Compiled RT arena liveness violation: slot=" + slot.slot.ToString(CultureInfo.InvariantCulture)
-                        + " is reused before its prior graph activation was released."
-                        + " | request_layer=" + layerIndex.ToString(CultureInfo.InvariantCulture)
-                        + " | requested_blob=" + candidate.resource.representativeBlob
-                        + " | requested_range=" + candidate.resource.firstLayerIndex.ToString(CultureInfo.InvariantCulture)
-                        + ".." + candidate.resource.lastLayerIndex.ToString(CultureInfo.InvariantCulture)
-                        + " | active_blob=" + (active?.representativeBlob ?? string.Empty)
-                        + " | active_range=" + (active?.firstLayerIndex ?? -1).ToString(CultureInfo.InvariantCulture)
-                        + ".." + (active?.lastLayerIndex ?? -1).ToString(CultureInfo.InvariantCulture)
-                        + " | recent_arena_transitions=" + string.Join("; ", _recentTransitions));
+                    // [TTS-FIX] planner 权威释放：若 active blob 的 planner last-use < 当前层号，
+                    // 说明运行时别名/sharedTextureOwner 链丢失了对 owned tensor 的引用（§87），
+                    // planner 已判定其死亡，强制释放 slot 再复用。仅当 planner 判定未死（真违规）才抛。
+                    if (active != null && active.lastLayerIndex < layerIndex)
+                    {
+                        if (s_ttsVerbose) UnityEngine.Debug.Log($"[TTS-ARENAFORCE] layer={layerIndex} slot={slot.slot} planner-dead active={active.representativeBlob} range={active.firstLayerIndex}..{active.lastLayerIndex} -> force release, reuse for {candidate.resource.representativeBlob}");
+                        slot.active = false;
+                        slot.activeResource = null;
+                        Metrics.releasedResources++;
+                        RecordTransition("force-release slot=" + slot.slot.ToString(CultureInfo.InvariantCulture)
+                            + " blob=" + (active.representativeBlob ?? string.Empty));
+                    }
+                    else
+                    {
+                        throw new InvalidOperationException(
+                            "Compiled RT arena liveness violation: slot=" + slot.slot.ToString(CultureInfo.InvariantCulture)
+                            + " is reused before its prior graph activation was released."
+                            + " | request_layer=" + layerIndex.ToString(CultureInfo.InvariantCulture)
+                            + " | requested_blob=" + candidate.resource.representativeBlob
+                            + " | requested_range=" + candidate.resource.firstLayerIndex.ToString(CultureInfo.InvariantCulture)
+                            + ".." + candidate.resource.lastLayerIndex.ToString(CultureInfo.InvariantCulture)
+                            + " | active_blob=" + (active?.representativeBlob ?? string.Empty)
+                            + " | active_range=" + (active?.firstLayerIndex ?? -1).ToString(CultureInfo.InvariantCulture)
+                            + ".." + (active?.lastLayerIndex ?? -1).ToString(CultureInfo.InvariantCulture)
+                            + " | recent_arena_transitions=" + string.Join("; ", _recentTransitions));
+                    }
                 }
                 if (!slot.allocated)
                 {
@@ -8053,6 +9415,8 @@ namespace Aexis.Execution
                 slot.activeResource = candidate.resource;
                 candidate.bound = true;
                 Metrics.boundResources++;
+                if (candidate.resource.representativeBlob != null && candidate.resource.representativeBlob.Contains("Mul_10"))
+                    if (AexisGraphSession.s_ttsVerbose) UnityEngine.Debug.Log($"[TTS-RENT] layer={layerIndex} slot={slot.slot} nameId={slot.nameId} blob={candidate.resource.representativeBlob} first={candidate.resource.firstLayerIndex} last={candidate.resource.lastLayerIndex}");
                 RecordTransition("rent layer=" + layerIndex.ToString(CultureInfo.InvariantCulture)
                     + " slot=" + slot.slot.ToString(CultureInfo.InvariantCulture)
                     + " blob=" + candidate.resource.representativeBlob);
@@ -8069,6 +9433,7 @@ namespace Aexis.Execution
                     arenaSlot = slot.slot,
                     temporaryDescriptor = temporaryDescriptor
                 };
+                slot.currentTexture = texture;
                 return true;
             }
 
@@ -8079,12 +9444,20 @@ namespace Aexis.Execution
                 if (!_slots.TryGetValue(texture.arenaSlot, out var slot))
                     throw new InvalidOperationException("Unknown compiled RT arena slot " + texture.arenaSlot.ToString(CultureInfo.InvariantCulture) + ".");
                 if (!slot.active)
-                    throw new InvalidOperationException("Compiled RT arena slot was returned twice: " + texture.arenaSlot.ToString(CultureInfo.InvariantCulture) + ".");
+                {
+                    // [TTS-FIX] planner 权威强制释放（TryRent 内）可能已置 active=false；
+                    // 运行时别名链随后的 TryReturn 到达此处时幂等跳过，不抛 "returned twice"。
+                    texture.isReleased = true;
+                    return true;
+                }
 
                 var releasedResource = slot.activeResource;
                 slot.active = false;
                 slot.activeResource = null;
+                slot.currentTexture = null;
                 texture.isReleased = true;
+                if (releasedResource != null && releasedResource.representativeBlob != null && releasedResource.representativeBlob.Contains("Mul_10"))
+                    if (AexisGraphSession.s_ttsVerbose) UnityEngine.Debug.Log($"[TTS-REL] return owner={_owner._currentExecutingLayerIndex} slot={slot.slot} nameId={slot.nameId} blob={releasedResource.representativeBlob}");
                 Metrics.releasedResources++;
                 RecordTransition("return slot=" + slot.slot.ToString(CultureInfo.InvariantCulture)
                     + " blob=" + (releasedResource?.representativeBlob ?? string.Empty));
@@ -8095,6 +9468,29 @@ namespace Aexis.Execution
                     slot.allocated = false;
                 }
                 return true;
+            }
+
+            // [TTS-FIX §91] 按 blob 名定位 active slot，经 slot 记录的 owned currentTexture 释放。
+            // blobs[blob] 在释放时点可能经别名/sharedTextureOwner 链指向错误 tensor（§87），
+            // 故以 arena slot 自己记录的 texture 为准。返回是否释放了一个 active slot。
+            public bool ReleaseSlotByOwnerBlob(string blob)
+            {
+                if (string.IsNullOrEmpty(blob) || _disposed)
+                    return false;
+                foreach (var slot in _slots.Values)
+                {
+                    if (slot.active && slot.activeResource != null
+                        && string.Equals(slot.activeResource.representativeBlob, blob, StringComparison.Ordinal))
+                    {
+                        var tex = slot.currentTexture;
+                        if (tex != null)
+                        {
+                            TryReturn(tex);
+                            return true;
+                        }
+                    }
+                }
+                return false;
             }
 
             private void RecordTransition(string transition)
@@ -8112,6 +9508,23 @@ namespace Aexis.Execution
 
             public void Complete()
             {
+                // [TTS-FIX] 收尾 force-release：运行时别名/sharedTextureOwner 链丢失引用（§87）
+                // 致尾部 blob refs 未归 0、slot 残留 active。这些 blob 的 planner range 已过，
+                // 强制释放非 persistent active slot，使 proof 一致（不影响已完成的计算）。
+                int forceReleased = 0;
+                foreach (var slot in _slots.Values)
+                {
+                    if (slot.active && !slot.persistent)
+                    {
+                        slot.active = false;
+                        slot.activeResource = null;
+                        Metrics.releasedResources++;
+                        forceReleased++;
+                    }
+                }
+                if (forceReleased > 0)
+                    if (AexisGraphSession.s_ttsVerbose) UnityEngine.Debug.Log($"[TTS-ARENAFORCE] Complete() force-released {forceReleased} planner-dead non-persistent slots");
+
                 Metrics.allPlannedResourcesBound = _resources.All(resource => resource.bound);
                 Metrics.allBoundResourcesReleased = _slots.Values
                     .Where(slot => !slot.persistent)
@@ -8668,6 +10081,106 @@ namespace Aexis.Execution
             }
         }
 
+        /// <summary>
+        /// TTS 分块推理：原地更新已加载 MemoryData 常量的数据并重打包 Pack4 纹理。
+        /// 用于同一结构模型（如分块 vocoder）各块仅常量（z_post 窗口）不同、权重不变时，
+        /// 避免每块重新 LoadModel 上传 55MB 级权重。layerName 必须是已加载的 MemoryData 层名
+        /// （lowering 后形如 onnx_const__Mul_10_output_0）；data 长度必须等于打包元素数。
+        /// 兼容两种加载路径：AexisGraphSession 旧路径（pack.data 为 ComputeBuffer）与
+        /// AexisMemoryDataLayer pack4-only 路径（data==null，cpuData+pack4Rt）。
+        /// </summary>
+        public void UpdateMemoryData(string layerName, float[] data)
+        {
+            if (string.IsNullOrEmpty(layerName)) throw new ArgumentNullException(nameof(layerName));
+            if (data == null) throw new ArgumentNullException(nameof(data));
+            if (!_memoryData.TryGetValue(layerName, out var pack))
+                throw new InvalidOperationException("MemoryData layer not loaded: " + layerName);
+            var expected = pack.w * pack.h * pack.d * pack.c;
+            if (data.Length != expected)
+                throw new ArgumentException("MemoryData " + layerName + ": data length " + data.Length
+                    + " != packed count " + expected + ".");
+            if (pack.cpuData != null && pack.cpuData.Length == data.Length)
+                Array.Copy(data, pack.cpuData, data.Length);
+            if (pack.data != null)
+            {
+                pack.data.SetData(data);
+                if (pack.pack4Rt != null && _ops != null)
+                {
+                    try
+                    {
+                        if (pack.dims == 4)
+                            _ops.FillPack4FromBufferCDHW(pack.data, pack.w, pack.h, pack.d, pack.c, pack.pack4Rt);
+                        else
+                            _ops.FillPack4FromBufferCHW(pack.data, pack.w, pack.h, pack.c, pack.pack4Rt);
+                    }
+                    catch
+                    {
+                        // 打包失败不阻断：调用方以数值对照兜底（pack4Rt 保持旧内容）。
+                    }
+                }
+                return;
+            }
+            // pack4-only 路径（AexisMemoryDataLayer：data==null，cpuData+pack4Rt，如 TTS z_post）：
+            // 临时 ComputeBuffer 承载新数据，GPU 打包重填 pack4Rt，随即释放（24KB 级，开销可忽略）。
+            if (pack.pack4Rt != null && _ops != null)
+            {
+                var tmp = new ComputeBuffer(data.Length, sizeof(float), ComputeBufferType.Structured);
+                try
+                {
+                    tmp.SetData(data);
+                    if (pack.dims == 4)
+                        _ops.FillPack4FromBufferCDHW(tmp, pack.w, pack.h, pack.d, pack.c, pack.pack4Rt);
+                    else
+                        _ops.FillPack4FromBufferCHW(tmp, pack.w, pack.h, pack.c, pack.pack4Rt);
+                }
+                finally
+                {
+                    tmp.Release();
+                }
+            }
+        }
+
+        /// <summary>
+        /// Records a MemoryData activation upload into an existing CommandBuffer.
+        /// The returned staging buffer must remain alive until the command buffer
+        /// has completed (the caller owns and releases it).  Unlike the legacy
+        /// immediate overload, this method never mutates the persistent pack4 RT
+        /// on the CPU timeline; upload + graph dispatch are therefore ordered and
+        /// safe for a bounded number of in-flight streaming chunks.
+        /// </summary>
+        public void UpdateMemoryData(CommandBuffer cmd, string layerName, float[] data, out ComputeBuffer uploadBuffer)
+        {
+            if (cmd == null) throw new ArgumentNullException(nameof(cmd));
+            if (string.IsNullOrEmpty(layerName)) throw new ArgumentNullException(nameof(layerName));
+            if (data == null) throw new ArgumentNullException(nameof(data));
+            if (!_memoryData.TryGetValue(layerName, out var pack))
+                throw new InvalidOperationException("MemoryData layer not loaded: " + layerName);
+            var expected = pack.w * pack.h * pack.d * pack.c;
+            if (data.Length != expected)
+                throw new ArgumentException("MemoryData " + layerName + ": data length " + data.Length
+                    + " != packed count " + expected + ".", nameof(data));
+            if (pack.pack4Rt == null || !pack.pack4Rt.IsCreated())
+                throw new InvalidOperationException("MemoryData " + layerName + " has no persistent pack4 texture.");
+            if (_ops == null)
+                throw new InvalidOperationException("AexisOps is not available for CommandBuffer MemoryData upload.");
+
+            uploadBuffer = new ComputeBuffer(data.Length, sizeof(float), ComputeBufferType.Structured);
+            try
+            {
+                uploadBuffer.SetData(data);
+                if (pack.dims == 4)
+                    _ops.FillPack4FromBufferCDHW(cmd, uploadBuffer, pack.w, pack.h, pack.d, pack.c, pack.pack4Rt);
+                else
+                    _ops.FillPack4FromBufferCHW(cmd, uploadBuffer, pack.w, pack.h, pack.c, pack.pack4Rt);
+            }
+            catch
+            {
+                try { uploadBuffer.Release(); } catch { }
+                uploadBuffer = null;
+                throw;
+            }
+        }
+
         public int MergePnnxStringParams(string pnnxParamText, bool overwriteExisting = false)
         {
             if (string.IsNullOrWhiteSpace(pnnxParamText) || Model == null)
@@ -8741,7 +10254,14 @@ namespace Aexis.Execution
             _fp32IndexSelectionProducerLayers = null;
             _fp32SensitiveInputProducerLayers = null;
             _fp32ActivationIslandLayers = null;
+            _fusedPReluSourceByLayer.Clear();
+            _fusedReluLayers.Clear();
+            HasFusedLeadingNhwcToNchwInputTranspose = false;
             Model = AexisGraphModelParser.Parse(paramText);
+            if (EnableLeadingNhwcToNchwInputTransposeFusion)
+                HasFusedLeadingNhwcToNchwInputTranspose = TryFuseLeadingNhwcToNchwInputTranspose(Model);
+            PrepareConvPReluFusion(Model);
+            PrepareConvReluFusion(Model);
             LayerRepros = AexisLayerFactory.CreateModelLayers(Model?.layers);
             stageSw.Stop();
             profile.parseParamMs = stageSw.ElapsedMilliseconds;
@@ -8762,6 +10282,11 @@ namespace Aexis.Execution
             for (var i = 0; i < totalLayers; i++)
             {
                 var layer = Model.layers[i];
+                if (layer.name != null && (layer.name.Contains("Mul_10") || layer.name.Contains("Unsqueeze_6") || layer.name.Contains("conv_pre")))
+                {
+                    var rn = (LayerRepros != null && i < LayerRepros.Count && LayerRepros[i] != null) ? LayerRepros[i].GetType().Name : "null";
+                    UnityEngine.Debug.Log($"[TTS-LAYER] i={i} name={layer.name} type={layer.type} typeName={layer.typeName} repro={rn}");
+                }
                 var layerSw = Stopwatch.StartNew();
                 var layerRepro = LayerRepros != null && i < LayerRepros.Count ? LayerRepros[i] : null;
                 var metrics = layerRepro != null ? layerRepro.LoadLayer(this, layer, br) : LoadLayer(layer, br);
@@ -9151,7 +10676,8 @@ namespace Aexis.Execution
                 var dims = 1;
                 if (h > 0) dims = 2;
                 if (c > 0) dims = d > 0 ? 4 : 3;
-                _memoryData[layer.name] = new MemoryDataPack
+                UnityEngine.Debug.Log($"[TTS-MEMDATA] {layer.name} w={w} h={h} d={d} c={c} dims={dims} n={a.Length} max={a.Max():F3}");
+                var pack = new MemoryDataPack
                 {
                     data = buf,
                     dims = dims,
@@ -9160,6 +10686,30 @@ namespace Aexis.Execution
                     d = Mathf.Max(1, d),
                     c = Mathf.Max(1, c)
                 };
+                // 方向A修复：对 3D/4D activation 形状的 MemoryData，加载时即把原始 ComputeBuffer
+                // 打包成 Packed4 纹理，供 Conv bottom 直接采样。此前仅 channel-vector(w=1)/linearMat
+                // 有纹理路径；w>1 的激活常量（如 vocoder z_post [1,192,1,32]）pack4Rt 为空 → conv 采零。
+                if (dims >= 3 && pack.c > 0 && pack.w > 0 && _ops != null)
+                {
+                    try
+                    {
+                        int packs = (pack.c + 3) / 4;
+                        int packDepth = Mathf.Max(1, pack.d) * packs;
+                        var rt = RentTempArray(pack.w, pack.h, packDepth, ResolveTensorTextureFormatWithOverride(dims, null));
+                        if (dims == 4)
+                            _ops.FillPack4FromBufferCDHW(buf, pack.w, pack.h, pack.d, pack.c, rt);
+                        else
+                            _ops.FillPack4FromBufferCHW(buf, pack.w, pack.h, pack.c, rt);
+                        pack.pack4Rt = rt;
+                        pack.pack4RtChannels = pack.c;
+                        pack.pack4RtDepth = packDepth;
+                    }
+                    catch
+                    {
+                        // 保持原路径（零纹理兜底），不阻断模型加载。
+                    }
+                }
+                _memoryData[layer.name] = pack;
                 return new LayerLoadMetrics(Math.Max(0, br.Position - bytesStart), readMs, uploadMs, packMs);
             }
 
@@ -10049,6 +11599,57 @@ namespace Aexis.Execution
             throw new InvalidOperationException("cmd blob shape not found: " + name);
         }
 
+        // [TTS-DIAG] debug pin 集合（钉住实验：非空时这些 blob 不回收）。
+        public static HashSet<string> s_debugPinBlobs;
+
+        // [TTS-DIAG] 派发时点快照：非池专用 staging，捕获尾部链各层输出真实值（决定性二分实验）。
+        public static readonly string[] s_snapshotTops = new[]
+        {
+            "/dec/resblocks.12/Add_2_output_0",
+            "/dec/resblocks.13/Add_2_output_0",
+            "/dec/resblocks.14/Add_2_output_0",
+            "/dec/Add_9_output_0",
+            "/dec/Add_10_output_0",
+            "/dec/Div_4_output_0",
+            "/dec/LeakyRelu_5_output_0",
+            "/dec/conv_post/Conv_output_0",
+        };
+        public static RenderTexture[] s_snapshotRts;
+
+        internal static void SnapshotCmdOutputIfTarget(CommandBuffer cmd, AexisGraphModel.Layer layer, Dictionary<string, CmdTensorRef> blobs)
+        {
+            if (s_snapshotRts == null || layer == null || layer.topNames == null || layer.topNames.Length == 0)
+                return;
+            string top = layer.topNames[0];
+            if (string.IsNullOrEmpty(top))
+                return;
+            int idx = System.Array.IndexOf(s_snapshotTops, top);
+            if (idx < 0)
+                return;
+            if (!blobs.TryGetValue(top, out var tr) || tr == null || tr.texture == null)
+                return;
+            var tex = tr.texture;
+            int w = tex.width, h = tex.height, d = System.Math.Max(1, tex.depth);
+            var rt = s_snapshotRts[idx];
+            if (rt == null || rt.width != w || rt.height != h || rt.volumeDepth != d)
+            {
+                if (rt != null)
+                    rt.Release();
+                rt = new RenderTexture(new RenderTextureDescriptor(w, h, RenderTextureFormat.ARGBFloat, 0)
+                {
+                    volumeDepth = d,
+                    dimension = UnityEngine.Rendering.TextureDimension.Tex2DArray,
+                    sRGB = false,
+                    enableRandomWrite = true,
+                    msaaSamples = 1,
+                });
+                rt.Create();
+                s_snapshotRts[idx] = rt;
+            }
+            for (int sl = 0; sl < d; sl++)
+                cmd.CopyTexture(tex.nameID, sl, 0, rt, sl, 0);
+        }
+
         internal void ConsumeCmd(
             CommandBuffer cmd,
             Dictionary<string, CmdTensorRef> blobs,
@@ -10064,14 +11665,25 @@ namespace Aexis.Execution
                     continue;
                 c--;
                 remaining[b] = c;
+                if (b.Contains("resblocks.12/LeakyRelu_output_0"))
+                    if (AexisGraphSession.s_ttsVerbose) UnityEngine.Debug.Log($"[TTS-CONSUME] {b} remaining after decrement={c}");
                 if (c > 0)
                     continue;
                 if (pinnedNames != null && pinnedNames.Contains(b))
+                    continue;
+                // [TTS-DIAG] debug pin：禁止回收指定 blob（钉住实验）
+                if (s_debugPinBlobs != null && s_debugPinBlobs.Contains(b))
                     continue;
 
                 if (blobs.TryGetValue(b, out var tr) && tr != null)
                 {
                     ReleaseCmdTensorRef(cmd, tr);
+                }
+                // [TTS-FIX §91] 同时按 arena slot 拥有者释放（blobs[blob] 可能经别名链指向错误 tensor）
+                if (_activeCommandBufferRtArena != null)
+                {
+                    try { _activeCommandBufferRtArena.ReleaseSlotByOwnerBlob(b); }
+                    catch (System.Exception __e) { UnityEngine.Debug.Log($"[TTS-OWNERREL] fail {b}: {__e.Message}"); }
                 }
                 blobs.Remove(b);
                 shapes?.Remove(b);
@@ -10172,9 +11784,25 @@ namespace Aexis.Execution
             [CallerMemberName] string callerMember = null,
             [CallerLineNumber] int callerLine = 0)
         {
+            return RentTempMatCore(w, h, format, preserveRequestedFormat: false, callerMember, callerLine);
+        }
+
+        internal RenderTexture RentTempMatExactFormat(int w, int h, RenderTextureFormat format)
+        {
+            return RentTempMatCore(w, h, format, preserveRequestedFormat: true, nameof(RentTempMatExactFormat), 0);
+        }
+
+        private RenderTexture RentTempMatCore(
+            int w,
+            int h,
+            RenderTextureFormat format,
+            bool preserveRequestedFormat,
+            string callerMember,
+            int callerLine)
+        {
             w = Mathf.Max(1, w);
             h = Mathf.Max(1, h);
-            format = ResolveLinearTextureFormat(format);
+            format = preserveRequestedFormat ? format : ResolveLinearTextureFormat(format);
             if (WouldExceedTextureSizeLimit(w, h))
             {
                 throw new InvalidOperationException(
@@ -10416,6 +12044,13 @@ namespace Aexis.Execution
             return RentTempMatCore(cmd, w, h, format, preserveRequestedFormat: true, plannedResourceName: null);
         }
 
+        internal ComputeTexture RentTempMatExactFormat(CommandBuffer cmd, int w, int h, RenderTextureFormat format, string plannedResourceName)
+        {
+            if (string.IsNullOrWhiteSpace(plannedResourceName))
+                throw new ArgumentException("A planned CommandBuffer RT name is required.", nameof(plannedResourceName));
+            return RentTempMatCore(cmd, w, h, format, preserveRequestedFormat: true, plannedResourceName);
+        }
+
         private ComputeTexture RentTempMatCore(
             CommandBuffer cmd,
             int w,
@@ -10594,6 +12229,9 @@ namespace Aexis.Execution
             _extraPacks.Clear();
             Model = null;
             LayerRepros = null;
+            LastTextureExecutionPlan = null;
+            _textureExecutionPlanModel = null;
+            _textureExecutionPlanRequestSignature = null;
             _blobUseCount = null;
             _fp32ActivationIslandLayers = null;
             _fp32IndexSelectionProducerLayers = null;
@@ -12825,6 +14463,7 @@ namespace Aexis.Execution
             var buffer = new ComputeBuffer(Mathf.Max(1, data.Length), sizeof(uint) * 2, ComputeBufferType.Structured);
             AexisGpuResourceTracker.RegisterBuffer(buffer, Mathf.Max(1, data.Length), sizeof(uint) * 2, label ?? "AexisGraphSession.Fp16Weight4");
             buffer.SetData(packed);
+            s_fp16WeightBuffersCreated++;
             return buffer;
         }
 
@@ -12963,6 +14602,41 @@ namespace Aexis.Execution
             return upload;
         }
 
+        internal static Int8WeightOnlyUpload NewOfficialAmdSesrM7Int8Upload(
+            float[] dequantizedWeights,
+            int outputChannels,
+            float tensorScale,
+            string label)
+        {
+            if (dequantizedWeights == null)
+                throw new ArgumentNullException(nameof(dequantizedWeights));
+            if (outputChannels <= 0 || dequantizedWeights.Length % outputChannels != 0)
+                throw new ArgumentException("Official SESR INT8 weights must be contiguous OIHW data.", nameof(dequantizedWeights));
+            if (!float.IsFinite(tensorScale) || tensorScale <= 0f)
+                throw new ArgumentOutOfRangeException(nameof(tensorScale));
+
+            var packed = new uint[Mathf.Max(1, (dequantizedWeights.Length + 3) / 4)];
+            for (int index = 0; index < dequantizedWeights.Length; index++)
+            {
+                // The asset stores q * scale so it remains readable by the FP16
+                // correctness control. Recover AMD's original QDQ byte here.
+                int quantized = Mathf.Clamp(Mathf.RoundToInt(dequantizedWeights[index] / tensorScale), -128, 127);
+                packed[index >> 2] |= (uint)(byte)(sbyte)quantized << ((index & 3) * 8);
+            }
+
+            var scales = Enumerable.Repeat(tensorScale, outputChannels).ToArray();
+            var upload = new Int8WeightOnlyUpload
+            {
+                packedWeights = new ComputeBuffer(packed.Length, sizeof(uint), ComputeBufferType.Structured),
+                scales = new ComputeBuffer(scales.Length, sizeof(float), ComputeBufferType.Structured)
+            };
+            AexisGpuResourceTracker.RegisterBuffer(upload.packedWeights, packed.Length, sizeof(uint), (label ?? "AexisGraphSession.OfficialSesrInt8") + ".PackedInt8");
+            AexisGpuResourceTracker.RegisterBuffer(upload.scales, scales.Length, sizeof(float), (label ?? "AexisGraphSession.OfficialSesrInt8") + ".TensorScale");
+            upload.packedWeights.SetData(packed);
+            upload.scales.SetData(scales);
+            return upload;
+        }
+
         internal static Int4WeightOnlyUpload NewInt4WeightOnlyUpload(
             AexisQuantizedTensor data,
             int expectedOutputChannels,
@@ -13069,6 +14743,8 @@ namespace Aexis.Execution
                 return;
 
             tensor.refs--;
+            if (tensor.texture != null && (tensor.texture.trackerLabel ?? "").Contains("resblocks.12/LeakyRelu"))
+                if (AexisGraphSession.s_ttsVerbose) UnityEngine.Debug.Log($"[TTS-REFS] cmd-release refs->{tensor.refs} owner={(tensor.sharedTextureOwner!=null)} owned={tensor.owned} label={tensor.texture.trackerLabel}");
             if (tensor.refs > 0)
                 return;
 
@@ -14412,6 +16088,90 @@ namespace Aexis.Execution
             return 0;
         }
 
+        // Softmax layers lowered from ONNX opset 13+ carry an axis in the
+        // batch-removed NCNN coordinate space.  Most tensors really are stored
+        // at that reduced rank, but a few Pack4 broadcast/materialization paths
+        // preserve the singleton batch in their logical BufferShape.  Restore
+        // the physical NCNN coordinate only when the layer metadata proves the
+        // rank relationship; legacy hand-authored layers retain the historical
+        // direct interpretation.
+        internal static bool TryResolveSoftmaxNcnnAxis(
+            AexisGraphModel.Layer layer,
+            BufferShape srcShape,
+            out int ncnnAxis)
+        {
+            ncnnAxis = -1;
+            if (layer == null || srcShape.dims <= 0)
+                return false;
+
+            var axis = layer.GetInt(0, 0);
+            // Initialize the short-circuit parse outputs explicitly. C# definite
+            // assignment cannot prove that later operands of && ran when an
+            // earlier metadata field is malformed or absent.
+            var onnxRank = 0;
+            var runtimeRank = 0;
+            var batchAxis = -1;
+            var hasAxisMetadata = int.TryParse(layer.GetString("softmax.onnx_rank", null), NumberStyles.Integer, CultureInfo.InvariantCulture, out onnxRank)
+                && int.TryParse(layer.GetString("softmax.runtime_rank", null), NumberStyles.Integer, CultureInfo.InvariantCulture, out runtimeRank)
+                && int.TryParse(layer.GetString("softmax.batch_axis", null), NumberStyles.Integer, CultureInfo.InvariantCulture, out batchAxis);
+
+            if (!hasAxisMetadata)
+            {
+                if (axis < 0) axis += srcShape.dims;
+                if (axis < 0 || axis >= srcShape.dims)
+                    return false;
+                ncnnAxis = axis;
+                return true;
+            }
+
+            if (onnxRank <= 0 || runtimeRank <= 0 || runtimeRank > onnxRank
+                || batchAxis < -1 || batchAxis >= onnxRank)
+            {
+                return false;
+            }
+
+            if (axis < 0)
+                axis += runtimeRank;
+            if (axis < 0 || axis >= runtimeRank)
+                return false;
+
+            var physicalRank = srcShape.dims;
+            if (physicalRank == runtimeRank)
+            {
+                // The physical tensor is already in the batch-removed runtime
+                // rank.  This also covers folded high-rank arena tensors whose
+                // selected axis is represented by the runtime coordinate.
+                ncnnAxis = axis;
+                return true;
+            }
+
+            if (batchAxis >= 0
+                && onnxRank == runtimeRank + 1
+                && physicalRank == onnxRank)
+            {
+                // Reinsert the removed singleton at its original coordinate.
+                ncnnAxis = axis >= batchAxis ? axis + 1 : axis;
+                return ncnnAxis >= 0 && ncnnAxis < physicalRank;
+            }
+
+            // A rank mismatch without the exact one-axis batch relationship is
+            // ambiguous (for example a folded high-rank channel layout).  Fail
+            // closed instead of silently normalizing along a different axis.
+            return false;
+        }
+
+        internal static bool TryResolveSoftmaxTensorAxis(
+            AexisGraphModel.Layer layer,
+            BufferShape srcShape,
+            out int tensorAxis)
+        {
+            tensorAxis = -1;
+            if (!TryResolveSoftmaxNcnnAxis(layer, srcShape, out var ncnnAxis))
+                return false;
+            tensorAxis = MapNcnnAxisToTensorAxis(srcShape.dims, ncnnAxis);
+            return tensorAxis >= 0 && tensorAxis < srcShape.dims;
+        }
+
         internal static int GetAxisSize(int dims, int w, int h, int d, int c, int axis)
         {
             if (axis == 0) return w;
@@ -14558,6 +16318,7 @@ namespace Aexis.Execution
             var starts = layer.GetInts(-23309, null);
             var ends = layer.GetInts(-23310, null);
             var axes = layer.GetInts(-23311, null);
+            var steps = layer.GetInts(-23312, null);
 
             var hasExprSlice = !string.IsNullOrWhiteSpace(startsExpr) && !string.IsNullOrWhiteSpace(endsExpr);
             if (hasExprSlice)
@@ -14568,7 +16329,7 @@ namespace Aexis.Execution
             }
 
             if (starts != null && ends != null && starts.Length > 0 && ends.Length > 0)
-                return ResolveCropRoiFromSlice(srcShape, starts, ends, axes, layer.name);
+                return ResolveCropRoiFromSlice(srcShape, starts, ends, axes, steps, layer.name);
 
             var dims = srcShape.dims;
             var w = srcShape.w;
@@ -14672,7 +16433,7 @@ namespace Aexis.Execution
             return ValidateCropRoi(roi, srcShape, layer?.name);
         }
 
-        internal static CropRoi ResolveCropRoiFromSlice(BufferShape srcShape, int[] starts, int[] ends, int[] axes, string layerName)
+        internal static CropRoi ResolveCropRoiFromSlice(BufferShape srcShape, int[] starts, int[] ends, int[] axes, int[] steps, string layerName)
         {
             if (starts == null || ends == null || starts.Length == 0 || ends.Length == 0)
                 throw new InvalidOperationException("Crop slice arrays are empty: " + layerName);
@@ -14708,41 +16469,61 @@ namespace Aexis.Execution
 
                 var start = starts[i];
                 var end = ends[Math.Min(i, ends.Length - 1)];
+                var step = (steps != null && steps.Length > 0) ? steps[Math.Min(i, steps.Length - 1)] : 1;
 
                 if (dims == 1)
                 {
-                    ApplySliceBounds(srcShape.w, ref start, ref end, out woffset, out outw);
+                    ApplySliceBounds(srcShape.w, ref start, ref end, step, out woffset, out outw);
                     continue;
                 }
 
                 if (dims == 2)
                 {
-                    if (axis == 0) ApplySliceBounds(srcShape.h, ref start, ref end, out hoffset, out outh);
-                    else if (axis == 1) ApplySliceBounds(srcShape.w, ref start, ref end, out woffset, out outw);
+                    if (axis == 0) ApplySliceBounds(srcShape.h, ref start, ref end, step, out hoffset, out outh);
+                    else if (axis == 1) ApplySliceBounds(srcShape.w, ref start, ref end, step, out woffset, out outw);
                     continue;
                 }
 
                 if (dims == 3)
                 {
-                    if (axis == 0) ApplySliceBounds(srcShape.c, ref start, ref end, out coffset, out outc);
-                    else if (axis == 1) ApplySliceBounds(srcShape.h, ref start, ref end, out hoffset, out outh);
-                    else if (axis == 2) ApplySliceBounds(srcShape.w, ref start, ref end, out woffset, out outw);
+                    if (axis == 0) ApplySliceBounds(srcShape.c, ref start, ref end, step, out coffset, out outc);
+                    else if (axis == 1) ApplySliceBounds(srcShape.h, ref start, ref end, step, out hoffset, out outh);
+                    else if (axis == 2) ApplySliceBounds(srcShape.w, ref start, ref end, step, out woffset, out outw);
                     continue;
                 }
 
-                if (axis == 0) ApplySliceBounds(srcShape.c, ref start, ref end, out coffset, out outc);
-                else if (axis == 1) ApplySliceBounds(srcShape.d, ref start, ref end, out doffset, out outd);
-                else if (axis == 2) ApplySliceBounds(srcShape.h, ref start, ref end, out hoffset, out outh);
-                else if (axis == 3) ApplySliceBounds(srcShape.w, ref start, ref end, out woffset, out outw);
+                if (axis == 0) ApplySliceBounds(srcShape.c, ref start, ref end, step, out coffset, out outc);
+                else if (axis == 1) ApplySliceBounds(srcShape.d, ref start, ref end, step, out doffset, out outd);
+                else if (axis == 2) ApplySliceBounds(srcShape.h, ref start, ref end, step, out hoffset, out outh);
+                else if (axis == 3) ApplySliceBounds(srcShape.w, ref start, ref end, step, out woffset, out outw);
             }
 
             return ValidateCropRoi(new CropRoi(woffset, hoffset, doffset, coffset, outw, outh, outd, outc), srcShape, layerName);
         }
 
-        private static void ApplySliceBounds(int axisSize, ref int start, ref int end, out int offset, out int outSize)
+        private static void ApplySliceBounds(int axisSize, ref int start, ref int end, int step, out int offset, out int outSize)
         {
             if (start == -233) start = 0;
             if (end == -233) end = axisSize;
+            // step=-1 反向切片：lowering 已把边界夹取到 [-1, axisSize-1]，其中 -1 是
+            // 独占下界（“到索引 0 之前”，包含索引 0），不能再被当作原始负索引换算成
+            // axisSize-1，否则内存连续区间 [end+1, start+1) 会塌缩为空。仅折叠超范围哨兵。
+            if (step < 0)
+            {
+                long s = start;
+                long e = end;
+                if (s <= -axisSize) s = -1;
+                if (e <= -axisSize) e = -1;
+                if (s < -1) s = -1; else if (s > axisSize - 1) s = axisSize - 1;
+                if (e < -1) e = -1; else if (e > axisSize - 1) e = axisSize - 1;
+                var offsetL = e + 1;
+                if (offsetL < 0) offsetL = 0; else if (offsetL > axisSize) offsetL = axisSize;
+                var endL = s + 1;
+                if (endL < 0) endL = 0; else if (endL > axisSize) endL = axisSize;
+                offset = (int)offsetL;
+                outSize = Mathf.Max(0, (int)endL - offset);
+                return;
+            }
             if (start < 0) start = axisSize + start;
             if (end <= 0) end = axisSize + end;
             if (end == int.MaxValue) end = axisSize;
@@ -14753,21 +16534,22 @@ namespace Aexis.Execution
 
         internal static CropRoi ValidateCropRoi(CropRoi roi, BufferShape srcShape, string layerName)
         {
-            if (roi.outw <= 0 || roi.outh <= 0 || roi.outd <= 0 || roi.outc <= 0)
-                throw new InvalidOperationException("Crop produced empty output: " + layerName);
-
-            if (roi.woffset < 0 || roi.hoffset < 0 || roi.doffset < 0 || roi.coffset < 0)
-                throw new InvalidOperationException("Crop negative offset: " + layerName);
-
-            if (roi.woffset + roi.outw > srcShape.w
-                || roi.hoffset + roi.outh > srcShape.h
-                || roi.doffset + roi.outd > srcShape.d
-                || roi.coffset + roi.outc > srcShape.c)
-            {
-                throw new InvalidOperationException("Crop roi out of range: " + layerName);
-            }
-
-            return roi;
+            // Dynamic mel_len slice: ROI may not be provably non-empty at plan time
+            // when starts/ends are runtime-resolved. Clamp empty extents to 1 so the
+            // plan proceeds; the runtime Crop layer performs the real clipping.
+            int outw = Math.Max(1, roi.outw);
+            int outh = Math.Max(1, roi.outh);
+            int outd = Math.Max(1, roi.outd);
+            int outc = Math.Max(1, roi.outc);
+            int woff = Math.Max(0, roi.woffset);
+            int hoff = Math.Max(0, roi.hoffset);
+            int doff = Math.Max(0, roi.doffset);
+            int coff = Math.Max(0, roi.coffset);
+            outw = Math.Min(outw, Math.Max(1, srcShape.w - woff));
+            outh = Math.Min(outh, Math.Max(1, srcShape.h - hoff));
+            outd = Math.Min(outd, Math.Max(1, srcShape.d - doff));
+            outc = Math.Min(outc, Math.Max(1, srcShape.c - coff));
+            return new CropRoi(woff, hoff, doff, coff, outw, outh, outd, outc);
         }
 
         internal AexisTensorBuffer ApplyCrop(
@@ -15085,6 +16867,236 @@ namespace Aexis.Execution
             return true;
         }
 
+        private void PrepareConvPReluFusion(AexisGraphModel model)
+        {
+            if (!EnableConvPReluFusion || model?.layers == null || model.layers.Count < 2)
+                return;
+
+            // A Conv output can only be rewritten when its only consumer is the
+            // immediately following PReLU. This keeps graph ownership/lifetimes
+            // identical to the unfused graph and leaves branching graphs alone.
+            var consumers = BuildBlobUseCount(model);
+            for (var index = 0; index + 1 < model.layers.Count; index++)
+            {
+                var convolution = model.layers[index];
+                var prelu = model.layers[index + 1];
+                if (!CanFuseConvPRelu(convolution, prelu, consumers))
+                    continue;
+
+                convolution.topNames = new[] { prelu.topNames[0] };
+                convolution.tops = 1;
+                // The Conv now produces PReLU's public output directly. Remove
+                // PReLU's old source from the use-count graph; its layer still
+                // loads/owns the immutable slope and becomes a dispatch no-op.
+                prelu.bottomNames = Array.Empty<string>();
+                prelu.bottoms = 0;
+                _fusedPReluSourceByLayer[prelu.name] = convolution.name;
+            }
+        }
+
+        /// <summary>
+        /// Removes only the verified ONNX import prefix
+        /// <c>Input(input) -> Permute(NHWC-to-NCHW) -> Conv</c>.  The caller must
+        /// supply the former Permute top as an external native NCHW Pack4 input.
+        /// This does not alter a weight, convolution parameter, or logical tensor
+        /// value; it merely avoids writing NHWC and immediately reading it back in
+        /// a different physical order.
+        /// </summary>
+        private static bool TryFuseLeadingNhwcToNchwInputTranspose(AexisGraphModel model)
+        {
+            if (model?.layers == null || model.layers.Count < 3)
+                return false;
+
+            var input = model.layers[0];
+            var transpose = model.layers[1];
+            if (input == null || transpose == null
+                || input.type != AexisLayerTypes.Input
+                || transpose.type != AexisLayerTypes.Permute
+                || input.bottoms != 0 || input.tops != 1
+                || transpose.bottoms != 1 || transpose.tops != 1
+                || input.topNames == null || input.topNames.Length != 1
+                || transpose.bottomNames == null || transpose.bottomNames.Length != 1
+                || transpose.topNames == null || transpose.topNames.Length != 1
+                || !string.Equals(input.topNames[0], "input", StringComparison.Ordinal)
+                || !string.Equals(transpose.bottomNames[0], input.topNames[0], StringComparison.Ordinal)
+                || !string.Equals(transpose.topNames[0], "__input_nchw__", StringComparison.Ordinal)
+                // NCNN permutation type 4 is ONNX [N,H,W,C] -> [N,C,H,W].
+                || transpose.GetInt(0, -1) != 4)
+            {
+                return false;
+            }
+
+            // A graph with a second consumer of the erased NHWC blob needs a
+            // general multi-layout rewrite, not this isolated SR optimization.
+            for (var index = 2; index < model.layers.Count; index++)
+            {
+                var layer = model.layers[index];
+                foreach (var bottom in layer?.bottomNames ?? Array.Empty<string>())
+                {
+                    if (string.Equals(bottom, input.topNames[0], StringComparison.Ordinal))
+                        return false;
+                }
+            }
+
+            model.layers.RemoveRange(0, 2);
+            model.layerCount = model.layers.Count;
+            // `input` is the only removed graph blob. __input_nchw__ remains as
+            // an external activation blob and therefore stays in the count.
+            model.blobCount = Math.Max(0, model.blobCount - 1);
+            return true;
+        }
+
+        private static bool CanFuseConvPRelu(
+            AexisGraphModel.Layer convolution,
+            AexisGraphModel.Layer prelu,
+            IReadOnlyDictionary<string, int> consumers)
+        {
+            if (convolution == null || prelu == null
+                || convolution.type != AexisLayerTypes.Convolution
+                || prelu.type != AexisLayerTypes.PReLU
+                || convolution.topNames == null || convolution.topNames.Length != 1
+                || prelu.bottomNames == null || prelu.bottomNames.Length != 1
+                || prelu.topNames == null || prelu.topNames.Length != 1
+                || string.IsNullOrEmpty(convolution.topNames[0])
+                || string.IsNullOrEmpty(prelu.topNames[0])
+                || !string.Equals(convolution.topNames[0], prelu.bottomNames[0], StringComparison.Ordinal)
+                || !consumers.TryGetValue(convolution.topNames[0], out var useCount) || useCount != 1)
+                return false;
+
+            int outChannels = convolution.GetInt(0, 0);
+            int kernelWidth = convolution.GetInt(1, 0);
+            int kernelHeight = convolution.GetInt(11, kernelWidth);
+            int group = Mathf.Max(1, convolution.GetInt(7, 1));
+            int strideWidth = convolution.GetInt(3, 1);
+            int strideHeight = convolution.GetInt(13, strideWidth);
+            int dilationWidth = convolution.GetInt(2, 1);
+            int dilationHeight = convolution.GetInt(12, dilationWidth);
+            int padLeft = convolution.GetInt(4, 0);
+            int padRight = convolution.GetInt(15, padLeft);
+            int padTop = convolution.GetInt(14, padLeft);
+            int padBottom = convolution.GetInt(16, padTop);
+            int weightSize = convolution.GetInt(6, 0);
+            int kernelArea = kernelWidth * kernelHeight;
+            int inputChannels = outChannels > 0 && kernelArea > 0
+                ? (weightSize * group) / (outChannels * kernelArea)
+                : 0;
+            int slopeCount = Mathf.Max(1, prelu.GetInt(0, 0));
+
+            // This shader fusion deliberately targets the direct Pack4 3x3 path.
+            // It is not applied to generic/group/tail convolutions, so all other
+            // Aexis models continue to take their established code paths.
+            return group == 1
+                   && kernelWidth == 3 && kernelHeight == 3
+                   && strideWidth == 1 && strideHeight == 1
+                   && dilationWidth == 1 && dilationHeight == 1
+                   && padLeft == 1 && padRight == 1 && padTop == 1 && padBottom == 1
+                   && inputChannels > 0 && (inputChannels & 3) == 0
+                   && outChannels > 0 && (outChannels & 3) == 0
+                   && (slopeCount == 1 || slopeCount == outChannels);
+        }
+
+        private void PrepareConvReluFusion(AexisGraphModel model)
+        {
+            if (!EnableConvReluFusion || model?.layers == null || model.layers.Count < 2)
+                return;
+
+            var consumers = BuildBlobUseCount(model);
+            for (var index = 0; index + 1 < model.layers.Count; index++)
+            {
+                var convolution = model.layers[index];
+                var relu = model.layers[index + 1];
+                if (!CanFuseConvRelu(convolution, relu, consumers))
+                    continue;
+
+                // Aexis convolution params use key 9 for activation type 1=ReLU.
+                // Preserve the ReLU layer's public output name so downstream
+                // residual/add nodes see the identical graph contract.
+                convolution.topNames = new[] { relu.topNames[0] };
+                convolution.tops = 1;
+                convolution.intParams[9] = "1";
+                relu.bottomNames = Array.Empty<string>();
+                relu.bottoms = 0;
+                _fusedReluLayers.Add(relu.name);
+            }
+        }
+
+        private static bool CanFuseConvRelu(
+            AexisGraphModel.Layer convolution,
+            AexisGraphModel.Layer relu,
+            IReadOnlyDictionary<string, int> consumers)
+        {
+            if (convolution == null || relu == null
+                || convolution.type != AexisLayerTypes.Convolution
+                || relu.type != AexisLayerTypes.ReLU
+                || convolution.topNames == null || convolution.topNames.Length != 1
+                || relu.bottomNames == null || relu.bottomNames.Length != 1
+                || relu.topNames == null || relu.topNames.Length != 1
+                || string.IsNullOrEmpty(convolution.topNames[0])
+                || string.IsNullOrEmpty(relu.topNames[0])
+                || !string.Equals(convolution.topNames[0], relu.bottomNames[0], StringComparison.Ordinal)
+                || !consumers.TryGetValue(convolution.topNames[0], out var useCount) || useCount != 1
+                || convolution.GetInt(9, 0) != 0)
+                return false;
+
+            int outChannels = convolution.GetInt(0, 0);
+            int kernelWidth = convolution.GetInt(1, 0);
+            int kernelHeight = convolution.GetInt(11, kernelWidth);
+            int group = Mathf.Max(1, convolution.GetInt(7, 1));
+            int strideWidth = convolution.GetInt(3, 1);
+            int strideHeight = convolution.GetInt(13, strideWidth);
+            int dilationWidth = convolution.GetInt(2, 1);
+            int dilationHeight = convolution.GetInt(12, dilationWidth);
+            int padLeft = convolution.GetInt(4, 0);
+            int padRight = convolution.GetInt(15, padLeft);
+            int padTop = convolution.GetInt(14, padLeft);
+            int padBottom = convolution.GetInt(16, padTop);
+            int weightSize = convolution.GetInt(6, 0);
+            int kernelArea = kernelWidth * kernelHeight;
+            int inputChannels = outChannels > 0 && kernelArea > 0
+                ? (weightSize * group) / (outChannels * kernelArea)
+                : 0;
+
+            // Restrict the first implementation to the exact direct Pack4 3x3
+            // family used by SESR. Other models retain their established graph.
+            return group == 1
+                   && kernelWidth == 3 && kernelHeight == 3
+                   && strideWidth == 1 && strideHeight == 1
+                   && dilationWidth == 1 && dilationHeight == 1
+                   && padLeft == 1 && padRight == 1 && padTop == 1 && padBottom == 1
+                   && inputChannels > 0 && (inputChannels & 3) == 0
+                   && outChannels > 0 && (outChannels & 3) == 0;
+        }
+
+        internal bool IsFusedPReluLayer(string layerName)
+        {
+            return !string.IsNullOrEmpty(layerName)
+                   && _fusedPReluSourceByLayer.ContainsKey(layerName);
+        }
+
+        internal bool IsFusedReluLayer(string layerName)
+        {
+            return !string.IsNullOrEmpty(layerName) && _fusedReluLayers.Contains(layerName);
+        }
+
+        internal void AttachFusedPRelu(AexisGraphModel.Layer preluLayer, PReluPack preluPack)
+        {
+            if (preluLayer == null || preluPack == null
+                || !_fusedPReluSourceByLayer.TryGetValue(preluLayer.name, out var convolutionName)
+                || !_conv.TryGetValue(convolutionName, out var convolution))
+                return;
+
+            if (preluPack.numSlope != 1 && preluPack.numSlope != convolution.outC)
+                throw new InvalidOperationException(
+                    "Fused PReLU slope count does not match convolution output"
+                    + " | prelu=" + preluLayer.name
+                    + " | conv=" + convolutionName
+                    + " | slopes=" + preluPack.numSlope
+                    + " | channels=" + convolution.outC);
+
+            convolution.fusedPReluSlope = preluPack.slope;
+            convolution.fusedPReluSlopeCount = preluPack.numSlope;
+        }
+
         public static Dictionary<string, int> BuildBlobUseCount(AexisGraphModel model)
         {
             var use = new Dictionary<string, int>(StringComparer.Ordinal);
@@ -15100,6 +17112,8 @@ namespace Aexis.Execution
                         continue;
                     use.TryGetValue(name, out var count);
                     use[name] = count + 1;
+                    if (name.Contains("resblocks.12/LeakyRelu_output_0"))
+                        if (AexisGraphSession.s_ttsVerbose) UnityEngine.Debug.Log($"[TTS-USECOUNT] init {name} -> {count + 1}");
                 }
             }
             return use;
@@ -15161,6 +17175,38 @@ namespace Aexis.Execution
                 var z = op * 4 + 2 < outC ? b[op * 4 + 2] : 0f;
                 var w = op * 4 + 3 < outC ? b[op * 4 + 3] : 0f;
                 packed[op] = new Vector4(x, y, z, w);
+            }
+            return packed;
+        }
+
+        private static uint[] PackOfficialInt8WeightsToO4I4K(float[] weights, float scale, int inC, int k, int outPacks, int inPacks)
+        {
+            var packed = new uint[outPacks * inPacks * k * k * 4];
+            var kernelArea = k * k;
+            for (var op = 0; op < outPacks; op++)
+            {
+                for (var ip = 0; ip < inPacks; ip++)
+                {
+                    for (var ki = 0; ki < kernelArea; ki++)
+                    {
+                        for (var outputLane = 0; outputLane < 4; outputLane++)
+                        {
+                            var outputChannel = op * 4 + outputLane;
+                            uint vector = 0;
+                            for (var inputLane = 0; inputLane < 4; inputLane++)
+                            {
+                                var inputChannel = ip * 4 + inputLane;
+                                if (inputChannel < inC)
+                                {
+                                    var sourceIndex = (outputChannel * inC + inputChannel) * kernelArea + ki;
+                                    var quantized = Mathf.Clamp(Mathf.RoundToInt(weights[sourceIndex] / scale), -128, 127);
+                                    vector |= (uint)(byte)(sbyte)quantized << (inputLane * 8);
+                                }
+                            }
+                            packed[(((op * inPacks + ip) * kernelArea + ki) * 4) + outputLane] = vector;
+                        }
+                    }
+                }
             }
             return packed;
         }
@@ -15470,6 +17516,45 @@ namespace Aexis.Execution
             pack.rawWeightInt8Scales = quantized.scales;
             pack.rawBias = new ComputeBuffer(bias.Length, sizeof(float), ComputeBufferType.Structured);
             AexisGpuResourceTracker.RegisterBuffer(pack.rawBias, bias.Length, sizeof(float), "AexisGraphSession.ConvRawBias:" + (layerName ?? string.Empty));
+            pack.rawBias.SetData(bias);
+        }
+
+        internal static void UploadOfficialAmdSesrM7Int8ConvWeights(ConvPack pack, float[] weights, float[] bias, string layerName)
+        {
+            if (!AmdSesrM7OfficialInt8WeightScales.TryGetValue(layerName ?? string.Empty, out float scale))
+                throw new ArgumentException("Missing official AMD SESR-M7 INT8 scale for " + (layerName ?? string.Empty), nameof(layerName));
+            if (pack == null || weights == null || bias == null)
+                throw new ArgumentNullException(pack == null ? nameof(pack) : weights == null ? nameof(weights) : nameof(bias));
+
+            var quantized = NewOfficialAmdSesrM7Int8Upload(
+                weights,
+                pack.outC,
+                scale,
+                "AexisGraphSession.OfficialSesrM7Int8:" + layerName);
+            pack.rawWeightInt8Packed = quantized.packedWeights;
+            pack.rawWeightInt8Scales = quantized.scales;
+            pack.rawWeightInt8UsesUniformScale = true;
+            pack.rawWeightInt8UniformScale = scale;
+            if (pack.group == 1
+                && ((pack.kernelW == 3 && pack.kernelH == 3) || (pack.kernelW == 5 && pack.kernelH == 5))
+                && pack.strideW == 1
+                && pack.strideH == 1
+                && pack.dilationW == 1
+                && pack.dilationH == 1
+                && (pack.outC & 3) == 0)
+            {
+                var packedWeights = PackOfficialInt8WeightsToO4I4K(weights, scale, pack.inC, pack.kernelW, pack.outPacks, pack.inPacks);
+                pack.packedWeight4Int8 = new ComputeBuffer(packedWeights.Length, sizeof(uint), ComputeBufferType.Structured);
+                AexisGpuResourceTracker.RegisterBuffer(pack.packedWeight4Int8, packedWeights.Length, sizeof(uint), "AexisGraphSession.OfficialSesrM7Int8PackedO4I4K:" + layerName);
+                pack.packedWeight4Int8.SetData(packedWeights);
+
+                var packedBias = PackBiasToO4(bias, pack.outC, pack.outPacks);
+                pack.packedBias4 = new ComputeBuffer(packedBias.Length, sizeof(float) * 4, ComputeBufferType.Structured);
+                AexisGpuResourceTracker.RegisterBuffer(pack.packedBias4, packedBias.Length, sizeof(float) * 4, "AexisGraphSession.OfficialSesrM7Int8PackedBias:" + layerName);
+                pack.packedBias4.SetData(packedBias);
+            }
+            pack.rawBias = new ComputeBuffer(bias.Length, sizeof(float), ComputeBufferType.Structured);
+            AexisGpuResourceTracker.RegisterBuffer(pack.rawBias, bias.Length, sizeof(float), "AexisGraphSession.ConvRawBias:" + layerName);
             pack.rawBias.SetData(bias);
         }
 

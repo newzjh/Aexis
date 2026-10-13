@@ -242,6 +242,9 @@ namespace Aexis.Execution
     public class ComputeTexture
     {
         public int nameID;
+        // TTS 修复：持久 RT 直绑覆盖——非空时用 RenderTargetIdentifier(texture)
+        // 替代 nameID int 绑定，避免 GetTemporaryRT 池化别名/barrier 问题。
+        public Texture directTexture;
         public int width;
         public int height;
         public int depth;
@@ -395,8 +398,16 @@ namespace Aexis.Execution
         private readonly int _kPackRgbToNhwcPack4;
         private readonly int _kPackMaskToNhwcPack4;
         private readonly int _kConv3x3Pack4;
+        private readonly int _kConv3x3Pack4Fp16Alu;
+        private readonly int _kConv5x5Pack4;
+        private readonly int _kConv5x5Pack4Fp16Alu;
+        private readonly int _kConv5x5RawInt8Pack4;
         private readonly int _kConvPack4General;
         private readonly int _kDeconvolutionPack4General;
+        private readonly int _kConvPack4GeneralFlat;
+        private readonly int _kConvPack4GeneralTileX;
+        private readonly int _kDeconvolutionPack4GeneralFlat;
+        private readonly int _kDeconvolutionPack4GeneralTileX;
         private readonly int _kConv2dGroupPack4;
         private readonly int _kDeconvolution2dGroupPack4;
         private readonly int _kDeconvolutionDepthWisePack4;
@@ -473,9 +484,13 @@ namespace Aexis.Execution
         private readonly int _kPack4ToRgb01;
         private readonly int _kPack4ToRgbScaled;
         private readonly int _kNhwcPack4ToRgbScaled;
+        private readonly int _kNhwcPack4TileToRgbScaled;
+        private readonly int _kNchwPack4TileToRgbScaled;
+        private readonly int _kSesrTailCrD12Pack4TileToRgbScaled;
         private readonly int _kProbeTilePack4;
         private readonly int _kProbeSeams;
         private readonly int _kPaddingPack4;
+        private readonly int _kPaddingLinearMat2D;
         private readonly int _kPoolingPack4;
         private readonly int _kPooling1DPack4;
         private readonly int _kPoolingPack4Cdhw;
@@ -502,6 +517,7 @@ namespace Aexis.Execution
         private readonly int _kBinaryOpPack4LinearMixedArray;
         private readonly int _kBinaryOpPack4Broadcast;
         private readonly int _kBinaryOpPack4BufferScalar;
+        private readonly int _kBinaryOpPack4TexScalar;
         private readonly int _kBinaryOpPack4ChannelVectorTex;
         private readonly int _kBinaryOpScalarSingleBroadcast;
         private readonly int _kCodeFormerMinEncodingFromSoftOneHot;
@@ -541,6 +557,8 @@ namespace Aexis.Execution
         private readonly int _kReshapeLinearMatToPack4;
         private readonly int _kReshapeLinearMat2D;
         private readonly int _kAttentionReshapePack4;
+        private readonly int _kAttentionMaskCompactPad4;
+        private readonly int _kAttentionMaskCompactPad4D4;
         private readonly int _kAttentionContextFlattenPack4;
         private readonly int _kSwishPack4;
         private readonly int _kSwishLinearMat;
@@ -570,6 +588,7 @@ namespace Aexis.Execution
         private readonly int _kGemm2D16;
         private readonly int _kLayerNorm2D;
         private readonly int _kLayerNormPack4WidthTex;
+        private readonly int _kLayerNormPack4ChannelsTex;
         private readonly int _kLayerNormPack4Linear2D;
         private readonly int _kSoftmax2D;
         private readonly int _kSoftmaxPack4Cdhw;
@@ -654,11 +673,16 @@ namespace Aexis.Execution
         private readonly int _gemmTextureOutsPerThread;
         private readonly int _gemmPack4LinearOutPacksPerThread;
         private ComputeBuffer _fallbackFloatBuffer;
+        private ComputeBuffer _fallbackUIntBuffer;
         private ComputeBuffer _fp16ConvWeights;
         private ComputeBuffer _fp16DepthWiseWeights;
         private ComputeBuffer _fp16GemmWeights;
         private ComputeBuffer _int8ConvWeights;
         private ComputeBuffer _int8ConvWeightScales;
+        private ComputeBuffer _int8ConvPack4Weights;
+        private bool _int8ConvUsesUniformScale;
+        private float _int8ConvUniformScale = 1f;
+        private float _int8ConvPack4UniformScale = 1f;
         private ComputeBuffer _int8GemmWeights;
         private ComputeBuffer _int8GemmWeightScales;
         private ComputeBuffer _int8EmbedWeights;
@@ -695,12 +719,31 @@ namespace Aexis.Execution
 
         // INT8 D2 weights are immutable packed uploads. Activations remain Pack4
         // textures; the shader dequantizes each read and accumulates in FP32.
-        public void SetInt8ConvWeights(ComputeBuffer packedWeights, ComputeBuffer perOutputScales)
+        public void SetInt8ConvWeights(
+            ComputeBuffer packedWeights,
+            ComputeBuffer perOutputScales,
+            bool usesUniformScale = false,
+            float uniformScale = 1f)
         {
             if ((packedWeights == null) != (perOutputScales == null))
                 throw new ArgumentException("INT8 convolution weights and per-output scales must be configured together.");
+            if (usesUniformScale && (packedWeights == null || !float.IsFinite(uniformScale) || uniformScale <= 0f))
+                throw new ArgumentOutOfRangeException(nameof(uniformScale), "INT8 uniform scale requires a positive finite packed-weight scale.");
             _int8ConvWeights = packedWeights;
             _int8ConvWeightScales = perOutputScales;
+            _int8ConvUsesUniformScale = packedWeights != null && usesUniformScale;
+            _int8ConvUniformScale = _int8ConvUsesUniformScale ? uniformScale : 1f;
+        }
+
+        // Official SESR-M7 body weights use the direct O4I4K layout consumed by
+        // the shared-memory Pack4 3x3 kernel. Each uint holds four signed input
+        // lane weights for one output lane.
+        public void SetInt8ConvPack4Weights(ComputeBuffer packedWeights, float uniformScale = 1f)
+        {
+            if (packedWeights != null && (!float.IsFinite(uniformScale) || uniformScale <= 0f))
+                throw new ArgumentOutOfRangeException(nameof(uniformScale));
+            _int8ConvPack4Weights = packedWeights;
+            _int8ConvPack4UniformScale = packedWeights != null ? uniformScale : 1f;
         }
 
         public void SetInt8GemmWeights(ComputeBuffer packedWeights, ComputeBuffer perOutputScales)
@@ -725,6 +768,16 @@ namespace Aexis.Execution
                 throw new ArgumentException("INT4 convolution weights and per-output scales must be configured together.");
             _int4ConvWeights = packedWeights;
             _int4ConvWeightScales = perOutputScales;
+        }
+
+        private void ValidateRawInt8Pack4Contract(ComputeBuffer weights, int inputChannels, int outputChannels)
+        {
+            if (weights == null) throw new ArgumentNullException(nameof(weights));
+            if (_int8ConvWeights == null || _int8ConvWeightScales == null)
+                throw new InvalidOperationException("Raw INT8 Pack4 convolution requires bound INT8 weights and output scales.");
+            if (inputChannels <= 0) throw new ArgumentOutOfRangeException(nameof(inputChannels));
+            if (outputChannels <= 0 || (outputChannels & 3) != 0)
+                throw new ArgumentOutOfRangeException(nameof(outputChannels), "Raw INT8 Pack4 output channels must be a whole Pack4 count.");
         }
 
         public void SetInt4GemmWeights(ComputeBuffer packedWeights, ComputeBuffer scales, int scaleBlockSize = 1)
@@ -789,6 +842,14 @@ namespace Aexis.Execution
             _cs.SetBuffer(kernel, "_ConvW4", fp32Weights);
             _cs.SetBuffer(kernel, "_ConvW4Fp16", _fp16ConvWeights ?? fp32Weights);
             _cs.SetInt("_UseFp16ConvWeights", _fp16ConvWeights != null ? 1 : 0);
+            _cs.SetBuffer(kernel, "_ConvW4Int8Packed", _int8ConvPack4Weights ?? GetFallbackUIntBuffer());
+            _cs.SetInt("_UseInt8ConvPack4Weights", _int8ConvPack4Weights != null ? 1 : 0);
+            _cs.SetFloat("_Int8ConvPack4WeightScale", _int8ConvPack4UniformScale);
+            _cs.SetBuffer(kernel, "_ConvWInt8Packed", _int8ConvWeights ?? GetFallbackUIntBuffer());
+            _cs.SetBuffer(kernel, "_ConvWInt8Scales", _int8ConvWeightScales ?? GetFallbackFloatBuffer());
+            _cs.SetInt("_UseInt8ConvWeights", _int8ConvWeights != null ? 1 : 0);
+            _cs.SetInt("_UseInt8ConvWeightUniformScale", _int8ConvUsesUniformScale ? 1 : 0);
+            _cs.SetFloat("_Int8ConvWeightUniformScale", _int8ConvUniformScale);
         }
 
         private void SetConvPack4Weights(CommandBuffer cmd, int kernel, ComputeBuffer fp32Weights)
@@ -796,6 +857,33 @@ namespace Aexis.Execution
             cmd.SetComputeBufferParam(_cs, kernel, "_ConvW4", fp32Weights);
             cmd.SetComputeBufferParam(_cs, kernel, "_ConvW4Fp16", _fp16ConvWeights ?? fp32Weights);
             cmd.SetComputeIntParam(_cs, "_UseFp16ConvWeights", _fp16ConvWeights != null ? 1 : 0);
+            cmd.SetComputeBufferParam(_cs, kernel, "_ConvW4Int8Packed", _int8ConvPack4Weights ?? GetFallbackUIntBuffer());
+            cmd.SetComputeIntParam(_cs, "_UseInt8ConvPack4Weights", _int8ConvPack4Weights != null ? 1 : 0);
+            cmd.SetComputeFloatParam(_cs, "_Int8ConvPack4WeightScale", _int8ConvPack4UniformScale);
+            cmd.SetComputeBufferParam(_cs, kernel, "_ConvWInt8Packed", _int8ConvWeights ?? GetFallbackUIntBuffer());
+            cmd.SetComputeBufferParam(_cs, kernel, "_ConvWInt8Scales", _int8ConvWeightScales ?? GetFallbackFloatBuffer());
+            cmd.SetComputeIntParam(_cs, "_UseInt8ConvWeights", _int8ConvWeights != null ? 1 : 0);
+            cmd.SetComputeIntParam(_cs, "_UseInt8ConvWeightUniformScale", _int8ConvUsesUniformScale ? 1 : 0);
+            cmd.SetComputeFloatParam(_cs, "_Int8ConvWeightUniformScale", _int8ConvUniformScale);
+        }
+
+        // The Conv -> PReLU fusion is used only by the direct Pack4 3x3 kernel.
+        // Bind a valid fallback buffer even when disabled because Vulkan validates
+        // all declared resources before it evaluates the runtime branch.
+        private void SetFusedPRelu(int kernel, ComputeBuffer fallback, ComputeBuffer slope, int slopeCount)
+        {
+            _cs.SetInt("_ConvUsePRelu", slope != null && slopeCount > 0 ? 1 : 0);
+            _cs.SetInt("_PReluSlopePack4Count", Mathf.Max(1, slopeCount));
+            _cs.SetInt("_PReluSlopePack4Packs", Mathf.Max(1, Mathf.CeilToInt(Mathf.Max(1, slopeCount) / 4f)));
+            _cs.SetBuffer(kernel, "_PReluSlopePack4Buf", slope ?? fallback);
+        }
+
+        private void SetFusedPRelu(CommandBuffer cmd, int kernel, ComputeBuffer fallback, ComputeBuffer slope, int slopeCount)
+        {
+            cmd.SetComputeIntParam(_cs, "_ConvUsePRelu", slope != null && slopeCount > 0 ? 1 : 0);
+            cmd.SetComputeIntParam(_cs, "_PReluSlopePack4Count", Mathf.Max(1, slopeCount));
+            cmd.SetComputeIntParam(_cs, "_PReluSlopePack4Packs", Mathf.Max(1, Mathf.CeilToInt(Mathf.Max(1, slopeCount) / 4f)));
+            cmd.SetComputeBufferParam(_cs, kernel, "_PReluSlopePack4Buf", slope ?? fallback);
         }
 
         private void SetDepthWisePack4Weights(int kernel, ComputeBuffer fp32Weights)
@@ -926,6 +1014,20 @@ namespace Aexis.Execution
 
         public bool EnableConv3dTile3x3Pack4FastPath { get; set; }
 
+        /// <summary>
+        /// Selects the separately compiled min16-ALU Pack4 3x3 kernel. It is
+        /// deliberately opt-in so models that require FP32 convolution arithmetic
+        /// remain on the original kernel.
+        /// </summary>
+        public bool PreferFp16AluConv3x3Pack4 { get; set; }
+
+        /// <summary>
+        /// Enables the experimental shared-memory 5x5 Pack4 kernel. It stays
+        /// opt-in because some D3D11 drivers lose occupancy from its larger LDS
+        /// tile despite the reduced texture/weight reads.
+        /// </summary>
+        public bool PreferSharedConv5x5Pack4 { get; set; }
+
         public AexisOps()
         {
             var sharedShader = AexisComputeShaderLoader.LoadOrThrow();
@@ -960,8 +1062,16 @@ namespace Aexis.Execution
             _kPackRgbToNhwcPack4 = _cs.FindKernel("AexisPackRgbToNhwcPack4");
             _kPackMaskToNhwcPack4 = _cs.FindKernel("AexisPackMaskToNhwcPack4");
             _kConv3x3Pack4 = _cs.FindKernel("AexisConv3x3Pack4");
+            _kConv3x3Pack4Fp16Alu = _cs.FindKernel("AexisConv3x3Pack4Fp16Alu");
+            _kConv5x5Pack4 = _cs.FindKernel("AexisConv5x5Pack4");
+            _kConv5x5Pack4Fp16Alu = _cs.FindKernel("AexisConv5x5Pack4Fp16Alu");
+            _kConv5x5RawInt8Pack4 = _cs.FindKernel("AexisConv5x5RawInt8Pack4");
             _kConvPack4General = _cs.FindKernel("AexisConvPack4General");
             _kDeconvolutionPack4General = _cs.FindKernel("AexisDeconvolutionPack4General");
+            _kConvPack4GeneralFlat = _cs.FindKernel("AexisConvPack4GeneralFlat");
+            _kConvPack4GeneralTileX = _cs.FindKernel("AexisConvPack4GeneralTileX");
+            _kDeconvolutionPack4GeneralFlat = _cs.FindKernel("AexisDeconvolutionPack4GeneralFlat");
+            _kDeconvolutionPack4GeneralTileX = _cs.FindKernel("AexisDeconvolutionPack4GeneralTileX");
             _kConv2dGroupPack4 = _cs.FindKernel("AexisConv2dGroupPack4");
             _kDeconvolution2dGroupPack4 = _cs.FindKernel("AexisDeconvolution2dGroupPack4");
             _kDeconvolutionDepthWisePack4 = _cs.FindKernel("AexisDeconvolutionDepthWisePack4");
@@ -1031,9 +1141,13 @@ namespace Aexis.Execution
             _kPack4ToRgb01 = _cs.FindKernel("AexisPack4ToRgb01");
             _kPack4ToRgbScaled = _cs.FindKernel("AexisPack4ToRgbScaled");
             _kNhwcPack4ToRgbScaled = _cs.FindKernel("AexisNhwcPack4ToRgbScaled");
+            _kNhwcPack4TileToRgbScaled = _cs.FindKernel("AexisNhwcPack4TileToRgbScaled");
+            _kNchwPack4TileToRgbScaled = _cs.FindKernel("AexisNchwPack4TileToRgbScaled");
+            _kSesrTailCrD12Pack4TileToRgbScaled = _cs.FindKernel("AexisSesrTailCrD12Pack4TileToRgbScaled");
             _kProbeTilePack4 = _cs.FindKernel("AexisProbeTilePack4");
             _kProbeSeams = _cs.FindKernel("AexisProbeSeams");
             _kPaddingPack4 = _cs.FindKernel("AexisPaddingPack4");
+            _kPaddingLinearMat2D = _cs.FindKernel("AexisPaddingLinearMat2D");
             _kPoolingPack4 = _cs.FindKernel("AexisPoolingPack4");
             _kPooling1DPack4 = _cs.FindKernel("AexisPooling1DPack4");
             _kPoolingPack4Cdhw = _cs.FindKernel("AexisPoolingPack4CDHW");
@@ -1060,6 +1174,7 @@ namespace Aexis.Execution
             _kBinaryOpPack4LinearMixedArray = _cs.FindKernel("AexisBinaryOpPack4LinearMixedArray");
             _kBinaryOpPack4Broadcast = _cs.FindKernel("AexisBinaryOpPack4Broadcast");
             _kBinaryOpPack4BufferScalar = _cs.FindKernel("AexisBinaryOpPack4BufferScalar");
+            _kBinaryOpPack4TexScalar = _cs.FindKernel("AexisBinaryOpPack4TexScalar");
             _kBinaryOpPack4ChannelVectorTex = _cs.FindKernel("AexisBinaryOpPack4ChannelVectorTex");
             _kBinaryOpScalarSingleBroadcast = _cs.FindKernel("AexisBinaryOpScalarSingleBroadcast");
             _kCodeFormerMinEncodingFromSoftOneHot = _cs.FindKernel("AexisCodeFormerMinEncodingFromSoftOneHot");
@@ -1099,6 +1214,8 @@ namespace Aexis.Execution
             _kReshapeLinearMatToPack4 = _cs.FindKernel("AexisReshapeLinearMatToPack4");
             _kReshapeLinearMat2D = _cs.FindKernel("AexisReshapeLinearMat2D");
             _kAttentionReshapePack4 = _cs.FindKernel("AexisAttentionReshapePack4");
+            _kAttentionMaskCompactPad4 = _cs.FindKernel("AexisAttentionMaskCompactPad4");
+            _kAttentionMaskCompactPad4D4 = _cs.FindKernel("AexisAttentionMaskCompactPad4D4");
             _kAttentionContextFlattenPack4 = _cs.FindKernel("AexisAttentionContextFlattenPack4");
             _kSwishPack4 = _cs.FindKernel("AexisSwishPack4");
             _kSwishLinearMat = _cs.FindKernel("AexisSwishLinearMat");
@@ -1128,6 +1245,7 @@ namespace Aexis.Execution
             _kGemm2D16 = _cs.FindKernel("AexisGemm2D16");
             _kLayerNorm2D = _cs.FindKernel("AexisLayerNorm2D");
             _kLayerNormPack4WidthTex = _cs.FindKernel("AexisLayerNormPack4WidthTex");
+            _kLayerNormPack4ChannelsTex = _cs.FindKernel("AexisLayerNormPack4ChannelsTex");
             _kLayerNormPack4Linear2D = _cs.FindKernel("AexisLayerNormPack4Linear2D");
             _kSoftmax2D = _cs.FindKernel("AexisSoftmax2D");
             _kSoftmaxPack4Cdhw = _cs.FindKernel("AexisSoftmaxPack4CDHW");
@@ -1311,24 +1429,26 @@ namespace Aexis.Execution
 
         public void PackRgbToPack4(Texture src, int offsetX, int offsetY, float sx, float sy, RenderTexture dstPack4, bool flipY = false)
         {
-            PackRgbToPack4(src, offsetX, offsetY, sx, sy, dstPack4, flipY, 1f);
+            PackRgbToPack4(src, offsetX, offsetY, sx, sy, dstPack4, flipY, 1f, 0f);
         }
 
         public void PackRgbToPack4(Texture src, int offsetX, int offsetY, float sx, float sy, RenderTexture dstPack4, bool flipY, float valueScale)
         {
-            if (src == null) throw new ArgumentNullException(nameof(src));
-            _cs.SetInt("_OffsetX", offsetX);
-            _cs.SetInt("_OffsetY", offsetY);
-            _cs.SetFloat("_ScaleX", sx);
-            _cs.SetFloat("_ScaleY", sy);
-            _cs.SetFloat("_InputValueScale", valueScale);
-            _cs.SetInt("_FlipY", flipY ? 1 : 0);
-            _cs.SetTexture(_kPackRgbToPack4, "_AexisIn", src);
-            _cs.SetTexture(_kPackRgbToPack4, "_AexisOutArr", dstPack4);
-            Dispatch2D(_cs, _kPackRgbToPack4, dstPack4.width, dstPack4.height, 32, 32);
+            PackRgbToPack4(src, offsetX, offsetY, sx, sy, dstPack4, flipY, valueScale, 0f);
         }
 
-        public void PackRgbToNhwcPack4(Texture src, int offsetX, int offsetY, float sx, float sy, RenderTexture dstPack4, bool flipY, float valueScale)
+        /// <summary>Pack RGB while applying an affine transform in the same dispatch.
+        /// This keeps model-specific byte-domain normalization GPU-only (for example
+        /// SESR's uint8 RGB minus 128 contract) without a staging texture.</summary>
+        public void PackRgbToPack4(Texture src, int offsetX, int offsetY, float sx, float sy, RenderTexture dstPack4, bool flipY, float valueScale, float valueBias)
+        {
+            PackRgbToPack4(src, offsetX, offsetY, sx, sy, dstPack4, flipY, valueScale, valueBias,
+                false, 0, 0);
+        }
+
+        /// <summary>Immediate counterpart of the reflected native NCHW Pack4 input packer.</summary>
+        public void PackRgbToPack4(Texture src, int offsetX, int offsetY, float sx, float sy, RenderTexture dstPack4,
+            bool flipY, float valueScale, float valueBias, bool tiledReflect, int paddedWidth, int paddedHeight)
         {
             if (src == null) throw new ArgumentNullException(nameof(src));
             if (dstPack4 == null) throw new ArgumentNullException(nameof(dstPack4));
@@ -1337,10 +1457,69 @@ namespace Aexis.Execution
             _cs.SetFloat("_ScaleX", sx);
             _cs.SetFloat("_ScaleY", sy);
             _cs.SetFloat("_InputValueScale", valueScale);
+            _cs.SetFloat("_InputValueBias", valueBias);
+            _cs.SetInt("_InputReflectPad", tiledReflect ? 1 : 0);
+            _cs.SetInt("_InputPaddedWidth", paddedWidth);
+            _cs.SetInt("_InputPaddedHeight", paddedHeight);
+            _cs.SetInt("_FlipY", flipY ? 1 : 0);
+            _cs.SetTexture(_kPackRgbToPack4, "_AexisIn", src);
+            _cs.SetTexture(_kPackRgbToPack4, "_AexisOutArr", dstPack4);
+            Dispatch2D(_cs, _kPackRgbToPack4, dstPack4.width, dstPack4.height, 32, 32);
+        }
+
+        public void PackRgbToNhwcPack4(Texture src, int offsetX, int offsetY, float sx, float sy, RenderTexture dstPack4, bool flipY, float valueScale)
+        {
+            PackRgbToNhwcPack4(src, offsetX, offsetY, sx, sy, dstPack4, flipY, valueScale, 0f, false, 0, 0);
+        }
+
+        /// <summary>Packs RGB into the ONNX NHWC Pack4 boundary layout.  The optional
+        /// reflect mode exactly follows SESR's two-stage numpy reflect tiling.</summary>
+        public void PackRgbToNhwcPack4(Texture src, int offsetX, int offsetY, float sx, float sy, RenderTexture dstPack4,
+            bool flipY, float valueScale, float valueBias, bool tiledReflect, int paddedWidth, int paddedHeight)
+        {
+            if (src == null) throw new ArgumentNullException(nameof(src));
+            if (dstPack4 == null) throw new ArgumentNullException(nameof(dstPack4));
+            _cs.SetInt("_OffsetX", offsetX);
+            _cs.SetInt("_OffsetY", offsetY);
+            _cs.SetFloat("_ScaleX", sx);
+            _cs.SetFloat("_ScaleY", sy);
+            _cs.SetFloat("_InputValueScale", valueScale);
+            _cs.SetFloat("_InputValueBias", valueBias);
+            _cs.SetInt("_InputReflectPad", tiledReflect ? 1 : 0);
+            _cs.SetInt("_InputPaddedWidth", paddedWidth);
+            _cs.SetInt("_InputPaddedHeight", paddedHeight);
             _cs.SetInt("_FlipY", flipY ? 1 : 0);
             _cs.SetTexture(_kPackRgbToNhwcPack4, "_AexisIn", src);
             _cs.SetTexture(_kPackRgbToNhwcPack4, "_AexisOutArr", dstPack4);
             Dispatch3D(_kPackRgbToNhwcPack4, dstPack4.width, dstPack4.height, ResolveRenderTextureDispatchDepth(dstPack4, dstPack4.volumeDepth > 0 ? dstPack4.volumeDepth : 1), 8, 8);
+        }
+
+        /// <summary>
+        /// CommandBuffer counterpart of <see cref="PackRgbToNhwcPack4(Texture,int,int,float,float,RenderTexture,bool,float,float,bool,int,int)"/>.
+        /// Keeping the boundary pack in the same command buffer as the model is
+        /// important for realtime SR: it gives the source copy, every convolution,
+        /// and the final RGB write one ordered GPU lifetime.
+        /// </summary>
+        public void PackRgbToNhwcPack4(CommandBuffer cmd, Texture src, int offsetX, int offsetY, float sx, float sy,
+            ComputeTexture dstPack4, bool flipY, float valueScale, float valueBias, bool tiledReflect, int paddedWidth, int paddedHeight)
+        {
+            if (cmd == null) throw new ArgumentNullException(nameof(cmd));
+            if (src == null) throw new ArgumentNullException(nameof(src));
+            if (dstPack4 == null) throw new ArgumentNullException(nameof(dstPack4));
+            cmd.SetComputeIntParam(_cs, "_OffsetX", offsetX);
+            cmd.SetComputeIntParam(_cs, "_OffsetY", offsetY);
+            cmd.SetComputeFloatParam(_cs, "_ScaleX", sx);
+            cmd.SetComputeFloatParam(_cs, "_ScaleY", sy);
+            cmd.SetComputeFloatParam(_cs, "_InputValueScale", valueScale);
+            cmd.SetComputeFloatParam(_cs, "_InputValueBias", valueBias);
+            cmd.SetComputeIntParam(_cs, "_InputReflectPad", tiledReflect ? 1 : 0);
+            cmd.SetComputeIntParam(_cs, "_InputPaddedWidth", paddedWidth);
+            cmd.SetComputeIntParam(_cs, "_InputPaddedHeight", paddedHeight);
+            cmd.SetComputeIntParam(_cs, "_FlipY", flipY ? 1 : 0);
+            cmd.SetComputeTextureParam(_cs, _kPackRgbToNhwcPack4, "_AexisIn", src);
+            cmd.SetComputeTextureParam(_cs, _kPackRgbToNhwcPack4, "_AexisOutArr", dstPack4.nameID);
+            Dispatch3D(cmd, _kPackRgbToNhwcPack4, dstPack4.width, dstPack4.height,
+                ResolveComputeTextureDispatchDepth(dstPack4, dstPack4.depth), 8, 8);
         }
 
         public void PackMaskToNhwcPack4(Texture src, int offsetX, int offsetY, float sx, float sy, RenderTexture dstPack4, bool flipY, float maskThreshold = 0.5f)
@@ -1352,6 +1531,10 @@ namespace Aexis.Execution
             _cs.SetFloat("_ScaleX", sx);
             _cs.SetFloat("_ScaleY", sy);
             _cs.SetFloat("_InputValueScale", 1f);
+            _cs.SetFloat("_InputValueBias", 0f);
+            _cs.SetInt("_InputReflectPad", 0);
+            _cs.SetInt("_InputPaddedWidth", 0);
+            _cs.SetInt("_InputPaddedHeight", 0);
             _cs.SetFloat("_MaskThreshold", maskThreshold);
             _cs.SetInt("_FlipY", flipY ? 1 : 0);
             _cs.SetTexture(_kPackMaskToNhwcPack4, "_AexisIn", src);
@@ -1362,17 +1545,43 @@ namespace Aexis.Execution
 
         public void PackRgbToPack4(CommandBuffer cmd, Texture src, int offsetX, int offsetY, float sx, float sy, ComputeTexture dstPack4, bool flipY = false)
         {
-            PackRgbToPack4(cmd, src, offsetX, offsetY, sx, sy, dstPack4, flipY, 1f);
+            PackRgbToPack4(cmd, src, offsetX, offsetY, sx, sy, dstPack4, flipY, 1f, 0f);
         }
 
         public void PackRgbToPack4(CommandBuffer cmd, Texture src, int offsetX, int offsetY, float sx, float sy, ComputeTexture dstPack4, bool flipY, float valueScale)
         {
+            PackRgbToPack4(cmd, src, offsetX, offsetY, sx, sy, dstPack4, flipY, valueScale, 0f);
+        }
+
+        public void PackRgbToPack4(CommandBuffer cmd, Texture src, int offsetX, int offsetY, float sx, float sy, ComputeTexture dstPack4, bool flipY, float valueScale, float valueBias)
+        {
+            PackRgbToPack4(cmd, src, offsetX, offsetY, sx, sy, dstPack4, flipY, valueScale, valueBias,
+                false, 0, 0);
+        }
+
+        /// <summary>
+        /// Packs RGB directly into the native NCHW Pack4 image layout.  The
+        /// optional reflect mode is the same two-stage SESR edge contract used by
+        /// <see cref="PackRgbToNhwcPack4(CommandBuffer,Texture,int,int,float,float,ComputeTexture,bool,float,float,bool,int,int)"/>.
+        /// Keeping this at the input boundary lets a model-specific graph rewrite
+        /// avoid materializing NHWC only to transpose it back to NCHW.
+        /// </summary>
+        public void PackRgbToPack4(CommandBuffer cmd, Texture src, int offsetX, int offsetY, float sx, float sy,
+            ComputeTexture dstPack4, bool flipY, float valueScale, float valueBias,
+            bool tiledReflect, int paddedWidth, int paddedHeight)
+        {
+            if (cmd == null) throw new ArgumentNullException(nameof(cmd));
             if (src == null) throw new ArgumentNullException(nameof(src));
-            cmd.SetComputeIntParams(_cs, "_OffsetX", offsetX);
-            cmd.SetComputeIntParams(_cs, "_OffsetY", offsetY);
+            if (dstPack4 == null) throw new ArgumentNullException(nameof(dstPack4));
+            cmd.SetComputeIntParam(_cs, "_OffsetX", offsetX);
+            cmd.SetComputeIntParam(_cs, "_OffsetY", offsetY);
             cmd.SetComputeFloatParam(_cs, "_ScaleX", sx);
             cmd.SetComputeFloatParam(_cs, "_ScaleY", sy);
             cmd.SetComputeFloatParam(_cs, "_InputValueScale", valueScale);
+            cmd.SetComputeFloatParam(_cs, "_InputValueBias", valueBias);
+            cmd.SetComputeIntParam(_cs, "_InputReflectPad", tiledReflect ? 1 : 0);
+            cmd.SetComputeIntParam(_cs, "_InputPaddedWidth", paddedWidth);
+            cmd.SetComputeIntParam(_cs, "_InputPaddedHeight", paddedHeight);
             cmd.SetComputeIntParam(_cs, "_FlipY", flipY ? 1 : 0);
             cmd.SetComputeTextureParam(_cs, _kPackRgbToPack4, "_AexisIn", src);
             cmd.SetComputeTextureParam(_cs, _kPackRgbToPack4, "_AexisOutArr", dstPack4.nameID);
@@ -1390,6 +1599,10 @@ namespace Aexis.Execution
             _cs.SetFloat("_ScaleX", sx);
             _cs.SetFloat("_ScaleY", sy);
             _cs.SetFloat("_InputValueScale", 1f);
+            _cs.SetFloat("_InputValueBias", 0f);
+            _cs.SetInt("_InputReflectPad", 0);
+            _cs.SetInt("_InputPaddedWidth", 0);
+            _cs.SetInt("_InputPaddedHeight", 0);
             _cs.SetInt("_FlipY", flipY ? 1 : 0);
             _cs.SetTexture(_kPackRgbToPack4Gfpgan, "_AexisIn", src);
             _cs.SetTexture(_kPackRgbToPack4Gfpgan, "_AexisOutArr", dstPack4);
@@ -1406,6 +1619,10 @@ namespace Aexis.Execution
             cmd.SetComputeFloatParam(_cs, "_ScaleX", sx);
             cmd.SetComputeFloatParam(_cs, "_ScaleY", sy);
             cmd.SetComputeFloatParam(_cs, "_InputValueScale", 1f);
+            cmd.SetComputeFloatParam(_cs, "_InputValueBias", 0f);
+            cmd.SetComputeIntParam(_cs, "_InputReflectPad", 0);
+            cmd.SetComputeIntParam(_cs, "_InputPaddedWidth", 0);
+            cmd.SetComputeIntParam(_cs, "_InputPaddedHeight", 0);
             cmd.SetComputeIntParam(_cs, "_FlipY", flipY ? 1 : 0);
             cmd.SetComputeTextureParam(_cs, _kPackRgbToPack4Gfpgan, "_AexisIn", src);
             cmd.SetComputeTextureParam(_cs, _kPackRgbToPack4Gfpgan, "_AexisOutArr", dstPack4.nameID);
@@ -1527,6 +1744,28 @@ namespace Aexis.Execution
             Dispatch3D(cmd, _kFillPack4FromBufferChw, w, h, Mathf.Max(1, Mathf.CeilToInt(c / 4f)), 8, 8);
         }
 
+        /// <summary>
+        /// CommandBuffer variant for a persistent RenderTexture destination.
+        /// This is used by streaming activation updates where the destination is
+        /// an immutable MemoryData pack4 RT owned by a graph session.  Binding the
+        /// texture object directly keeps the upload and the following graph
+        /// dispatch in one ordered command buffer and avoids a CPU-side
+        /// UpdateMemoryData race between two in-flight audio chunks.
+        /// </summary>
+        public void FillPack4FromBufferCHW(CommandBuffer cmd, ComputeBuffer input, int w, int h, int c, RenderTexture outputPack4)
+        {
+            if (cmd == null) throw new ArgumentNullException(nameof(cmd));
+            if (input == null) throw new ArgumentNullException(nameof(input));
+            if (outputPack4 == null) throw new ArgumentNullException(nameof(outputPack4));
+            cmd.SetComputeIntParam(_cs, "_FillW", w);
+            cmd.SetComputeIntParam(_cs, "_FillH", h);
+            cmd.SetComputeIntParam(_cs, "_FillD", 1);
+            cmd.SetComputeIntParam(_cs, "_FillC", c);
+            cmd.SetComputeBufferParam(_cs, _kFillPack4FromBufferChw, "_FillIn", input);
+            cmd.SetComputeTextureParam(_cs, _kFillPack4FromBufferChw, "_TexOut0Arr", outputPack4);
+            Dispatch3D(cmd, _kFillPack4FromBufferChw, w, h, Mathf.Max(1, Mathf.CeilToInt(c / 4f)), 8, 8);
+        }
+
         public void FillPack4FromBufferCDHW(ComputeBuffer input, int w, int h, int d, int c, RenderTexture outputPack4)
         {
             if (input == null) throw new ArgumentNullException(nameof(input));
@@ -1552,6 +1791,21 @@ namespace Aexis.Execution
             cmd.SetComputeBufferParam(_cs, _kFillPack4FromBufferCdhw, "_FillIn", input);
             cmd.SetComputeTextureParam(_cs, _kFillPack4FromBufferCdhw, "_TexOut0Arr", outputPack4.nameID);
             Dispatch3D(cmd, _kFillPack4FromBufferCdhw, w, h, outputPack4.depth, 8, 8);
+        }
+
+        /// <summary>RenderTexture destination counterpart of the CDHW upload.</summary>
+        public void FillPack4FromBufferCDHW(CommandBuffer cmd, ComputeBuffer input, int w, int h, int d, int c, RenderTexture outputPack4)
+        {
+            if (cmd == null) throw new ArgumentNullException(nameof(cmd));
+            if (input == null) throw new ArgumentNullException(nameof(input));
+            if (outputPack4 == null) throw new ArgumentNullException(nameof(outputPack4));
+            cmd.SetComputeIntParam(_cs, "_FillW", w);
+            cmd.SetComputeIntParam(_cs, "_FillH", h);
+            cmd.SetComputeIntParam(_cs, "_FillD", d);
+            cmd.SetComputeIntParam(_cs, "_FillC", c);
+            cmd.SetComputeBufferParam(_cs, _kFillPack4FromBufferCdhw, "_FillIn", input);
+            cmd.SetComputeTextureParam(_cs, _kFillPack4FromBufferCdhw, "_TexOut0Arr", outputPack4);
+            Dispatch3D(cmd, _kFillPack4FromBufferCdhw, w, h, outputPack4.volumeDepth, 8, 8);
         }
 
         public void FillLinearMatFromBuffer(ComputeBuffer input, int w, int h, RenderTexture output)
@@ -2831,7 +3085,7 @@ namespace Aexis.Execution
             Dispatch3D(_kSlicePack4, output.width, output.height, output.volumeDepth > 0 ? output.volumeDepth : 1, 8, 8);
         }
 
-        public void SlicePack4Cdhw(RenderTexture input, int inW, int inH, int inD, int inC, int axis, int begin, int outW, int outH, int outD, int outC, RenderTexture output)
+        public void SlicePack4Cdhw(RenderTexture input, int inW, int inH, int inD, int inC, int axis, int begin, int step, int outW, int outH, int outD, int outC, RenderTexture output)
         {
             if (input == null) throw new ArgumentNullException(nameof(input));
             if (output == null) throw new ArgumentNullException(nameof(output));
@@ -2841,6 +3095,7 @@ namespace Aexis.Execution
             _cs.SetInt("_SlicePack4CDHWInC", inC);
             _cs.SetInt("_SlicePack4CDHWAxis", axis);
             _cs.SetInt("_SlicePack4CDHWBegin", begin);
+            _cs.SetInt("_SlicePack4CDHWStep", step);
             _cs.SetInt("_SlicePack4CDHWOutW", outW);
             _cs.SetInt("_SlicePack4CDHWOutH", outH);
             _cs.SetInt("_SlicePack4CDHWOutD", outD);
@@ -2868,7 +3123,7 @@ namespace Aexis.Execution
             Dispatch3D(cmd, _kSlicePack4, output.width, output.height, Mathf.Max(1, Mathf.CeilToInt(outC / 4f)), 8, 8);
         }
 
-        public void SlicePack4Cdhw(CommandBuffer cmd, ComputeTexture input, int inW, int inH, int inD, int inC, int axis, int begin, int outW, int outH, int outD, int outC, ComputeTexture output)
+        public void SlicePack4Cdhw(CommandBuffer cmd, ComputeTexture input, int inW, int inH, int inD, int inC, int axis, int begin, int step, int outW, int outH, int outD, int outC, ComputeTexture output)
         {
             if (cmd == null) throw new ArgumentNullException(nameof(cmd));
             if (input == null) throw new ArgumentNullException(nameof(input));
@@ -2879,6 +3134,7 @@ namespace Aexis.Execution
             cmd.SetComputeIntParam(_cs, "_SlicePack4CDHWInC", inC);
             cmd.SetComputeIntParam(_cs, "_SlicePack4CDHWAxis", axis);
             cmd.SetComputeIntParam(_cs, "_SlicePack4CDHWBegin", begin);
+            cmd.SetComputeIntParam(_cs, "_SlicePack4CDHWStep", step);
             cmd.SetComputeIntParam(_cs, "_SlicePack4CDHWOutW", outW);
             cmd.SetComputeIntParam(_cs, "_SlicePack4CDHWOutH", outH);
             cmd.SetComputeIntParam(_cs, "_SlicePack4CDHWOutD", outD);
@@ -3473,6 +3729,95 @@ namespace Aexis.Execution
             cmd.SetComputeTextureParam(_cs, _kAttentionReshapePack4, "_TexIn0Arr", input.nameID);
             cmd.SetComputeTextureParam(_cs, _kAttentionReshapePack4, "_TexOut0Arr", output.nameID);
             Dispatch3D(cmd, _kAttentionReshapePack4, output.width, output.height, ResolveComputeTextureDispatchDepth(output, Mathf.Max(1, outD * Mathf.CeilToInt(outC / 4f))), 8, 8);
+        }
+
+        // Fuses the relative-position attention mask geometry
+        // Pad_1 -> Reshape_7 -> Pad_2 -> Reshape_10. The source remains a
+        // bounded Pack4 Texture2DArray [srcW,srcH,2,1]; only the final
+        // [outW,outH,1,2] texture is allocated.
+        public void AttentionMaskCompactPad4(
+            RenderTexture input,
+            int srcW,
+            int srcH,
+            int outW,
+            int outH,
+            RenderTexture output,
+            int srcD = 1,
+            int srcC = 2,
+            int padLeft = 0)
+        {
+            if (input == null) throw new ArgumentNullException(nameof(input));
+            if (output == null) throw new ArgumentNullException(nameof(output));
+            var padRight = Mathf.Max(0, outW * outH - srcW * srcH);
+            _cs.SetInt("_AttentionMaskCompactSrcW", srcW);
+            _cs.SetInt("_AttentionMaskCompactSrcH", srcH);
+            _cs.SetInt("_AttentionMaskCompactOutW", outW);
+            _cs.SetInt("_AttentionMaskCompactOutH", outH);
+            _cs.SetInt("_AttentionMaskCompactPadRight", padRight);
+            _cs.SetInt("_AttentionMaskCompactPadLeft", Mathf.Max(0, padLeft));
+            _cs.SetInt("_AttentionMaskCompactSrcD", Mathf.Max(1, srcD));
+            _cs.SetInt("_AttentionMaskCompactSrcC", Mathf.Max(1, srcC));
+            _cs.SetTexture(_kAttentionMaskCompactPad4, "_TexIn0Arr", input);
+            _cs.SetTexture(_kAttentionMaskCompactPad4, "_TexOut0Arr", output);
+            Dispatch3D(_kAttentionMaskCompactPad4, output.width, output.height,
+                ResolveRenderTextureDispatchDepth(output, 1), 8, 8);
+        }
+
+        public void AttentionMaskCompactPad4(
+            CommandBuffer cmd,
+            ComputeTexture input,
+            int srcW,
+            int srcH,
+            int outW,
+            int outH,
+            ComputeTexture output,
+            int srcD = 1,
+            int srcC = 2,
+            int padLeft = 0)
+        {
+            if (cmd == null) throw new ArgumentNullException(nameof(cmd));
+            if (input == null) throw new ArgumentNullException(nameof(input));
+            if (output == null) throw new ArgumentNullException(nameof(output));
+            var padRight = Mathf.Max(0, outW * outH - srcW * srcH);
+            cmd.SetComputeIntParam(_cs, "_AttentionMaskCompactSrcW", srcW);
+            cmd.SetComputeIntParam(_cs, "_AttentionMaskCompactSrcH", srcH);
+            cmd.SetComputeIntParam(_cs, "_AttentionMaskCompactOutW", outW);
+            cmd.SetComputeIntParam(_cs, "_AttentionMaskCompactOutH", outH);
+            cmd.SetComputeIntParam(_cs, "_AttentionMaskCompactPadRight", padRight);
+            cmd.SetComputeIntParam(_cs, "_AttentionMaskCompactPadLeft", Mathf.Max(0, padLeft));
+            cmd.SetComputeIntParam(_cs, "_AttentionMaskCompactSrcD", Mathf.Max(1, srcD));
+            cmd.SetComputeIntParam(_cs, "_AttentionMaskCompactSrcC", Mathf.Max(1, srcC));
+            cmd.SetComputeTextureParam(_cs, _kAttentionMaskCompactPad4, "_TexIn0Arr", input.nameID);
+            cmd.SetComputeTextureParam(_cs, _kAttentionMaskCompactPad4, "_TexOut0Arr", output.nameID);
+            Dispatch3D(cmd, _kAttentionMaskCompactPad4, output.width, output.height,
+                ResolveComputeTextureDispatchDepth(output, 1), 8, 8);
+        }
+
+        // Fuses Pad_3 -> Reshape_13 -> Pad_4 -> Reshape_16 in the flow
+        // relative-position attention path. Both logical rows remain depth
+        // slices, so no oversized LinearMat is allocated for Reshape_13.
+        public void AttentionMaskCompactPad4D4(
+            CommandBuffer cmd,
+            ComputeTexture input,
+            int srcW,
+            int srcH,
+            int outW,
+            int outH,
+            ComputeTexture output,
+            int padLeft = 0)
+        {
+            if (cmd == null) throw new ArgumentNullException(nameof(cmd));
+            if (input == null) throw new ArgumentNullException(nameof(input));
+            if (output == null) throw new ArgumentNullException(nameof(output));
+            cmd.SetComputeIntParam(_cs, "_AttentionMaskCompactSrcW", srcW);
+            cmd.SetComputeIntParam(_cs, "_AttentionMaskCompactSrcH", srcH);
+            cmd.SetComputeIntParam(_cs, "_AttentionMaskCompactOutW", outW);
+            cmd.SetComputeIntParam(_cs, "_AttentionMaskCompactOutH", outH);
+            cmd.SetComputeIntParam(_cs, "_AttentionMaskCompactPadLeft", Mathf.Max(0, padLeft));
+            cmd.SetComputeTextureParam(_cs, _kAttentionMaskCompactPad4D4, "_TexIn0Arr", input.nameID);
+            cmd.SetComputeTextureParam(_cs, _kAttentionMaskCompactPad4D4, "_TexOut0Arr", output.nameID);
+            Dispatch3D(cmd, _kAttentionMaskCompactPad4D4, output.width, output.height,
+                ResolveComputeTextureDispatchDepth(output, 2), 8, 8);
         }
 
         public void AttentionContextFlattenPack4(RenderTexture input, int inW, int inH, int inD, int inC, int outC, int outDims, RenderTexture output)
@@ -4238,6 +4583,125 @@ namespace Aexis.Execution
             Dispatch2D(_kNhwcPack4ToRgbScaled, outputRgb.width, outputRgb.height, 32, 32);
         }
 
+        /// <summary>Unpacks a centered NHWC model tile and writes only its core to a
+        /// destination RGB RT. Tile coordinates are in model-output pixels.</summary>
+        public void NhwcPack4TileToRgbScaled(RenderTexture inputPack4, RenderTexture outputRgb,
+            int dstX, int dstY, int dstW, int dstH, int tilePadX, int tilePadY,
+            int tileCoreW, int tileCoreH, int tileW, int tileH, float scale, float bias = 0f)
+        {
+            if (inputPack4 == null) throw new ArgumentNullException(nameof(inputPack4));
+            if (outputRgb == null) throw new ArgumentNullException(nameof(outputRgb));
+            if (dstW <= 0 || dstH <= 0) return;
+            if (dstX < 0 || dstY < 0 || dstX + dstW > outputRgb.width || dstY + dstH > outputRgb.height)
+                throw new ArgumentOutOfRangeException(nameof(dstX), "destination rect out of range");
+            _cs.SetInt("_BlitW", dstW);
+            _cs.SetInt("_BlitH", dstH);
+            _cs.SetInt("_DstX", dstX);
+            _cs.SetInt("_DstY", dstY);
+            _cs.SetInt("_TilePadX", tilePadX);
+            _cs.SetInt("_TilePadY", tilePadY);
+            _cs.SetInt("_TileCoreW", tileCoreW);
+            _cs.SetInt("_TileCoreH", tileCoreH);
+            _cs.SetInt("_TileW", tileW);
+            _cs.SetInt("_TileH", tileH);
+            _cs.SetFloat("_OutputValueScale", scale);
+            _cs.SetFloat("_OutputValueBias", bias);
+            _cs.SetTexture(_kNhwcPack4TileToRgbScaled, "_TexIn0Arr", inputPack4);
+            _cs.SetTexture(_kNhwcPack4TileToRgbScaled, "_RgbOut", outputRgb);
+            Dispatch2D(_kNhwcPack4TileToRgbScaled, dstW, dstH, 32, 32);
+        }
+
+        /// <summary>CommandBuffer variant of the SESR NHWC output crop/de-center pass.</summary>
+        public void NhwcPack4TileToRgbScaled(CommandBuffer cmd, ComputeTexture inputPack4, RenderTexture outputRgb,
+            int dstX, int dstY, int dstW, int dstH, int tilePadX, int tilePadY,
+            int tileCoreW, int tileCoreH, int tileW, int tileH, float scale, float bias = 0f)
+        {
+            if (cmd == null) throw new ArgumentNullException(nameof(cmd));
+            if (inputPack4 == null) throw new ArgumentNullException(nameof(inputPack4));
+            if (outputRgb == null) throw new ArgumentNullException(nameof(outputRgb));
+            if (dstW <= 0 || dstH <= 0) return;
+            if (dstX < 0 || dstY < 0 || dstX + dstW > outputRgb.width || dstY + dstH > outputRgb.height)
+                throw new ArgumentOutOfRangeException(nameof(dstX), "destination rect out of range");
+            cmd.SetComputeIntParam(_cs, "_BlitW", dstW);
+            cmd.SetComputeIntParam(_cs, "_BlitH", dstH);
+            cmd.SetComputeIntParam(_cs, "_DstX", dstX);
+            cmd.SetComputeIntParam(_cs, "_DstY", dstY);
+            cmd.SetComputeIntParam(_cs, "_TilePadX", tilePadX);
+            cmd.SetComputeIntParam(_cs, "_TilePadY", tilePadY);
+            cmd.SetComputeIntParam(_cs, "_TileCoreW", tileCoreW);
+            cmd.SetComputeIntParam(_cs, "_TileCoreH", tileCoreH);
+            cmd.SetComputeIntParam(_cs, "_TileW", tileW);
+            cmd.SetComputeIntParam(_cs, "_TileH", tileH);
+            cmd.SetComputeFloatParam(_cs, "_OutputValueScale", scale);
+            cmd.SetComputeFloatParam(_cs, "_OutputValueBias", bias);
+            cmd.SetComputeTextureParam(_cs, _kNhwcPack4TileToRgbScaled, "_TexIn0Arr", inputPack4.nameID);
+            cmd.SetComputeTextureParam(_cs, _kNhwcPack4TileToRgbScaled, "_RgbOut", outputRgb);
+            Dispatch2D(cmd, _cs, _kNhwcPack4TileToRgbScaled, dstW, dstH, 32, 32);
+        }
+
+        /// <summary>CommandBuffer terminal path for a three-channel NCHW Pack4 tensor.
+        /// This is mathematically identical to transposing it to NHWC first, then using
+        /// <see cref="NhwcPack4TileToRgbScaled(CommandBuffer, ComputeTexture, RenderTexture, int, int, int, int, int, int, int, int, int, int, float, float)"/>.</summary>
+        public void NchwPack4TileToRgbScaled(CommandBuffer cmd, ComputeTexture inputPack4, RenderTexture outputRgb,
+            int dstX, int dstY, int dstW, int dstH, int tilePadX, int tilePadY,
+            int tileCoreW, int tileCoreH, int tileW, int tileH, float scale, float bias = 0f)
+        {
+            if (cmd == null) throw new ArgumentNullException(nameof(cmd));
+            if (inputPack4 == null) throw new ArgumentNullException(nameof(inputPack4));
+            if (outputRgb == null) throw new ArgumentNullException(nameof(outputRgb));
+            if (dstW <= 0 || dstH <= 0) return;
+            if (dstX < 0 || dstY < 0 || dstX + dstW > outputRgb.width || dstY + dstH > outputRgb.height)
+                throw new ArgumentOutOfRangeException(nameof(dstX), "destination rect out of range");
+            cmd.SetComputeIntParam(_cs, "_BlitW", dstW);
+            cmd.SetComputeIntParam(_cs, "_BlitH", dstH);
+            cmd.SetComputeIntParam(_cs, "_DstX", dstX);
+            cmd.SetComputeIntParam(_cs, "_DstY", dstY);
+            cmd.SetComputeIntParam(_cs, "_TilePadX", tilePadX);
+            cmd.SetComputeIntParam(_cs, "_TilePadY", tilePadY);
+            cmd.SetComputeIntParam(_cs, "_TileCoreW", tileCoreW);
+            cmd.SetComputeIntParam(_cs, "_TileCoreH", tileCoreH);
+            cmd.SetComputeIntParam(_cs, "_TileW", tileW);
+            cmd.SetComputeIntParam(_cs, "_TileH", tileH);
+            cmd.SetComputeFloatParam(_cs, "_OutputValueScale", scale);
+            cmd.SetComputeFloatParam(_cs, "_OutputValueBias", bias);
+            // _RgbInArr is the Pack4 shader-side macro alias for _TexIn0Arr.
+            // CommandBuffer properties are resolved before macro expansion, so
+            // bind the concrete common binding name.
+            cmd.SetComputeTextureParam(_cs, _kNchwPack4TileToRgbScaled, "_TexIn0Arr", inputPack4.nameID);
+            cmd.SetComputeTextureParam(_cs, _kNchwPack4TileToRgbScaled, "_RgbOut", outputRgb);
+            Dispatch2D(cmd, _cs, _kNchwPack4TileToRgbScaled, dstW, dstH, 32, 32);
+        }
+
+        /// <summary>Fuses SESR-M7's verified x2 CRD 12-to-3 PixelShuffle with its
+        /// final RGB crop/de-center pass, eliminating only the lossless temporary
+        /// PixelShuffle activation.</summary>
+        public void SesrTailCrD12Pack4TileToRgbScaled(CommandBuffer cmd, ComputeTexture inputPack4, RenderTexture outputRgb,
+            int dstX, int dstY, int dstW, int dstH, int tilePadX, int tilePadY,
+            int tileCoreW, int tileCoreH, int tileW, int tileH, float scale, float bias = 0f)
+        {
+            if (cmd == null) throw new ArgumentNullException(nameof(cmd));
+            if (inputPack4 == null) throw new ArgumentNullException(nameof(inputPack4));
+            if (outputRgb == null) throw new ArgumentNullException(nameof(outputRgb));
+            if (dstW <= 0 || dstH <= 0) return;
+            if (dstX < 0 || dstY < 0 || dstX + dstW > outputRgb.width || dstY + dstH > outputRgb.height)
+                throw new ArgumentOutOfRangeException(nameof(dstX), "destination rect out of range");
+            cmd.SetComputeIntParam(_cs, "_BlitW", dstW);
+            cmd.SetComputeIntParam(_cs, "_BlitH", dstH);
+            cmd.SetComputeIntParam(_cs, "_DstX", dstX);
+            cmd.SetComputeIntParam(_cs, "_DstY", dstY);
+            cmd.SetComputeIntParam(_cs, "_TilePadX", tilePadX);
+            cmd.SetComputeIntParam(_cs, "_TilePadY", tilePadY);
+            cmd.SetComputeIntParam(_cs, "_TileCoreW", tileCoreW);
+            cmd.SetComputeIntParam(_cs, "_TileCoreH", tileCoreH);
+            cmd.SetComputeIntParam(_cs, "_TileW", tileW);
+            cmd.SetComputeIntParam(_cs, "_TileH", tileH);
+            cmd.SetComputeFloatParam(_cs, "_OutputValueScale", scale);
+            cmd.SetComputeFloatParam(_cs, "_OutputValueBias", bias);
+            cmd.SetComputeTextureParam(_cs, _kSesrTailCrD12Pack4TileToRgbScaled, "_TexIn0Arr", inputPack4.nameID);
+            cmd.SetComputeTextureParam(_cs, _kSesrTailCrD12Pack4TileToRgbScaled, "_RgbOut", outputRgb);
+            Dispatch2D(cmd, _cs, _kSesrTailCrD12Pack4TileToRgbScaled, dstW, dstH, 32, 32);
+        }
+
         public void ProbeTilePack4(CommandBuffer cmd, ComputeTexture tileOutPack4, int probeIndex, int pad, int coreW, int coreH, ComputeBuffer probeOut)
         {
             if (probeOut == null) throw new ArgumentNullException(nameof(probeOut));
@@ -4319,6 +4783,37 @@ namespace Aexis.Execution
             cmd.SetComputeTextureParam(_cs, _kPaddingPack4, "_TexIn0Arr", input.nameID);
             cmd.SetComputeTextureParam(_cs, _kPaddingPack4, "_TexOut0Arr", output.nameID);
             Dispatch3D(cmd, _kPaddingPack4, output.width, output.height, packs, 8, 8);
+        }
+
+        public void PaddingLinearMat2D(RenderTexture input, int padLeft, int padRight, int padTop, int padBottom, int padType, float padValue, RenderTexture output)
+        {
+            if (input == null) throw new ArgumentNullException(nameof(input));
+            if (output == null) throw new ArgumentNullException(nameof(output));
+            _cs.SetInt("_PadLeft", padLeft);
+            _cs.SetInt("_PadRight", padRight);
+            _cs.SetInt("_PadTop", padTop);
+            _cs.SetInt("_PadBottom", padBottom);
+            _cs.SetInt("_PadType", padType);
+            _cs.SetVector("_PadValue4", new Vector4(padValue, 0f, 0f, 0f));
+            _cs.SetTexture(_kPaddingLinearMat2D, "_LinearIn0", input);
+            _cs.SetTexture(_kPaddingLinearMat2D, "_LinearOut0", output);
+            Dispatch2D(_kPaddingLinearMat2D, output.width, output.height, 8, 8);
+        }
+
+        public void PaddingLinearMat2D(CommandBuffer cmd, ComputeTexture input, int padLeft, int padRight, int padTop, int padBottom, int padType, float padValue, ComputeTexture output)
+        {
+            if (cmd == null) throw new ArgumentNullException(nameof(cmd));
+            if (input == null) throw new ArgumentNullException(nameof(input));
+            if (output == null) throw new ArgumentNullException(nameof(output));
+            cmd.SetComputeIntParam(_cs, "_PadLeft", padLeft);
+            cmd.SetComputeIntParam(_cs, "_PadRight", padRight);
+            cmd.SetComputeIntParam(_cs, "_PadTop", padTop);
+            cmd.SetComputeIntParam(_cs, "_PadBottom", padBottom);
+            cmd.SetComputeIntParam(_cs, "_PadType", padType);
+            cmd.SetComputeVectorParam(_cs, "_PadValue4", new Vector4(padValue, 0f, 0f, 0f));
+            cmd.SetComputeTextureParam(_cs, _kPaddingLinearMat2D, "_LinearIn0", input.nameID);
+            cmd.SetComputeTextureParam(_cs, _kPaddingLinearMat2D, "_LinearOut0", output.nameID);
+            Dispatch2D(cmd, _cs, _kPaddingLinearMat2D, output.width, output.height, 8, 8);
         }
 
         public void PoolingPack4(RenderTexture input, int packs, int kernelW, int kernelH, int strideW, int strideH, int padLeft, int padTop, int poolType, RenderTexture output, bool includePad = false)
@@ -5219,7 +5714,7 @@ namespace Aexis.Execution
             if (a == null) throw new ArgumentNullException(nameof(a));
             if (b == null) throw new ArgumentNullException(nameof(b));
             if (output == null) throw new ArgumentNullException(nameof(output));
-            if (broadcastMode < 1 || broadcastMode > 8)
+            if (broadcastMode < 1 || broadcastMode > 9)
                 throw new ArgumentOutOfRangeException(nameof(broadcastMode));
             if (_probeFastZeroBinaryOp)
             {
@@ -5249,6 +5744,30 @@ namespace Aexis.Execution
             _cs.SetBuffer(_kBinaryOpPack4BufferScalar, "_BufB", scalar);
             _cs.SetTexture(_kBinaryOpPack4BufferScalar, "_TexOut0Arr", output);
             Dispatch3D(_kBinaryOpPack4BufferScalar, output.width, output.height, ResolveRenderTextureDispatchDepth(output, packs), 8, 8);
+        }
+
+        /// <summary>
+        /// Applies a binary operation between a Pack4 texture and a single
+        /// scalar stored in a 1x1 Texture2D. MemoryData publishes rank-1
+        /// constants as RFloat Texture2D objects on the immediate path, so
+        /// binding them to the Texture2DArray input of BinaryOpPack4 would
+        /// trigger a dimension mismatch. The dedicated shader reads the
+        /// scalar from <c>_LinearIn1[0,0]</c> and broadcasts it to every lane.
+        /// </summary>
+        public void BinaryOpPack4TexScalar(RenderTexture texture, RenderTexture scalarTex2D, int packs, int opType, RenderTexture output)
+        {
+            if (texture == null) throw new ArgumentNullException(nameof(texture));
+            if (scalarTex2D == null) throw new ArgumentNullException(nameof(scalarTex2D));
+            if (output == null) throw new ArgumentNullException(nameof(output));
+            if (scalarTex2D.dimension != TextureDimension.Tex2D)
+                throw new InvalidOperationException("BinaryOpPack4TexScalar requires a Texture2D scalar source.");
+            if (packs < 1) throw new ArgumentOutOfRangeException(nameof(packs));
+
+            _cs.SetInt("_BinaryOpType", opType);
+            _cs.SetTexture(_kBinaryOpPack4TexScalar, "_TexIn0Arr", texture);
+            _cs.SetTexture(_kBinaryOpPack4TexScalar, "_LinearIn1", scalarTex2D);
+            _cs.SetTexture(_kBinaryOpPack4TexScalar, "_TexOut0Arr", output);
+            Dispatch3D(_kBinaryOpPack4TexScalar, output.width, output.height, ResolveRenderTextureDispatchDepth(output, packs), 8, 8);
         }
 
         public void BinaryOpPack4ChannelVectorTex(RenderTexture texture, RenderTexture vector, int packs, int opType, bool vectorIsA, RenderTexture output)
@@ -5335,7 +5854,7 @@ namespace Aexis.Execution
             if (a == null) throw new ArgumentNullException(nameof(a));
             if (b == null) throw new ArgumentNullException(nameof(b));
             if (output == null) throw new ArgumentNullException(nameof(output));
-            if (broadcastMode < 1 || broadcastMode > 8)
+            if (broadcastMode < 1 || broadcastMode > 9)
                 throw new ArgumentOutOfRangeException(nameof(broadcastMode));
             if (_probeFastZeroBinaryOp)
             {
@@ -5367,6 +5886,23 @@ namespace Aexis.Execution
             cmd.SetComputeBufferParam(_cs, _kBinaryOpPack4BufferScalar, "_BufB", scalar);
             cmd.SetComputeTextureParam(_cs, _kBinaryOpPack4BufferScalar, "_TexOut0Arr", output.nameID);
             Dispatch3D(cmd, _kBinaryOpPack4BufferScalar, output.width, output.height, ResolveComputeTextureDispatchDepth(output, packs), 8, 8);
+        }
+
+        public void BinaryOpPack4TexScalar(CommandBuffer cmd, ComputeTexture texture, ComputeTexture scalarTex2D, int packs, int opType, ComputeTexture output)
+        {
+            if (cmd == null) throw new ArgumentNullException(nameof(cmd));
+            if (texture == null) throw new ArgumentNullException(nameof(texture));
+            if (scalarTex2D == null) throw new ArgumentNullException(nameof(scalarTex2D));
+            if (output == null) throw new ArgumentNullException(nameof(output));
+            if (scalarTex2D.dimension != TextureDimension.Tex2D)
+                throw new InvalidOperationException("BinaryOpPack4TexScalar requires a Texture2D scalar source (MemoryData 单元素常量).");
+            if (packs < 1) throw new ArgumentOutOfRangeException(nameof(packs));
+
+            cmd.SetComputeIntParam(_cs, "_BinaryOpType", opType);
+            cmd.SetComputeTextureParam(_cs, _kBinaryOpPack4TexScalar, "_TexIn0Arr", texture.nameID);
+            cmd.SetComputeTextureParam(_cs, _kBinaryOpPack4TexScalar, "_LinearIn1", scalarTex2D.nameID);
+            cmd.SetComputeTextureParam(_cs, _kBinaryOpPack4TexScalar, "_TexOut0Arr", output.nameID);
+            Dispatch3D(cmd, _kBinaryOpPack4TexScalar, output.width, output.height, ResolveComputeTextureDispatchDepth(output, packs), 8, 8);
         }
 
         public void BinaryOpPack4ChannelVectorTex(CommandBuffer cmd, ComputeTexture texture, ComputeTexture vector, int packs, int opType, bool vectorIsA, ComputeTexture output)
@@ -5591,7 +6127,7 @@ namespace Aexis.Execution
             Dispatch2D(cmd, _cs, _kGeluLinearMat, output.width, output.height, 8, 8);
         }
 
-        public void Conv3x3Pack4(RenderTexture srcPack4, int inPacks, ComputeBuffer w4, ComputeBuffer b4, int outPacks, int pad, int activationType, float activationParam, RenderTexture dstPack4)
+        public void Conv3x3Pack4(RenderTexture srcPack4, int inPacks, ComputeBuffer w4, ComputeBuffer b4, int outPacks, int pad, int activationType, float activationParam, RenderTexture dstPack4, ComputeBuffer fusedPReluSlope = null, int fusedPReluSlopeCount = 0)
         {
             if (srcPack4 == null) throw new ArgumentNullException(nameof(srcPack4));
             if (dstPack4 == null) throw new ArgumentNullException(nameof(dstPack4));
@@ -5600,6 +6136,7 @@ namespace Aexis.Execution
             if (inPacks <= 0) throw new ArgumentOutOfRangeException(nameof(inPacks));
             if (outPacks <= 0) throw new ArgumentOutOfRangeException(nameof(outPacks));
 
+            int kernel = PreferFp16AluConv3x3Pack4 ? _kConv3x3Pack4Fp16Alu : _kConv3x3Pack4;
             _cs.SetInt("_InPacks", inPacks);
             _cs.SetInt("_OutPacks", outPacks);
             _cs.SetInt("_Pad", Mathf.Max(0, pad));
@@ -5611,12 +6148,13 @@ namespace Aexis.Execution
             // this inactive branch, so bind the existing Pack4 input as a
             // harmless texture-native placeholder for ordinary convolution.
             _cs.SetInt("_GfpganDynamicConvW4Width", Mathf.Max(1, srcPack4.width));
-            _cs.SetBuffer(_kConv3x3Pack4, "_ConvW4", w4);
-            _cs.SetBuffer(_kConv3x3Pack4, "_ConvB4", b4);
-            _cs.SetTexture(_kConv3x3Pack4, "_GfpganDynamicConvW4Tex", srcPack4);
-            _cs.SetTexture(_kConv3x3Pack4, "_ConvInArr", srcPack4);
-            _cs.SetTexture(_kConv3x3Pack4, "_ConvOutArr", dstPack4);
-            Dispatch3D(_kConv3x3Pack4, (dstPack4.width + 1) / 2, (dstPack4.height + 1) / 2, (outPacks + 1) / 2, 8, 8);
+            SetConvPack4Weights(kernel, w4);
+            _cs.SetBuffer(kernel, "_ConvB4", b4);
+            SetFusedPRelu(kernel, b4, fusedPReluSlope, fusedPReluSlopeCount);
+            _cs.SetTexture(kernel, "_GfpganDynamicConvW4Tex", srcPack4);
+            _cs.SetTexture(kernel, "_ConvInArr", srcPack4);
+            _cs.SetTexture(kernel, "_ConvOutArr", dstPack4);
+            Dispatch3D(kernel, (dstPack4.width + 1) / 2, (dstPack4.height + 1) / 2, (outPacks + 1) / 2, 16, 4);
         }
 
         public void Conv3x3Pack4DynamicWeight(RenderTexture srcPack4, int inPacks, RenderTexture dynamicW4, ComputeBuffer b4, int outPacks, int pad, int activationType, float activationParam, RenderTexture dstPack4)
@@ -5632,13 +6170,28 @@ namespace Aexis.Execution
             // Bound only to satisfy the inactive immutable-weight branch.
             _cs.SetBuffer(_kConv3x3Pack4, "_ConvW4", b4);
             _cs.SetBuffer(_kConv3x3Pack4, "_ConvB4", b4);
+            SetFusedPRelu(_kConv3x3Pack4, b4, null, 0);
             _cs.SetTexture(_kConv3x3Pack4, "_GfpganDynamicConvW4Tex", dynamicW4);
             _cs.SetTexture(_kConv3x3Pack4, "_ConvInArr", srcPack4);
             _cs.SetTexture(_kConv3x3Pack4, "_ConvOutArr", dstPack4);
-            Dispatch3D(_kConv3x3Pack4, (dstPack4.width + 1) / 2, (dstPack4.height + 1) / 2, (outPacks + 1) / 2, 8, 8);
+            Dispatch3D(_kConv3x3Pack4, (dstPack4.width + 1) / 2, (dstPack4.height + 1) / 2, (outPacks + 1) / 2, 16, 4);
         }
 
-        public void ConvPack4General(RenderTexture srcPack4, int inPacks, ComputeBuffer w4, ComputeBuffer b4, int outPacks, int outputChannels, int kernelW, int kernelH, int strideW, int strideH, int padLeft, int padTop, int dilationW, int dilationH, int activationType, float activationParam, RenderTexture dstPack4)
+        // Diagnostic: record which conv/deconv kernel variant is selected for each distinct
+        // output geometry, once per process. Used to verify tiling dispatch actually fires.
+        public static readonly System.Collections.Generic.HashSet<string> s_kernelDispatchLog =
+            new System.Collections.Generic.HashSet<string>(StringComparer.Ordinal);
+
+        static void LogKernelDispatch(string name, int outW, int outH, int strideW, int strideH,
+            int kernelW, int kernelH, int outPacks)
+        {
+            string key = name + " out=" + outW + "x" + outH + " stride=" + strideW + "x" + strideH
+                + " kw=" + kernelW + " kh=" + kernelH + " packs=" + outPacks;
+            if (s_kernelDispatchLog.Add(key))
+                UnityEngine.Debug.Log("[AexisDispatch] " + key);
+        }
+
+        public void ConvPack4General(RenderTexture srcPack4, int inPacks, ComputeBuffer w4, ComputeBuffer b4, int outPacks, int outputChannels, int kernelW, int kernelH, int strideW, int strideH, int padLeft, int padTop, int dilationW, int dilationH, int activationType, float activationParam, RenderTexture dstPack4, int inputChannels = 0)
         {
             if (srcPack4 == null) throw new ArgumentNullException(nameof(srcPack4));
             if (dstPack4 == null) throw new ArgumentNullException(nameof(dstPack4));
@@ -5649,8 +6202,20 @@ namespace Aexis.Execution
             if (outputChannels <= 0 || outputChannels > outPacks * 4) throw new ArgumentOutOfRangeException(nameof(outputChannels));
             if (kernelW <= 0 || kernelH <= 0) throw new ArgumentOutOfRangeException(nameof(kernelW));
 
+            if (PreferSharedConv5x5Pack4
+                && outputChannels == outPacks * 4
+                && kernelW == 5 && kernelH == 5
+                && strideW == 1 && strideH == 1
+                && dilationW == 1 && dilationH == 1
+                && padLeft == 2 && padTop == 2)
+            {
+                Conv5x5Pack4(srcPack4, inPacks, w4, b4, outPacks, activationType, activationParam, dstPack4);
+                return;
+            }
+
             _cs.SetInt("_InW", srcPack4.width);
             _cs.SetInt("_InH", srcPack4.height);
+            _cs.SetInt("_InC", inputChannels > 0 ? inputChannels : inPacks * 4);
             _cs.SetInt("_OutW", dstPack4.width);
             _cs.SetInt("_OutH", dstPack4.height);
             _cs.SetInt("_InPacks", inPacks);
@@ -5666,11 +6231,76 @@ namespace Aexis.Execution
             _cs.SetInt("_DilationHVar", Mathf.Max(1, dilationH));
             _cs.SetInt("_ActType", activationType);
             _cs.SetFloat("_ActParam", activationParam);
+            _cs.SetInt("_UseGfpganDynWeights", 0);
+            // AexisReadGenericConvWeight4 can route to the dynamic GFPGAN weight
+            // texture; the declared resource must be bound before dispatch even
+            // when that branch is inactive (same requirement as 3x3/5x5/1x1).
+            _cs.SetInt("_GfpganDynamicConvW4Width", Mathf.Max(1, srcPack4.width));
+            _cs.SetTexture(_kConvPack4General, "_GfpganDynamicConvW4Tex", srcPack4);
             SetConvPack4Weights(_kConvPack4General, w4);
-            _cs.SetBuffer(_kConvPack4General, "_ConvB4", b4);
-            _cs.SetTexture(_kConvPack4General, "_ConvInArr", srcPack4);
-            _cs.SetTexture(_kConvPack4General, "_ConvOutArr", dstPack4);
-            Dispatch3D(_kConvPack4General, (dstPack4.width + 1) / 2, (dstPack4.height + 1) / 2, (outPacks + 1) / 2, 8, 8);
+            // The General kernel shares global conv buffer declarations (_ConvW/_ConvWInt8*/
+            // _ConvWInt4*/_ConvB) with the non-packed conv path; Unity requires all of them
+            // bound before dispatch even though the active fp32 Pack4 path only reads _ConvW4/_ConvB4.
+            // Narrow 1-row vocoder stages (height==1): the 8x8 tiled kernel wastes ~7/8 of its
+            // y-threads, so route to the flat 1-output-per-thread variant dispatched 1D over the
+            // total output texels. Numerically identical; the default multi-row path is unchanged.
+            bool useFlatConv = dstPack4.height <= 1;
+            bool useTileX = useFlatConv && strideW == 1 && strideH == 1 && dilationW == 1 && dilationH == 1
+                && kernelH == 1 && padTop == 0
+                // AexisConvPack4GeneralTileX keeps TILE_X + kernelW - 1
+                // samples in a fixed float4[16] register array.  Larger
+                // kernels must use the bounds-safe flat implementation.
+                && kernelW <= 13;
+            int convKernel = useTileX ? _kConvPack4GeneralTileX : (useFlatConv ? _kConvPack4GeneralFlat : _kConvPack4General);
+            LogKernelDispatch(useTileX ? "convTileX" : (useFlatConv ? "convFlat" : "convGeneral"),
+                dstPack4.width, dstPack4.height, strideW, strideH, kernelW, kernelH, outPacks);
+            SetConvPack4Weights(convKernel, w4);
+            _cs.SetBuffer(convKernel, "_ConvW", (_int8ConvWeights != null || _int4ConvWeights != null) ? b4 : w4);
+            _cs.SetBuffer(convKernel, "_ConvWInt8Packed", _int8ConvWeights ?? w4);
+            _cs.SetBuffer(convKernel, "_ConvWInt8Scales", _int8ConvWeightScales ?? w4);
+            _cs.SetBuffer(convKernel, "_ConvWInt4Packed", _int4ConvWeights ?? w4);
+            _cs.SetBuffer(convKernel, "_ConvWInt4Scales", _int4ConvWeightScales ?? w4);
+            _cs.SetBuffer(convKernel, "_ConvB", b4);
+            _cs.SetBuffer(convKernel, "_ConvB4", b4);
+            _cs.SetTexture(convKernel, "_GfpganDynamicConvW4Tex", srcPack4);
+            _cs.SetTexture(convKernel, "_ConvInArr", srcPack4);
+            _cs.SetTexture(convKernel, "_ConvOutArr", dstPack4);
+            if (useTileX)
+            {
+                // Each thread handles 4 output pixels
+                int groupsX = Mathf.Max(1, Mathf.CeilToInt(dstPack4.width / (256f * 4)));
+                _cs.Dispatch(convKernel, groupsX, 1, outPacks);
+            }
+            else if (useFlatConv)
+            {
+                int groupsX = Mathf.Max(1, Mathf.CeilToInt(dstPack4.width / 256f));
+                _cs.Dispatch(convKernel, groupsX, 1, outPacks);
+            }
+            else
+            {
+                Dispatch3D(convKernel, (dstPack4.width + 1) / 2, (dstPack4.height + 1) / 2, (outPacks + 1) / 2, 8, 8);
+            }
+        }
+
+        private void Conv5x5Pack4(RenderTexture srcPack4, int inPacks, ComputeBuffer w4, ComputeBuffer b4,
+            int outPacks, int activationType, float activationParam, RenderTexture dstPack4)
+        {
+            int kernel = PreferFp16AluConv3x3Pack4 ? _kConv5x5Pack4Fp16Alu : _kConv5x5Pack4;
+            _cs.SetInt("_InPacks", inPacks);
+            _cs.SetInt("_OutPacks", outPacks);
+            _cs.SetInt("_Pad", 2);
+            _cs.SetInt("_ActType", activationType);
+            _cs.SetFloat("_ActParam", activationParam);
+            _cs.SetInt("_UseGfpganDynWeights", 0);
+            _cs.SetInt("_GfpganDynamicConvW4Width", Mathf.Max(1, srcPack4.width));
+            SetConvPack4Weights(kernel, w4);
+            _cs.SetBuffer(kernel, "_ConvB4", b4);
+            SetFusedPRelu(kernel, b4, null, 0);
+            _cs.SetTexture(kernel, "_GfpganDynamicConvW4Tex", srcPack4);
+            _cs.SetTexture(kernel, "_ConvInArr", srcPack4);
+            _cs.SetTexture(kernel, "_ConvOutArr", dstPack4);
+            Dispatch3D(kernel, (dstPack4.width + 1) / 2, (dstPack4.height + 1) / 2,
+                (outPacks + 1) / 2, 16, 4);
         }
 
         public void DeconvolutionPack4General(RenderTexture srcPack4, int inPacks, ComputeBuffer w4, ComputeBuffer b4, int outPacks, int kernelW, int kernelH, int strideW, int strideH, int padLeft, int padTop, int dilationW, int dilationH, int activationType, float activationParam, RenderTexture dstPack4)
@@ -5685,6 +6315,7 @@ namespace Aexis.Execution
 
             _cs.SetInt("_InW", srcPack4.width);
             _cs.SetInt("_InH", srcPack4.height);
+            _cs.SetInt("_InTileW", 0);
             _cs.SetInt("_OutW", dstPack4.width);
             _cs.SetInt("_OutH", dstPack4.height);
             _cs.SetInt("_InPacks", inPacks);
@@ -5700,10 +6331,38 @@ namespace Aexis.Execution
             _cs.SetInt("_ActType", activationType);
             _cs.SetFloat("_ActParam", activationParam);
             SetConvPack4Weights(_kDeconvolutionPack4General, w4);
-            _cs.SetBuffer(_kDeconvolutionPack4General, "_ConvB4", b4);
-            _cs.SetTexture(_kDeconvolutionPack4General, "_ConvInArr", srcPack4);
-            _cs.SetTexture(_kDeconvolutionPack4General, "_ConvOutArr", dstPack4);
-            Dispatch3D(_kDeconvolutionPack4General, dstPack4.width, dstPack4.height, outPacks, 8, 8);
+            // Narrow 1-row vocoder stages (height==1): the 8x8 3D dispatch wastes ~7/8 of its
+            // y-threads, so route to the flat 1-output-per-thread variant dispatched 1D over the
+            // total output texels. Numerically identical; the default multi-row path is unchanged.
+            bool useFlatDeconv = dstPack4.height <= 1;
+            bool useTileXDeconv = useFlatDeconv && dstPack4.width >= 4096 && strideW >= 2
+                && strideH == 1 && kernelH == 1 && padTop == 0 && dilationW == 1 && dilationH == 1;
+            int deconvKernel = useTileXDeconv ? _kDeconvolutionPack4GeneralTileX : (useFlatDeconv ? _kDeconvolutionPack4GeneralFlat : _kDeconvolutionPack4General);
+            LogKernelDispatch(useTileXDeconv ? "deconvTileX" : (useFlatDeconv ? "deconvFlat" : "deconvGeneral"),
+                dstPack4.width, dstPack4.height, strideW, strideH, kernelW, kernelH, outPacks);
+            SetConvPack4Weights(deconvKernel, w4);
+            _cs.SetBuffer(deconvKernel, "_ConvB4", b4);
+            _cs.SetTexture(deconvKernel, "_ConvInArr", srcPack4);
+            _cs.SetTexture(deconvKernel, "_ConvOutArr", dstPack4);
+            // 2D layout: when output exceeds maxTextureSize (16384), wrap into rows of 16384 texels.
+            // Caller must allocate texture as (width=16384, height=ceil(total_texels/16384)).
+            int outTileW = dstPack4.width > 16384 ? 16384 : 0;
+            _cs.SetInt("_OutTileW", outTileW);
+            if (useTileXDeconv)
+            {
+                // Each thread handles 8 output pixels
+                int groupsX = Mathf.Max(1, Mathf.CeilToInt(dstPack4.width / (256f * 8)));
+                _cs.Dispatch(deconvKernel, groupsX, 1, outPacks);
+            }
+            else if (useFlatDeconv)
+            {
+                int groupsX = Mathf.Max(1, Mathf.CeilToInt(dstPack4.width / 256f));
+                _cs.Dispatch(deconvKernel, groupsX, 1, outPacks);
+            }
+            else
+            {
+                Dispatch3D(deconvKernel, dstPack4.width, dstPack4.height, outPacks, 8, 8);
+            }
         }
 
         public void DeconvolutionDepthWisePack4(RenderTexture srcPack4, ComputeBuffer w4, ComputeBuffer b4, int inputChannels, int outputChannels, int group, int outPacks, int kernelW, int kernelH, int strideW, int strideH, int padLeft, int padTop, int dilationW, int dilationH, int activationType, float activationParam, RenderTexture dstPack4)
@@ -5822,6 +6481,26 @@ namespace Aexis.Execution
                 dstPack4);
         }
 
+        // SESR's RGB head and 16-channel tail use the raw OIHW INT8 upload.
+        // Reuse the conservative group-convolution binding contract while the
+        // shader computes a 2x2 x 2-pack block to avoid scalar read duplication.
+        public void Conv5x5RawInt8Pack4(
+            RenderTexture srcPack4,
+            ComputeBuffer weights,
+            ComputeBuffer bias,
+            int inputChannels,
+            int outputChannels,
+            int activationType,
+            float activationParam,
+            RenderTexture dstPack4)
+        {
+            ValidateRawInt8Pack4Contract(weights, inputChannels, outputChannels);
+            DispatchConv2dGroupPack4(
+                _kConv5x5RawInt8Pack4, srcPack4, weights, bias,
+                inputChannels, outputChannels, 1, 5, 5, 1, 1, 2, 2, 1, 1,
+                activationType, activationParam, dstPack4);
+        }
+
         private void DispatchConv2dGroupPack4(
             int kernel,
             RenderTexture srcPack4,
@@ -5871,10 +6550,17 @@ namespace Aexis.Execution
             _cs.SetInt("_DilationHVar", dilationH);
             _cs.SetInt("_ActType", activationType);
             _cs.SetFloat("_ActParam", activationParam);
-            _cs.SetBuffer(kernel, "_ConvW", weights);
+            // The scalar fallback is a float SRV while compact INT8 weights are
+            // a uint SRV. Do not alias the same D3D resource through both typed
+            // declarations: some drivers invalidate the uint view even though
+            // the float branch is dynamically unreachable. Bias is an existing
+            // float buffer and is never read while _UseInt8ConvWeights is set.
+            _cs.SetBuffer(kernel, "_ConvW", (_int8ConvWeights != null || _int4ConvWeights != null) ? bias : weights);
             _cs.SetBuffer(kernel, "_ConvWInt8Packed", _int8ConvWeights ?? weights);
             _cs.SetBuffer(kernel, "_ConvWInt8Scales", _int8ConvWeightScales ?? weights);
             _cs.SetInt("_UseInt8ConvWeights", _int8ConvWeights != null ? 1 : 0);
+            _cs.SetInt("_UseInt8ConvWeightUniformScale", _int8ConvUsesUniformScale ? 1 : 0);
+            _cs.SetFloat("_Int8ConvWeightUniformScale", _int8ConvUniformScale);
             _cs.SetBuffer(kernel, "_ConvWInt4Packed", _int4ConvWeights ?? weights);
             _cs.SetBuffer(kernel, "_ConvWInt4Scales", _int4ConvWeightScales ?? weights);
             _cs.SetInt("_UseInt4ConvWeights", _int4ConvWeights != null ? 1 : 0);
@@ -5885,10 +6571,15 @@ namespace Aexis.Execution
             _cs.SetBuffer(kernel, "_ConvB", bias);
             _cs.SetTexture(kernel, "_ConvInArr", srcPack4);
             _cs.SetTexture(kernel, "_ConvOutArr", dstPack4);
-            Dispatch3D(kernel, dstPack4.width, dstPack4.height, dstPack4.volumeDepth, 8, 8);
+            bool isRawInt8BlockKernel = kernel == _kConv5x5RawInt8Pack4;
+            Dispatch3D(kernel,
+                isRawInt8BlockKernel ? (dstPack4.width + 1) / 2 : dstPack4.width,
+                isRawInt8BlockKernel ? (dstPack4.height + 1) / 2 : dstPack4.height,
+                isRawInt8BlockKernel ? (dstPack4.volumeDepth + 1) / 2 : dstPack4.volumeDepth,
+                8, 8);
         }
 
-        public void Conv3x3Pack4Winograd23(RenderTexture srcPack4, int inPacks, ComputeBuffer wTm23, ComputeBuffer b4, int outPacks, int biasTerm, int activationType, float activationParam, RenderTexture dstPack4)
+        public void Conv3x3Pack4Winograd23(RenderTexture srcPack4, int inPacks, ComputeBuffer wTm23, ComputeBuffer b4, int outPacks, int biasTerm, int activationType, float activationParam, RenderTexture dstPack4, ComputeBuffer fusedPReluSlope = null, int fusedPReluSlopeCount = 0)
         {
             if (srcPack4 == null) throw new ArgumentNullException(nameof(srcPack4));
             if (dstPack4 == null) throw new ArgumentNullException(nameof(dstPack4));
@@ -5919,6 +6610,7 @@ namespace Aexis.Execution
 
             _cs.SetBuffer(_kWinograd23TransformOutput, "_WinoTopTm", _winoTopTm);
             _cs.SetBuffer(_kWinograd23TransformOutput, "_WinoBias4", b4);
+            SetFusedPRelu(_kWinograd23TransformOutput, b4, fusedPReluSlope, fusedPReluSlopeCount);
             _cs.SetTexture(_kWinograd23TransformOutput, "_WinoOutArr", dstPack4);
             DispatchWinograd23TransformOutput(null, blockX, blockY, outPacks);
             
@@ -5926,7 +6618,7 @@ namespace Aexis.Execution
             //WaitGpuIdle();
         }
 
-        public void Conv3x3Pack4Winograd23(CommandBuffer cmd, ComputeTexture srcPack4, int inPacks, ComputeBuffer wTm23, ComputeBuffer b4, int outPacks, int biasTerm, int activationType, float activationParam, ComputeTexture dstPack4)
+        public void Conv3x3Pack4Winograd23(CommandBuffer cmd, ComputeTexture srcPack4, int inPacks, ComputeBuffer wTm23, ComputeBuffer b4, int outPacks, int biasTerm, int activationType, float activationParam, ComputeTexture dstPack4, ComputeBuffer fusedPReluSlope = null, int fusedPReluSlopeCount = 0)
         {
             if (cmd == null) throw new ArgumentNullException(nameof(cmd));
             var w = srcPack4.width;
@@ -5950,6 +6642,7 @@ namespace Aexis.Execution
 
             cmd.SetComputeBufferParam(_cs, _kWinograd23TransformOutput, "_WinoTopTm", _winoTopTm);
             cmd.SetComputeBufferParam(_cs, _kWinograd23TransformOutput, "_WinoBias4", b4);
+            SetFusedPRelu(cmd, _kWinograd23TransformOutput, b4, fusedPReluSlope, fusedPReluSlopeCount);
             cmd.SetComputeTextureParam(_cs, _kWinograd23TransformOutput, "_WinoOutArr", dstPack4.nameID);
             DispatchWinograd23TransformOutput(cmd, blockX, blockY, outPacks);
 
@@ -5977,6 +6670,11 @@ namespace Aexis.Execution
             {
                 try { _fallbackFloatBuffer.Release(); } catch { }
                 _fallbackFloatBuffer = null;
+            }
+            if (_fallbackUIntBuffer != null)
+            {
+                try { _fallbackUIntBuffer.Release(); } catch { }
+                _fallbackUIntBuffer = null;
             }
             _winoBottomCap = 0;
             _winoTopCap = 0;
@@ -6048,6 +6746,17 @@ namespace Aexis.Execution
             }
 
             return _fallbackFloatBuffer;
+        }
+
+        private ComputeBuffer GetFallbackUIntBuffer()
+        {
+            if (_fallbackUIntBuffer == null)
+            {
+                _fallbackUIntBuffer = new ComputeBuffer(1, sizeof(uint), ComputeBufferType.Structured);
+                _fallbackUIntBuffer.SetData(new uint[] { 0u });
+            }
+
+            return _fallbackUIntBuffer;
         }
 
         private void DispatchWinograd23TransformInput(CommandBuffer cmd, int blockX, int blockY, int inPacks)
@@ -6139,7 +6848,7 @@ namespace Aexis.Execution
             _cs.SetFloat("_ActParam", activationParam);
             _cs.SetInt("_UseGfpganDynWeights", 0);
             _cs.SetInt("_GfpganDynamicConvW4Width", Mathf.Max(1, srcPack4.width));
-            _cs.SetBuffer(_kConv1x1Pack4, "_ConvW4", w4);
+            SetConvPack4Weights(_kConv1x1Pack4, w4);
             _cs.SetBuffer(_kConv1x1Pack4, "_ConvB4", b4);
             _cs.SetTexture(_kConv1x1Pack4, "_GfpganDynamicConvW4Tex", srcPack4);
             _cs.SetTexture(_kConv1x1Pack4, "_ConvInArr", srcPack4);
@@ -6180,10 +6889,14 @@ namespace Aexis.Execution
             cmd.SetComputeFloatParam(_cs, "_ActParam", activationParam);
             cmd.SetComputeIntParam(_cs, "_UseGfpganDynWeights", 0);
             cmd.SetComputeIntParam(_cs, "_GfpganDynamicConvW4Width", Mathf.Max(1, srcPack4.width));
-            cmd.SetComputeBufferParam(_cs, _kConv1x1Pack4, "_ConvW4", w4);
+            SetConvPack4Weights(cmd, _kConv1x1Pack4, w4);
             cmd.SetComputeBufferParam(_cs, _kConv1x1Pack4, "_ConvB4", b4);
+            // TTS 修复：directTexture 非空时用 RenderTargetIdentifier 绑定持久 RT。
+            if (srcPack4.directTexture != null)
+                cmd.SetComputeTextureParam(_cs, _kConv1x1Pack4, "_ConvInArr", new RenderTargetIdentifier(srcPack4.directTexture));
+            else
+                cmd.SetComputeTextureParam(_cs, _kConv1x1Pack4, "_ConvInArr", srcPack4.nameID);
             cmd.SetComputeTextureParam(_cs, _kConv1x1Pack4, "_GfpganDynamicConvW4Tex", srcPack4.nameID);
-            cmd.SetComputeTextureParam(_cs, _kConv1x1Pack4, "_ConvInArr", srcPack4.nameID);
             cmd.SetComputeTextureParam(_cs, _kConv1x1Pack4, "_ConvOutArr", dstPack4.nameID);
             Dispatch3D(cmd, _kConv1x1Pack4, (dstPack4.width + 1) / 2, (dstPack4.height + 1) / 2, (outPacks + 1) / 2, 8, 8);
         }
@@ -6927,7 +7640,7 @@ namespace Aexis.Execution
             Dispatch3D(cmd, _kInterpDown2NearestPack4, output.width, output.height, packs, 8, 8);
         }
 
-        public void Conv3x3Pack4(CommandBuffer cmd, ComputeTexture srcPack4, int inPacks, ComputeBuffer w4, ComputeBuffer b4, int outPacks, int pad, int activationType, float activationParam, ComputeTexture dstPack4)
+        public void Conv3x3Pack4(CommandBuffer cmd, ComputeTexture srcPack4, int inPacks, ComputeBuffer w4, ComputeBuffer b4, int outPacks, int pad, int activationType, float activationParam, ComputeTexture dstPack4, ComputeBuffer fusedPReluSlope = null, int fusedPReluSlopeCount = 0)
         {
             if (cmd == null) throw new ArgumentNullException(nameof(cmd));
             if (srcPack4 == null) throw new ArgumentNullException(nameof(srcPack4));
@@ -6937,6 +7650,7 @@ namespace Aexis.Execution
             if (inPacks <= 0) throw new ArgumentOutOfRangeException(nameof(inPacks));
             if (outPacks <= 0) throw new ArgumentOutOfRangeException(nameof(outPacks));
 
+            int kernel = PreferFp16AluConv3x3Pack4 ? _kConv3x3Pack4Fp16Alu : _kConv3x3Pack4;
             cmd.SetComputeIntParam(_cs, "_InPacks", inPacks);
             cmd.SetComputeIntParam(_cs, "_OutPacks", outPacks);
             cmd.SetComputeIntParam(_cs, "_Pad", Mathf.Max(0, pad));
@@ -6944,12 +7658,13 @@ namespace Aexis.Execution
             cmd.SetComputeFloatParam(_cs, "_ActParam", activationParam);
             cmd.SetComputeIntParam(_cs, "_UseGfpganDynWeights", 0);
             cmd.SetComputeIntParam(_cs, "_GfpganDynamicConvW4Width", Mathf.Max(1, srcPack4.width));
-            cmd.SetComputeBufferParam(_cs, _kConv3x3Pack4, "_ConvW4", w4);
-            cmd.SetComputeBufferParam(_cs, _kConv3x3Pack4, "_ConvB4", b4);
-            cmd.SetComputeTextureParam(_cs, _kConv3x3Pack4, "_GfpganDynamicConvW4Tex", srcPack4.nameID);
-            cmd.SetComputeTextureParam(_cs, _kConv3x3Pack4, "_ConvInArr", srcPack4.nameID);
-            cmd.SetComputeTextureParam(_cs, _kConv3x3Pack4, "_ConvOutArr", dstPack4.nameID);
-            Dispatch3D(cmd, _kConv3x3Pack4, (dstPack4.width + 1) / 2, (dstPack4.height + 1) / 2, (outPacks + 1) / 2, 8, 8);
+            SetConvPack4Weights(cmd, kernel, w4);
+            cmd.SetComputeBufferParam(_cs, kernel, "_ConvB4", b4);
+            SetFusedPRelu(cmd, kernel, b4, fusedPReluSlope, fusedPReluSlopeCount);
+            cmd.SetComputeTextureParam(_cs, kernel, "_GfpganDynamicConvW4Tex", srcPack4.nameID);
+            cmd.SetComputeTextureParam(_cs, kernel, "_ConvInArr", srcPack4.nameID);
+            cmd.SetComputeTextureParam(_cs, kernel, "_ConvOutArr", dstPack4.nameID);
+            Dispatch3D(cmd, kernel, (dstPack4.width + 1) / 2, (dstPack4.height + 1) / 2, (outPacks + 1) / 2, 16, 4);
         }
 
         public void Conv3x3Pack4DynamicWeight(CommandBuffer cmd, ComputeTexture srcPack4, int inPacks, ComputeTexture dynamicW4, ComputeBuffer b4, int outPacks, int pad, int activationType, float activationParam, ComputeTexture dstPack4)
@@ -6965,10 +7680,11 @@ namespace Aexis.Execution
             cmd.SetComputeIntParam(_cs, "_GfpganDynamicConvW4Width", dynamicW4.width);
             cmd.SetComputeBufferParam(_cs, _kConv3x3Pack4, "_ConvW4", b4);
             cmd.SetComputeBufferParam(_cs, _kConv3x3Pack4, "_ConvB4", b4);
+            SetFusedPRelu(cmd, _kConv3x3Pack4, b4, null, 0);
             cmd.SetComputeTextureParam(_cs, _kConv3x3Pack4, "_GfpganDynamicConvW4Tex", dynamicW4.nameID);
             cmd.SetComputeTextureParam(_cs, _kConv3x3Pack4, "_ConvInArr", srcPack4.nameID);
             cmd.SetComputeTextureParam(_cs, _kConv3x3Pack4, "_ConvOutArr", dstPack4.nameID);
-            Dispatch3D(cmd, _kConv3x3Pack4, (dstPack4.width + 1) / 2, (dstPack4.height + 1) / 2, (outPacks + 1) / 2, 8, 8);
+            Dispatch3D(cmd, _kConv3x3Pack4, (dstPack4.width + 1) / 2, (dstPack4.height + 1) / 2, (outPacks + 1) / 2, 16, 4);
         }
 
         // Generic 2D/grouped Pack4 path. Weights and bias are immutable scalar uploads;
@@ -7013,6 +7729,24 @@ namespace Aexis.Execution
                 activationType,
                 activationParam,
                 dstPack4);
+        }
+
+        public void Conv5x5RawInt8Pack4(
+            CommandBuffer cmd,
+            ComputeTexture srcPack4,
+            ComputeBuffer weights,
+            ComputeBuffer bias,
+            int inputChannels,
+            int outputChannels,
+            int activationType,
+            float activationParam,
+            ComputeTexture dstPack4)
+        {
+            ValidateRawInt8Pack4Contract(weights, inputChannels, outputChannels);
+            DispatchConv2dGroupPack4(
+                cmd, _kConv5x5RawInt8Pack4, srcPack4, weights, bias,
+                inputChannels, outputChannels, 1, 5, 5, 1, 1, 2, 2, 1, 1,
+                activationType, activationParam, dstPack4);
         }
 
         public void Deconvolution2dGroupPack4(
@@ -7108,10 +7842,15 @@ namespace Aexis.Execution
             cmd.SetComputeIntParam(_cs, "_DilationHVar", dilationH);
             cmd.SetComputeIntParam(_cs, "_ActType", activationType);
             cmd.SetComputeFloatParam(_cs, "_ActParam", activationParam);
-            cmd.SetComputeBufferParam(_cs, kernel, "_ConvW", weights);
+            // See the immediate-dispatch counterpart above. Keep the inactive
+            // float declaration bound to a real float SRV, not the packed uint
+            // INT8 payload that the active branch reads through its own slot.
+            cmd.SetComputeBufferParam(_cs, kernel, "_ConvW", (_int8ConvWeights != null || _int4ConvWeights != null) ? bias : weights);
             cmd.SetComputeBufferParam(_cs, kernel, "_ConvWInt8Packed", _int8ConvWeights ?? weights);
             cmd.SetComputeBufferParam(_cs, kernel, "_ConvWInt8Scales", _int8ConvWeightScales ?? weights);
             cmd.SetComputeIntParam(_cs, "_UseInt8ConvWeights", _int8ConvWeights != null ? 1 : 0);
+            cmd.SetComputeIntParam(_cs, "_UseInt8ConvWeightUniformScale", _int8ConvUsesUniformScale ? 1 : 0);
+            cmd.SetComputeFloatParam(_cs, "_Int8ConvWeightUniformScale", _int8ConvUniformScale);
             cmd.SetComputeBufferParam(_cs, kernel, "_ConvWInt4Packed", _int4ConvWeights ?? weights);
             cmd.SetComputeBufferParam(_cs, kernel, "_ConvWInt4Scales", _int4ConvWeightScales ?? weights);
             cmd.SetComputeIntParam(_cs, "_UseInt4ConvWeights", _int4ConvWeights != null ? 1 : 0);
@@ -7122,10 +7861,15 @@ namespace Aexis.Execution
             cmd.SetComputeBufferParam(_cs, kernel, "_ConvB", bias);
             cmd.SetComputeTextureParam(_cs, kernel, "_ConvInArr", srcPack4.nameID);
             cmd.SetComputeTextureParam(_cs, kernel, "_ConvOutArr", dstPack4.nameID);
-            Dispatch3D(cmd, kernel, dstPack4.width, dstPack4.height, dstPack4.depth, 8, 8);
+            bool isRawInt8BlockKernel = kernel == _kConv5x5RawInt8Pack4;
+            Dispatch3D(cmd, kernel,
+                isRawInt8BlockKernel ? (dstPack4.width + 1) / 2 : dstPack4.width,
+                isRawInt8BlockKernel ? (dstPack4.height + 1) / 2 : dstPack4.height,
+                isRawInt8BlockKernel ? (dstPack4.depth + 1) / 2 : dstPack4.depth,
+                8, 8);
         }
 
-        public void ConvPack4General(CommandBuffer cmd, ComputeTexture srcPack4, int inPacks, ComputeBuffer w4, ComputeBuffer b4, int outPacks, int outputChannels, int kernelW, int kernelH, int strideW, int strideH, int padLeft, int padTop, int dilationW, int dilationH, int activationType, float activationParam, ComputeTexture dstPack4)
+        public void ConvPack4General(CommandBuffer cmd, ComputeTexture srcPack4, int inPacks, ComputeBuffer w4, ComputeBuffer b4, int outPacks, int outputChannels, int kernelW, int kernelH, int strideW, int strideH, int padLeft, int padTop, int dilationW, int dilationH, int activationType, float activationParam, ComputeTexture dstPack4, int inputChannels = 0, int logicalInputWidth = 0, int logicalOutputWidth = 0)
         {
             if (cmd == null) throw new ArgumentNullException(nameof(cmd));
             if (srcPack4 == null) throw new ArgumentNullException(nameof(srcPack4));
@@ -7137,10 +7881,24 @@ namespace Aexis.Execution
             if (outputChannels <= 0 || outputChannels > outPacks * 4) throw new ArgumentOutOfRangeException(nameof(outputChannels));
             if (kernelW <= 0 || kernelH <= 0) throw new ArgumentOutOfRangeException(nameof(kernelW));
 
-            cmd.SetComputeIntParam(_cs, "_InW", srcPack4.width);
+            if (logicalInputWidth == 0 && PreferSharedConv5x5Pack4
+                && outputChannels == outPacks * 4
+                && kernelW == 5 && kernelH == 5
+                && strideW == 1 && strideH == 1
+                && dilationW == 1 && dilationH == 1
+                && padLeft == 2 && padTop == 2)
+            {
+                Conv5x5Pack4(cmd, srcPack4, inPacks, w4, b4, outPacks, activationType, activationParam, dstPack4);
+                return;
+            }
+
+            cmd.SetComputeIntParam(_cs, "_InW", logicalInputWidth > 0 ? logicalInputWidth : srcPack4.width);
             cmd.SetComputeIntParam(_cs, "_InH", srcPack4.height);
-            cmd.SetComputeIntParam(_cs, "_OutW", dstPack4.width);
+            cmd.SetComputeIntParam(_cs, "_InC", inputChannels > 0 ? inputChannels : inPacks * 4);
+            cmd.SetComputeIntParam(_cs, "_OutW", logicalOutputWidth > 0 ? logicalOutputWidth : dstPack4.width);
             cmd.SetComputeIntParam(_cs, "_OutH", dstPack4.height);
+            cmd.SetComputeIntParam(_cs, "_InTileW", logicalInputWidth > 0 ? srcPack4.width : 0);
+            cmd.SetComputeIntParam(_cs, "_OutTileW", logicalOutputWidth > 0 ? dstPack4.width : 0);
             cmd.SetComputeIntParam(_cs, "_InPacks", inPacks);
             cmd.SetComputeIntParam(_cs, "_OutPacks", outPacks);
             cmd.SetComputeIntParam(_cs, "_OutC", outputChannels);
@@ -7154,14 +7912,66 @@ namespace Aexis.Execution
             cmd.SetComputeIntParam(_cs, "_DilationHVar", Mathf.Max(1, dilationH));
             cmd.SetComputeIntParam(_cs, "_ActType", activationType);
             cmd.SetComputeFloatParam(_cs, "_ActParam", activationParam);
-            SetConvPack4Weights(cmd, _kConvPack4General, w4);
-            cmd.SetComputeBufferParam(_cs, _kConvPack4General, "_ConvB4", b4);
-            cmd.SetComputeTextureParam(_cs, _kConvPack4General, "_ConvInArr", srcPack4.nameID);
-            cmd.SetComputeTextureParam(_cs, _kConvPack4General, "_ConvOutArr", dstPack4.nameID);
-            Dispatch3D(cmd, _kConvPack4General, (dstPack4.width + 1) / 2, (dstPack4.height + 1) / 2, (outPacks + 1) / 2, 8, 8);
+            cmd.SetComputeIntParam(_cs, "_UseGfpganDynWeights", 0);
+            // Bind a placeholder for the declared dynamic GFPGAN weight texture
+            // so the general conv kernel dispatches with all resources set.
+            cmd.SetComputeIntParam(_cs, "_GfpganDynamicConvW4Width", Mathf.Max(1, srcPack4.width));
+            // Mirror the immediate-mode kernel selection on the pack4-rt (command buffer)
+            // path: narrow 1-row stages use the flat / register-tiled variants instead of
+            // the 8x8 tiled default, whose y-threads all bail when height==1.
+            bool useFlatConv = dstPack4.height <= 1 || logicalOutputWidth > 0;
+            bool useTileX = useFlatConv && strideW == 1 && strideH == 1
+                && (dilationW == 1 || (logicalOutputWidth > 0 && dilationW > 1)) && dilationH == 1
+                && kernelH == 1 && padTop == 0
+                // The logical-width path also supports dilated kernels through
+                // direct TileX input reads. The register cache supports <= 13 taps.
+                && kernelW <= 13;
+            if (logicalOutputWidth > 0 && !useTileX)
+                throw new InvalidOperationException("Tiled vocoder convolution requires the 1D TileX kernel profile.");
+            int convKernel = useTileX ? _kConvPack4GeneralTileX : (useFlatConv ? _kConvPack4GeneralFlat : _kConvPack4General);
+            LogKernelDispatch(useTileX ? "cbConvTileX" : (useFlatConv ? "cbConvFlat" : "cbConvGeneral"),
+                dstPack4.width, dstPack4.height, strideW, strideH, kernelW, kernelH, outPacks);
+            cmd.SetComputeTextureParam(_cs, convKernel, "_GfpganDynamicConvW4Tex", srcPack4.nameID);
+            SetConvPack4Weights(cmd, convKernel, w4);
+            cmd.SetComputeBufferParam(_cs, convKernel, "_ConvW", (_int8ConvWeights != null || _int4ConvWeights != null) ? b4 : w4);
+            cmd.SetComputeBufferParam(_cs, convKernel, "_ConvWInt8Packed", _int8ConvWeights ?? w4);
+            cmd.SetComputeBufferParam(_cs, convKernel, "_ConvWInt8Scales", _int8ConvWeightScales ?? w4);
+            cmd.SetComputeBufferParam(_cs, convKernel, "_ConvWInt4Packed", _int4ConvWeights ?? w4);
+            cmd.SetComputeBufferParam(_cs, convKernel, "_ConvWInt4Scales", _int4ConvWeightScales ?? w4);
+            cmd.SetComputeBufferParam(_cs, convKernel, "_ConvB", b4);
+            cmd.SetComputeBufferParam(_cs, convKernel, "_ConvB4", b4);
+            BindConvIn(cmd, convKernel, srcPack4);
+            cmd.SetComputeTextureParam(_cs, convKernel, "_ConvOutArr", dstPack4.nameID);
+            if (useTileX)
+                cmd.DispatchCompute(_cs, convKernel, Mathf.Max(1, Mathf.CeilToInt((logicalOutputWidth > 0 ? logicalOutputWidth : dstPack4.width) / (256f * 4))), 1, outPacks);
+            else if (useFlatConv)
+                cmd.DispatchCompute(_cs, convKernel, Mathf.Max(1, Mathf.CeilToInt(dstPack4.width / 256f)), 1, outPacks);
+            else
+                Dispatch3D(cmd, convKernel, (dstPack4.width + 1) / 2, (dstPack4.height + 1) / 2, (outPacks + 1) / 2, 8, 8);
         }
 
-        public void DeconvolutionPack4General(CommandBuffer cmd, ComputeTexture srcPack4, int inPacks, ComputeBuffer w4, ComputeBuffer b4, int outPacks, int kernelW, int kernelH, int strideW, int strideH, int padLeft, int padTop, int dilationW, int dilationH, int activationType, float activationParam, ComputeTexture dstPack4)
+        private void Conv5x5Pack4(CommandBuffer cmd, ComputeTexture srcPack4, int inPacks, ComputeBuffer w4,
+            ComputeBuffer b4, int outPacks, int activationType, float activationParam, ComputeTexture dstPack4)
+        {
+            int kernel = PreferFp16AluConv3x3Pack4 ? _kConv5x5Pack4Fp16Alu : _kConv5x5Pack4;
+            cmd.SetComputeIntParam(_cs, "_InPacks", inPacks);
+            cmd.SetComputeIntParam(_cs, "_OutPacks", outPacks);
+            cmd.SetComputeIntParam(_cs, "_Pad", 2);
+            cmd.SetComputeIntParam(_cs, "_ActType", activationType);
+            cmd.SetComputeFloatParam(_cs, "_ActParam", activationParam);
+            cmd.SetComputeIntParam(_cs, "_UseGfpganDynWeights", 0);
+            cmd.SetComputeIntParam(_cs, "_GfpganDynamicConvW4Width", Mathf.Max(1, srcPack4.width));
+            SetConvPack4Weights(cmd, kernel, w4);
+            cmd.SetComputeBufferParam(_cs, kernel, "_ConvB4", b4);
+            SetFusedPRelu(cmd, kernel, b4, null, 0);
+            cmd.SetComputeTextureParam(_cs, kernel, "_GfpganDynamicConvW4Tex", srcPack4.nameID);
+            cmd.SetComputeTextureParam(_cs, kernel, "_ConvInArr", srcPack4.nameID);
+            cmd.SetComputeTextureParam(_cs, kernel, "_ConvOutArr", dstPack4.nameID);
+            Dispatch3D(cmd, kernel, (dstPack4.width + 1) / 2, (dstPack4.height + 1) / 2,
+                (outPacks + 1) / 2, 16, 4);
+        }
+
+        public void DeconvolutionPack4General(CommandBuffer cmd, ComputeTexture srcPack4, int inPacks, ComputeBuffer w4, ComputeBuffer b4, int outPacks, int kernelW, int kernelH, int strideW, int strideH, int padLeft, int padTop, int dilationW, int dilationH, int activationType, float activationParam, ComputeTexture dstPack4, int logicalOutputWidth = 0, int logicalInputWidth = 0)
         {
             if (cmd == null) throw new ArgumentNullException(nameof(cmd));
             if (srcPack4 == null) throw new ArgumentNullException(nameof(srcPack4));
@@ -7171,10 +7981,16 @@ namespace Aexis.Execution
             if (inPacks <= 0) throw new ArgumentOutOfRangeException(nameof(inPacks));
             if (outPacks <= 0) throw new ArgumentOutOfRangeException(nameof(outPacks));
             if (kernelW <= 0 || kernelH <= 0) throw new ArgumentOutOfRangeException(nameof(kernelW));
+            if (logicalInputWidth > 0 && (srcPack4.width != 8192
+                || logicalInputWidth <= srcPack4.width
+                || logicalInputWidth % srcPack4.width != 0
+                || srcPack4.height != logicalInputWidth / srcPack4.width))
+                throw new ArgumentException("Tiled deconvolution input must have exact 8192-wide Pack4 storage.", nameof(logicalInputWidth));
 
-            cmd.SetComputeIntParam(_cs, "_InW", srcPack4.width);
-            cmd.SetComputeIntParam(_cs, "_InH", srcPack4.height);
-            cmd.SetComputeIntParam(_cs, "_OutW", dstPack4.width);
+            cmd.SetComputeIntParam(_cs, "_InW", logicalInputWidth > 0 ? logicalInputWidth : srcPack4.width);
+            cmd.SetComputeIntParam(_cs, "_InH", logicalInputWidth > 0 ? 1 : srcPack4.height);
+            cmd.SetComputeIntParam(_cs, "_InTileW", logicalInputWidth > 0 ? srcPack4.width : 0);
+            cmd.SetComputeIntParam(_cs, "_OutW", logicalOutputWidth > 0 ? logicalOutputWidth : dstPack4.width);
             cmd.SetComputeIntParam(_cs, "_OutH", dstPack4.height);
             cmd.SetComputeIntParam(_cs, "_InPacks", inPacks);
             cmd.SetComputeIntParam(_cs, "_OutPacks", outPacks);
@@ -7188,11 +8004,29 @@ namespace Aexis.Execution
             cmd.SetComputeIntParam(_cs, "_DilationHVar", Mathf.Max(1, dilationH));
             cmd.SetComputeIntParam(_cs, "_ActType", activationType);
             cmd.SetComputeFloatParam(_cs, "_ActParam", activationParam);
-            SetConvPack4Weights(cmd, _kDeconvolutionPack4General, w4);
-            cmd.SetComputeBufferParam(_cs, _kDeconvolutionPack4General, "_ConvB4", b4);
-            cmd.SetComputeTextureParam(_cs, _kDeconvolutionPack4General, "_ConvInArr", srcPack4.nameID);
-            cmd.SetComputeTextureParam(_cs, _kDeconvolutionPack4General, "_ConvOutArr", dstPack4.nameID);
-            Dispatch3D(cmd, _kDeconvolutionPack4General, dstPack4.width, dstPack4.height, outPacks, 8, 8);
+            // Wide 1-row deconv stages dominate memory traffic; select the register-tiled
+            // kernel (8 outputs/thread with input reuse) on the pack4-rt path too, matching
+            // the immediate-mode overload.
+            bool useFlatDeconv = dstPack4.height <= 1 || logicalOutputWidth > 0;
+            bool useTileXDeconv = useFlatDeconv && (logicalOutputWidth > 0 ? logicalOutputWidth : dstPack4.width) >= 4096 && strideW >= 2
+                && strideH == 1 && kernelH == 1 && padTop == 0 && dilationW == 1 && dilationH == 1;
+            if (logicalInputWidth > 0 && !useTileXDeconv)
+                throw new NotSupportedException("Tiled deconvolution input requires the 1D TileX kernel.");
+            int deconvKernel = useTileXDeconv ? _kDeconvolutionPack4GeneralTileX : (useFlatDeconv ? _kDeconvolutionPack4GeneralFlat : _kDeconvolutionPack4General);
+            LogKernelDispatch(useTileXDeconv ? "cbDeconvTileX" : (useFlatDeconv ? "cbDeconvFlat" : "cbDeconvGeneral"),
+                dstPack4.width, dstPack4.height, strideW, strideH, kernelW, kernelH, outPacks);
+            SetConvPack4Weights(cmd, deconvKernel, w4);
+            cmd.SetComputeBufferParam(_cs, deconvKernel, "_ConvB4", b4);
+            cmd.SetComputeTextureParam(_cs, deconvKernel, "_ConvInArr", srcPack4.nameID);
+            cmd.SetComputeTextureParam(_cs, deconvKernel, "_ConvOutArr", dstPack4.nameID);
+            int outTileW = logicalOutputWidth > 0 ? dstPack4.width : (dstPack4.width > 16384 ? 16384 : 0);
+            cmd.SetComputeIntParam(_cs, "_OutTileW", outTileW);
+            if (useTileXDeconv)
+                cmd.DispatchCompute(_cs, deconvKernel, Mathf.Max(1, Mathf.CeilToInt((logicalOutputWidth > 0 ? logicalOutputWidth : dstPack4.width) / (256f * 8))), 1, outPacks);
+            else if (useFlatDeconv)
+                cmd.DispatchCompute(_cs, deconvKernel, Mathf.Max(1, Mathf.CeilToInt(dstPack4.width / 256f)), 1, outPacks);
+            else
+                Dispatch3D(cmd, deconvKernel, dstPack4.width, dstPack4.height, outPacks, 8, 8);
         }
 
         public void DeconvolutionDepthWisePack4(CommandBuffer cmd, ComputeTexture srcPack4, ComputeBuffer w4, ComputeBuffer b4, int inputChannels, int outputChannels, int group, int outPacks, int kernelW, int kernelH, int strideW, int strideH, int padLeft, int padTop, int dilationW, int dilationH, int activationType, float activationParam, ComputeTexture dstPack4)
@@ -10439,6 +11273,34 @@ namespace Aexis.Execution
             Dispatch3D(_kLayerNormPack4WidthTex, output.width, output.height, ResolveRenderTextureDispatchDepth(output, Mathf.Max(1, d * packs)), 8, 8);
         }
 
+        public void LayerNormPack4ChannelsTex(RenderTexture input, int w, int h, int d, int c, int packs, float eps, bool affine, ComputeBuffer gamma, ComputeBuffer beta, RenderTexture output)
+        {
+            if (input == null) throw new ArgumentNullException(nameof(input));
+            if (output == null) throw new ArgumentNullException(nameof(output));
+            if (w <= 0) throw new ArgumentOutOfRangeException(nameof(w));
+            if (h <= 0) throw new ArgumentOutOfRangeException(nameof(h));
+            if (d <= 0) throw new ArgumentOutOfRangeException(nameof(d));
+            if (c <= 0) throw new ArgumentOutOfRangeException(nameof(c));
+            if ((c & 3) != 0) throw new ArgumentException("Pack4 channel normalization requires a multiple of four channels.", nameof(c));
+            if (packs != c / 4) throw new ArgumentException("Pack count must match the logical channel count.", nameof(packs));
+            if (affine && (gamma == null || beta == null)) throw new ArgumentNullException(nameof(gamma));
+
+            _cs.SetInt("_LnW", w);
+            _cs.SetInt("_LnH", h);
+            _cs.SetInt("_LnD", d);
+            _cs.SetInt("_LnC", c);
+            _cs.SetInt("_LnAffine", affine ? 1 : 0);
+            _cs.SetFloat("_LnEps", eps);
+            _cs.SetTexture(_kLayerNormPack4ChannelsTex, "_TexIn0Arr", input);
+            _cs.SetTexture(_kLayerNormPack4ChannelsTex, "_TexOut0Arr", output);
+            if (affine)
+            {
+                _cs.SetBuffer(_kLayerNormPack4ChannelsTex, "_LnGamma", gamma);
+                _cs.SetBuffer(_kLayerNormPack4ChannelsTex, "_LnBeta", beta);
+            }
+            Dispatch3D(_kLayerNormPack4ChannelsTex, output.width, output.height, ResolveRenderTextureDispatchDepth(output, Mathf.Max(1, d * packs)), 8, 8);
+        }
+
         public void LayerNormPack4WidthTex(CommandBuffer cmd, ComputeTexture input, int w, int h, int d, int c, int packs, float eps, bool affine, ComputeBuffer gamma, ComputeBuffer beta, ComputeTexture output)
         {
             if (cmd == null) throw new ArgumentNullException(nameof(cmd));
@@ -10465,6 +11327,35 @@ namespace Aexis.Execution
                 cmd.SetComputeBufferParam(_cs, _kLayerNormPack4WidthTex, "_LnBeta", beta);
             }
             Dispatch3D(cmd, _kLayerNormPack4WidthTex, output.width, output.height, ResolveComputeTextureDispatchDepth(output, Mathf.Max(1, d * packs)), 8, 8);
+        }
+
+        public void LayerNormPack4ChannelsTex(CommandBuffer cmd, ComputeTexture input, int w, int h, int d, int c, int packs, float eps, bool affine, ComputeBuffer gamma, ComputeBuffer beta, ComputeTexture output)
+        {
+            if (cmd == null) throw new ArgumentNullException(nameof(cmd));
+            if (input == null) throw new ArgumentNullException(nameof(input));
+            if (output == null) throw new ArgumentNullException(nameof(output));
+            if (w <= 0) throw new ArgumentOutOfRangeException(nameof(w));
+            if (h <= 0) throw new ArgumentOutOfRangeException(nameof(h));
+            if (d <= 0) throw new ArgumentOutOfRangeException(nameof(d));
+            if (c <= 0) throw new ArgumentOutOfRangeException(nameof(c));
+            if ((c & 3) != 0) throw new ArgumentException("Pack4 channel normalization requires a multiple of four channels.", nameof(c));
+            if (packs != c / 4) throw new ArgumentException("Pack count must match the logical channel count.", nameof(packs));
+            if (affine && (gamma == null || beta == null)) throw new ArgumentNullException(nameof(gamma));
+
+            cmd.SetComputeIntParam(_cs, "_LnW", w);
+            cmd.SetComputeIntParam(_cs, "_LnH", h);
+            cmd.SetComputeIntParam(_cs, "_LnD", d);
+            cmd.SetComputeIntParam(_cs, "_LnC", c);
+            cmd.SetComputeIntParam(_cs, "_LnAffine", affine ? 1 : 0);
+            cmd.SetComputeFloatParam(_cs, "_LnEps", eps);
+            cmd.SetComputeTextureParam(_cs, _kLayerNormPack4ChannelsTex, "_TexIn0Arr", input.nameID);
+            cmd.SetComputeTextureParam(_cs, _kLayerNormPack4ChannelsTex, "_TexOut0Arr", output.nameID);
+            if (affine)
+            {
+                cmd.SetComputeBufferParam(_cs, _kLayerNormPack4ChannelsTex, "_LnGamma", gamma);
+                cmd.SetComputeBufferParam(_cs, _kLayerNormPack4ChannelsTex, "_LnBeta", beta);
+            }
+            Dispatch3D(cmd, _kLayerNormPack4ChannelsTex, output.width, output.height, ResolveComputeTextureDispatchDepth(output, Mathf.Max(1, d * packs)), 8, 8);
         }
 
         public void LayerNormPack4Linear2D(RenderTexture input, int logicalW, int logicalH, float eps, bool affine, ComputeBuffer gamma, ComputeBuffer beta, RenderTexture output)
@@ -12501,6 +13392,15 @@ namespace Aexis.Execution
         private void Dispatch2D(int kernel, int w, int h, int tx, int ty)
         {
             Dispatch2D(_cs, kernel, w, h, tx, ty);
+        }
+
+        // TTS 修复：绑定 conv 输入纹理——directTexture 非空时用 RenderTargetIdentifier。
+        private void BindConvIn(CommandBuffer cmd, int kernel, ComputeTexture srcPack4)
+        {
+            if (srcPack4.directTexture != null)
+                cmd.SetComputeTextureParam(_cs, kernel, "_ConvInArr", new RenderTargetIdentifier(srcPack4.directTexture));
+            else
+                cmd.SetComputeTextureParam(_cs, kernel, "_ConvInArr", srcPack4.nameID);
         }
 
         private void Dispatch3D(int kernel, int w, int h, int z, int tx, int ty)

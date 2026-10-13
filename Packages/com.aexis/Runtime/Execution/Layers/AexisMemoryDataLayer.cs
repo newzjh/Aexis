@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
@@ -236,6 +236,12 @@ namespace Aexis.Execution
             }
         }
 
+        private static RenderTexture s_diagRt;
+        private static RenderTexture s_diagRt2;
+        public static RenderTexture GetDiagRt() => s_diagRt;
+        public static RenderTexture GetDiagRt2() => s_diagRt2;
+        public static void SetDiagRt2(RenderTexture rt) { s_diagRt2 = rt; }
+
         private static bool TryCreatePack4Texture(
             AexisGraphSession owner,
             AexisGraphModel.Layer layer,
@@ -267,7 +273,7 @@ namespace Aexis.Execution
                 {
                     dimension = TextureDimension.Tex2DArray,
                     volumeDepth = slices,
-                    enableRandomWrite = false,
+                    enableRandomWrite = true,
                     msaaSamples = 1
                 };
                 texture = new RenderTexture(descriptor)
@@ -385,6 +391,10 @@ namespace Aexis.Execution
 
             // MemoryData produces a real graph tensor. Bind the slot assigned to
             // its top blob rather than asking the arena to infer an unnamed RT.
+            if (AexisGraphSession.s_ttsVerbose) UnityEngine.Debug.Log($"[TTS-MDPUB] {layer.name} -> {layer.topNames[0]} w={memoryPack.w} h={memoryPack.h} depth={memoryPack.pack4RtDepth} fmt={outputFormat}");
+            // TTS 修复v3：探针证明 Texture2D→Blit→RT→Readback 非零。
+            // 改用 commandBuffer.CopyTexture（GPU 拷贝，非 compute op）
+            // 从 pack4Rt 复制到 rented temp RT，conv 走既有 nameID 采样。
             var texture = owner.RentTempArray(
                 commandBuffer,
                 memoryPack.w,
@@ -392,8 +402,13 @@ namespace Aexis.Execution
                 memoryPack.pack4RtDepth,
                 outputFormat,
                 layer.topNames[0]);
-            for (var slice = 0; slice < memoryPack.pack4RtDepth; slice++)
-                commandBuffer.CopyTexture(memoryPack.pack4Rt, slice, 0, texture.nameID, slice, 0);
+            // Copy each slice from the session-owned immutable source texture.
+            // The session owns pack4Rt until inference completes, so it is a stable
+            // source for deferred CommandBuffer copies. A shared relay would be
+            // overwritten by later constants before this buffer executes.
+            for (var sl = 0; sl < memoryPack.pack4RtDepth; sl++)
+                commandBuffer.CopyTexture(memoryPack.pack4Rt, sl, 0, texture.nameID, sl, 0);
+            if (AexisGraphSession.s_ttsVerbose) UnityEngine.Debug.Log($"[TTS-BIND] MD publish {layer.topNames[0]} rentedTemp.nameID={texture.nameID} w={texture.width} h={texture.height} depth={texture.depth}");
             var shape = new AexisGraphSession.BufferShape(memoryPack.dims, memoryPack.w, memoryPack.h, memoryPack.d, memoryPack.c);
             blobs[layer.topNames[0]] = AexisGraphSession.CreateCmdTensorRef(texture, shape, shape, owned: true, blobName: layer.topNames[0]);
             if (shapes != null) shapes[layer.topNames[0]] = shape;

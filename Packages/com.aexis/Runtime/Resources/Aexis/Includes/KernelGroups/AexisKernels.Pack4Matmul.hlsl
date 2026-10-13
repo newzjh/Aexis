@@ -1694,6 +1694,69 @@ void AexisLayerNormPack4Linear2D_Impl(uint3 id)
     _LnTexOutArr[int3(packX, row, 0)] = o;
 }
 
+void AexisLayerNormPack4ChannelsTex_Impl(uint3 id)
+{
+    uint ow, oh, od;
+    _LnTexOutArr.GetDimensions(ow, oh, od);
+    if (id.x >= ow || id.y >= oh || id.z >= od)
+        return;
+
+    int packs = max(1, (_LnC + 3) / 4);
+    int depth = max(1, _LnD);
+    int slice = (int)id.z;
+    int z = slice / packs;
+    int pack = slice - z * packs;
+    if (z >= depth)
+        return;
+
+    float sum = 0.0;
+    for (int p = 0; p < packs; p++)
+    {
+        float4 values = _LnTexInArr[int3(id.x, id.y, z * packs + p)];
+        [unroll]
+        for (int lane = 0; lane < 4; lane++)
+        {
+            int channel = p * 4 + lane;
+            if (channel < _LnC)
+                sum += AexisReadLane(values, lane);
+        }
+    }
+
+    float mean = sum / max(1, _LnC);
+    float squaredDeviation = 0.0;
+    for (int p = 0; p < packs; p++)
+    {
+        float4 values = _LnTexInArr[int3(id.x, id.y, z * packs + p)];
+        [unroll]
+        for (int lane = 0; lane < 4; lane++)
+        {
+            int channel = p * 4 + lane;
+            if (channel < _LnC)
+            {
+                float centered = AexisReadLane(values, lane) - mean;
+                squaredDeviation += centered * centered;
+            }
+        }
+    }
+
+    float variance = squaredDeviation / max(1, _LnC);
+    float invstd = 1.0 / sqrt(max(variance + _LnEps, 1e-20));
+    float4 values = _LnTexInArr[int3(id.x, id.y, slice)];
+    float4 output = 0.0;
+    [unroll]
+    for (int lane = 0; lane < 4; lane++)
+    {
+        int channel = pack * 4 + lane;
+        if (channel >= _LnC)
+            continue;
+        float normalized = (AexisReadLane(values, lane) - mean) * invstd;
+        if (_LnAffine != 0)
+            normalized = normalized * _LnGamma[channel] + _LnBeta[channel];
+        AexisWriteLane(output, lane, normalized);
+    }
+    _LnTexOutArr[int3(id.x, id.y, slice)] = output;
+}
+
 void AexisSoftmaxPack4CDHW_Impl(uint3 id)
 {
     uint w, h, d;

@@ -287,14 +287,114 @@ namespace Aexis.Execution
             if (!CanUseSimplePack4TexturePath(owner, layer.bottomNames[0], pp, textureBlobs, textureShapes, bufferBlobs, bufferViews, out var srcTex, out var srcShape))
                 throw new InvalidOperationException("Padding render-texture path requires simple pack4 input: " + layer.name);
 
-            var outRt = owner.RentTempArray(srcTex.width + pp.left + pp.right, srcTex.height + pp.top + pp.bottom, srcTex.packs, RenderTextureFormat.ARGBHalf);
-            owner.Ops.PaddingPack4(srcTex.texture, srcTex.packs, pp.left, pp.right, pp.top, pp.bottom, pp.type, new Vector4(pp.value, pp.value, pp.value, pp.value), outRt);
+            // The long flow attention masks cannot materialize their flattened
+            // LinearMat view once L is large.  Keep the two rows in the bounded
+            // Pack4 texture and write the compact padded layout directly, just
+            // as the CommandBuffer path does below.  This branch is intentionally
+            // before the generic spatial padding path so it never allocates the
+            // oversized [2, 2L^2] texture.
+            var sourceStorage = AexisGraphSession.GetTextureStorageShape(srcTex, srcShape);
+            if (AexisGraphSession.TryResolveCompactAttentionMaskPad4(
+                    layer,
+                    srcShape,
+                    sourceStorage,
+                    out var compactPad4LogicalShape,
+                    out var compactPad4StorageShape))
+            {
+                var compactPad4Output = owner.RentTempArray(
+                    compactPad4StorageShape.w,
+                    compactPad4StorageShape.h,
+                    1,
+                    AexisGraphSession.ResolveTensorTextureFormat(compactPad4StorageShape.dims));
+                owner.Ops.AttentionMaskCompactPad4(
+                    srcTex.texture,
+                    sourceStorage.w,
+                    sourceStorage.h,
+                    compactPad4StorageShape.w,
+                    compactPad4StorageShape.h,
+                    compactPad4Output,
+                    sourceStorage.d,
+                    sourceStorage.c,
+                    sourceStorage.h);
+                AexisGraphSession.SetTextureBlob(
+                    textureBlobs,
+                    textureShapes,
+                    layer.topNames[0],
+                    compactPad4Output,
+                    compactPad4LogicalShape,
+                    compactPad4StorageShape);
+                owner.Consume(textureBlobs, bufferBlobs, bufferRefs, bufferViews, remaining, layer.bottomNames, pinnedNames);
+                return;
+            }
+
+            if (AexisGraphSession.TryResolveCompactAttentionMaskPad2(
+                    layer,
+                    srcShape,
+                    sourceStorage,
+                    out var compactLogicalShape,
+                    out var compactStorageShape))
+            {
+                var compactOutput = owner.RentTempArray(
+                    compactStorageShape.w,
+                    compactStorageShape.h,
+                    1,
+                    AexisGraphSession.ResolveTensorTextureFormat(compactStorageShape.dims));
+                owner.Ops.AttentionMaskCompactPad4(
+                    srcTex.texture,
+                    sourceStorage.w,
+                    sourceStorage.h,
+                    compactStorageShape.w,
+                    compactStorageShape.h,
+                    compactOutput,
+                    sourceStorage.d,
+                    sourceStorage.c);
+                AexisGraphSession.SetTextureBlob(
+                    textureBlobs,
+                    textureShapes,
+                    layer.topNames[0],
+                    compactOutput,
+                    compactLogicalShape,
+                    compactStorageShape);
+                owner.Consume(textureBlobs, bufferBlobs, bufferRefs, bufferViews, remaining, layer.bottomNames, pinnedNames);
+                return;
+            }
+
+            if (IsPaddingLinearMat2D(srcTex, srcShape))
+            {
+                var outW = srcShape.w + pp.left + pp.right;
+                var outH = srcShape.h + pp.top + pp.bottom;
+                var linearOutShape = new AexisGraphSession.BufferShape(2, outW, outH, 1, 1);
+                var outMat = owner.RentTempMatExactFormat(outW, outH, AexisGraphSession.ResolveLinearMatTextureFormat());
+                owner.Ops.PaddingLinearMat2D(srcTex.texture, pp.left, pp.right, pp.top, pp.bottom, pp.type, pp.value, outMat);
+                AexisGraphSession.SetTextureBlob(
+                    textureBlobs,
+                    textureShapes,
+                    layer.topNames[0],
+                    outMat,
+                    linearOutShape,
+                    AexisGraphSession.ResolveLinearMatStorageShape(linearOutShape));
+                owner.Consume(textureBlobs, bufferBlobs, bufferRefs, bufferViews, remaining, layer.bottomNames, pinnedNames);
+                return;
+            }
+
+            var outDepth = srcShape.dims == 4
+                ? Mathf.Max(1, srcShape.d) * Mathf.Max(1, srcTex.packs)
+                : Mathf.Max(1, srcTex.packs);
+            var outRt = owner.RentTempArray(
+                srcTex.width + pp.left + pp.right,
+                srcTex.height + pp.top + pp.bottom,
+                outDepth,
+                AexisGraphSession.ResolveTensorTextureFormat(srcShape.dims));
+            owner.Ops.PaddingPack4(srcTex.texture, outDepth, pp.left, pp.right, pp.top, pp.bottom, pp.type, new Vector4(pp.value, pp.value, pp.value, pp.value), outRt);
+            var outShape = srcShape.dims == 4
+                ? new AexisGraphSession.BufferShape(4, srcShape.w + pp.left + pp.right, srcShape.h + pp.top + pp.bottom, srcShape.d, srcShape.c)
+                : new AexisGraphSession.BufferShape(3, srcShape.w + pp.left + pp.right, srcShape.h + pp.top + pp.bottom, 1, srcShape.c);
             AexisGraphSession.SetTextureBlob(
                 textureBlobs,
                 textureShapes,
                 layer.topNames[0],
                 outRt,
-                new AexisGraphSession.BufferShape(3, srcShape.w + pp.left + pp.right, srcShape.h + pp.top + pp.bottom, 1, srcShape.c));
+                outShape);
             owner.Consume(textureBlobs, bufferBlobs, bufferRefs, bufferViews, remaining, layer.bottomNames, pinnedNames);
         }
 
@@ -336,10 +436,89 @@ namespace Aexis.Execution
             }
 
             var outShape = ResolveCmdOutputShape(srcShape, pp);
+
+            if (AexisGraphSession.TryResolveCompactAttentionMaskPad4(
+                    layer,
+                    srcShape,
+                    AexisGraphSession.GetCmdStorageShape(src, srcShape),
+                    out var compactPad4LogicalShape,
+                    out var compactPad4StorageShape))
+            {
+                var compactPad4Output = owner.RentTempArray(
+                    cmd,
+                    compactPad4StorageShape.w,
+                    compactPad4StorageShape.h,
+                    1,
+                    AexisGraphSession.ResolveTensorTextureFormat(compactPad4StorageShape.dims),
+                    layer.topNames[0]);
+                var inputStorage = AexisGraphSession.GetCmdStorageShape(src, srcShape);
+                // The output is always folded d3/c=2 storage. The existing
+                // compact kernel accepts either d3/c=2 or d4/d=2,c=1 input
+                // and writes the two output rows into RGBA lanes.
+                owner.Ops.AttentionMaskCompactPad4(
+                    cmd,
+                    src.texture,
+                    inputStorage.w,
+                    inputStorage.h,
+                    compactPad4StorageShape.w,
+                    compactPad4StorageShape.h,
+                    compactPad4Output,
+                    inputStorage.d,
+                    inputStorage.c,
+                    inputStorage.h);
+                blobs[layer.topNames[0]] = AexisGraphSession.CreateCmdTensorRef(
+                    compactPad4Output,
+                    compactPad4LogicalShape,
+                    compactPad4StorageShape,
+                    owned: true,
+                    blobName: layer.topNames[0]);
+                if (shapes != null)
+                    shapes[layer.topNames[0]] = compactPad4LogicalShape;
+                owner.ConsumeCmd(cmd, blobs, remaining, layer.bottomNames, pinnedNames, shapes);
+                return;
+            }
+
+            if (AexisGraphSession.TryResolveCompactAttentionMaskPad2(
+                    layer,
+                    srcShape,
+                    AexisGraphSession.GetCmdStorageShape(src, srcShape),
+                    out var compactLogicalShape,
+                    out var compactStorageShape))
+            {
+                var compactOutput = owner.RentTempArray(
+                    cmd,
+                    compactStorageShape.w,
+                    compactStorageShape.h,
+                    1,
+                    AexisGraphSession.ResolveTensorTextureFormat(compactStorageShape.dims),
+                    layer.topNames[0]);
+                var inputStorage = AexisGraphSession.GetCmdStorageShape(src, srcShape);
+                owner.Ops.AttentionMaskCompactPad4(
+                    cmd,
+                    src.texture,
+                    inputStorage.w,
+                    inputStorage.h,
+                    compactStorageShape.w,
+                    compactStorageShape.h,
+                    compactOutput,
+                    inputStorage.d,
+                    inputStorage.c);
+                blobs[layer.topNames[0]] = AexisGraphSession.CreateCmdTensorRef(
+                    compactOutput,
+                    compactLogicalShape,
+                    compactStorageShape,
+                    owned: true,
+                    blobName: layer.topNames[0]);
+                if (shapes != null)
+                    shapes[layer.topNames[0]] = compactLogicalShape;
+                owner.ConsumeCmd(cmd, blobs, remaining, layer.bottomNames, pinnedNames, shapes);
+                return;
+            }
+
             if (!CanUseSimplePack4CmdPath(src, srcShape, pp))
             {
                 throw new InvalidOperationException(
-                    "Padding command-buffer Pack4 profile rejected the input descriptor"
+                    "Padding command-buffer texture profile rejected the input descriptor"
                     + " | layer=" + layer.name
                     + " | logical=d" + srcShape.dims + ":" + srcShape.w + "x" + srcShape.h + "x" + srcShape.d + "x" + srcShape.c
                     + " | texture=" + src.width + "x" + src.height + "x" + src.packs
@@ -352,8 +531,50 @@ namespace Aexis.Execution
             if (outW <= 0 || outH <= 0)
                 throw new InvalidOperationException("Padding invalid out size: " + outW + "x" + outH);
 
-            var outArr = owner.RentTempArray(cmd, outW, outH, src.packs, RenderTextureFormat.ARGBHalf);
-            owner.Ops.PaddingPack4(cmd, src.texture, src.packs, pp.left, pp.right, pp.top, pp.bottom, pp.type, new Vector4(pp.value, pp.value, pp.value, pp.value), outArr);
+            if (IsPaddingLinearMat2D(src, srcShape))
+            {
+                var linearOutputShape = new AexisGraphSession.BufferShape(2, outW, outH, 1, 1);
+                var linearStorageShape = AexisGraphSession.ResolveLinearMatStorageShape(linearOutputShape);
+                var outMat = owner.RentTempMatExactFormat(
+                    cmd,
+                    outW,
+                    outH,
+                    AexisGraphSession.ResolveLinearMatTextureFormat(),
+                    layer.topNames[0]);
+                owner.Ops.PaddingLinearMat2D(
+                    cmd,
+                    src.texture,
+                    pp.left,
+                    pp.right,
+                    pp.top,
+                    pp.bottom,
+                    pp.type,
+                    pp.value,
+                    outMat);
+                blobs[layer.topNames[0]] = AexisGraphSession.CreateCmdTensorRef(
+                    outMat,
+                    linearOutputShape,
+                    linearStorageShape,
+                    owned: true,
+                    blobName: layer.topNames[0]);
+                if (shapes != null)
+                    shapes[layer.topNames[0]] = linearOutputShape;
+                owner.ConsumeCmd(cmd, blobs, remaining, layer.bottomNames, pinnedNames, shapes);
+                return;
+            }
+
+            var outArr = owner.RentTempArray(
+                cmd,
+                outW,
+                outH,
+                Mathf.Max(1, srcShape.d) * Mathf.Max(1, src.packs),
+                AexisGraphSession.ResolveTensorTextureFormat(srcShape.dims),
+                layer.topNames[0]);
+            var dispatchDepth = Mathf.Max(1, srcShape.d) * Mathf.Max(1, src.packs);
+            owner.Ops.PaddingPack4(cmd, src.texture, dispatchDepth, pp.left, pp.right, pp.top, pp.bottom, pp.type, new Vector4(pp.value, pp.value, pp.value, pp.value), outArr);
+            var padStorageShape = srcShape.dims == 2
+                ? new AexisGraphSession.BufferShape(3, outW, outH, 1, 4)
+                : outShape;
             blobs[layer.topNames[0]] = new AexisGraphSession.CmdTensorRef
             {
                 texture = outArr,
@@ -361,7 +582,11 @@ namespace Aexis.Execution
                 height = outH,
                 packs = src.packs,
                 refs = 1,
-                owned = true
+                owned = true,
+                hasLogicalShape = true,
+                logicalShape = outShape,
+                hasStorageShape = true,
+                storageShape = padStorageShape
             };
             if (shapes != null)
                 shapes[layer.topNames[0]] = outShape;
@@ -385,7 +610,10 @@ namespace Aexis.Execution
                 return false;
             if (!owner.TryGetPack4Texture(bottomName, textureBlobs, textureShapes, bufferBlobs, bufferViews, out srcTex, out srcShape))
                 return false;
-            return srcShape.dims == 3;
+            if (AexisGraphSession.IsStrictLinearMatTexture(srcTex))
+                return IsPaddingLinearMat2D(srcTex, srcShape);
+            return srcTex.texture.dimension == TextureDimension.Tex2DArray
+                && (srcShape.dims == 2 || srcShape.dims == 3 || srcShape.dims == 4);
         }
 
         private static bool CanUseSimplePack4CmdPath(AexisGraphSession.CmdTensorRef src, AexisGraphSession.BufferShape srcShape, PaddingPack pp)
@@ -395,12 +623,44 @@ namespace Aexis.Execution
                 && pp.front == 0
                 && pp.behind == 0
                 && pp.perChannelPadDataSize == 0
-                && srcShape.dims == 3
+                && (srcShape.dims == 2 || srcShape.dims == 3 || srcShape.dims == 4)
                 && srcShape.w == src.width
                 && srcShape.h == src.height
-                && srcShape.d == 1
+                && srcShape.d > 0
                 && srcShape.c > 0
-                && srcShape.c <= src.packs * 4;
+                && srcShape.c <= src.packs * 4
+                && (IsPaddingLinearMat2D(src, srcShape)
+                    || src.texture.dimension == TextureDimension.Tex2DArray);
+        }
+
+        private static bool IsPaddingLinearMat2D(AexisGraphSession.TensorRef src, AexisGraphSession.BufferShape shape)
+        {
+            return src != null
+                && src.texture != null
+                && AexisGraphSession.IsStrictLinearMatTexture(src)
+                && src.texture.format == RenderTextureFormat.RFloat
+                && shape.dims == 2
+                && shape.d == 1
+                && shape.c == 1
+                && src.width == shape.w
+                && src.height == shape.h
+                && AexisGraphSession.BufferShapeEquals(AexisGraphSession.GetTextureStorageShape(src, shape),
+                    AexisGraphSession.ResolveLinearMatStorageShape(shape));
+        }
+
+        private static bool IsPaddingLinearMat2D(AexisGraphSession.CmdTensorRef src, AexisGraphSession.BufferShape shape)
+        {
+            return src != null
+                && src.texture != null
+                && AexisGraphSession.IsStrictLinearMatTexture(src)
+                && src.texture.format == RenderTextureFormat.RFloat
+                && shape.dims == 2
+                && shape.d == 1
+                && shape.c == 1
+                && src.width == shape.w
+                && src.height == shape.h
+                && AexisGraphSession.BufferShapeEquals(AexisGraphSession.GetCmdStorageShape(src, shape),
+                    AexisGraphSession.ResolveLinearMatStorageShape(shape));
         }
 
         private static AexisGraphSession.BufferShape ResolveCmdOutputShape(AexisGraphSession.BufferShape srcShape, PaddingPack pp)

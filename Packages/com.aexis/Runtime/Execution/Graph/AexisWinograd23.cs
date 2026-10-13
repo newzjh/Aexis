@@ -30,7 +30,10 @@ namespace Aexis.Execution
             if (w <= 0 || h <= 0)
                 return false;
 
-            return inPacks >= 48 && outPacks >= 16;
+            // ESRGAN animevideov3 uses a 64->64 (16-pack) trunk.  The transform
+            // overhead is amortized at the stage resolutions used by the game;
+            // keep a small minimum so tiny tensors still use the direct kernel.
+            return inPacks >= 16 && outPacks >= 16 && (w * h) >= (64 * 64);
         }
 
         public static int BlockX(int w) => (w + 1) / 2;

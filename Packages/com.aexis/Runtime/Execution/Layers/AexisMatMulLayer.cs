@@ -213,73 +213,134 @@ namespace Aexis.Execution
             if (k <= 0 || aRows <= 0 || n <= 0 || k != kFromB)
                 return false;
 
-            var outBatchD = Mathf.Max(aShape.d, bShape.d);
-            var outBatchC = Mathf.Max(aShape.c, bShape.c);
-            if ((aShape.d != 1 && aShape.d != outBatchD)
-                || (bShape.d != 1 && bShape.d != outBatchD)
-                || (aShape.c != 1 && aShape.c != outBatchC)
-                || (bShape.c != 1 && bShape.c != outBatchC))
+            var matmulATexture = aTex.texture;
+            var matmulBTexture = bTex.texture;
+            var matmulAShape = aShape;
+            var matmulBShape = bShape;
+            ComputeTexture channelBatchReshape = null;
+            try
             {
-                return false;
-            }
+                if (aShape.dims != bShape.dims)
+                {
+                    var rank4Index = aShape.dims > bShape.dims ? 0 : 1;
+                    var rank3Index = 1 - rank4Index;
+                    var rank4 = rank4Index == 0 ? aShape : bShape;
+                    var rank3 = rank3Index == 0 ? aShape : bShape;
+                    var sharedBatch = Mathf.Max(rank4.d, rank3.c);
+                    if ((rank4.d != 1 && rank4.d != sharedBatch)
+                        || (rank3.c != 1 && rank3.c != sharedBatch))
+                        return false;
 
-            var maxDims = Mathf.Max(aShape.dims, bShape.dims);
-            AexisGraphSession.BufferShape outShape;
-            if (outBatchD == 1 && outBatchC == 1)
-            {
-                outShape = new AexisGraphSession.BufferShape(2, Mathf.Max(1, n), Mathf.Max(1, aRows), 1, 1);
-            }
-            else if (maxDims >= 4 || outBatchD > 1)
-            {
-                outShape = new AexisGraphSession.BufferShape(4, Mathf.Max(1, n), Mathf.Max(1, aRows), Mathf.Max(1, outBatchD), Mathf.Max(1, outBatchC));
-            }
-            else
-            {
-                outShape = new AexisGraphSession.BufferShape(3, Mathf.Max(1, n), Mathf.Max(1, aRows), 1, Mathf.Max(1, outBatchC));
-            }
+                    if (rank3.c > 1)
+                    {
+                        var source = rank3Index == 0 ? aTex : bTex;
+                        var packedShape = new AexisGraphSession.BufferShape(4, rank3.w, rank3.h, sharedBatch, 1);
+                        var suffix = rank3Index == 0 ? "matmul-a-channel-to-depth" : "matmul-b-channel-to-depth";
+                        channelBatchReshape = owner.RentTempArray(
+                            context.commandBuffer,
+                            packedShape.w,
+                            packedShape.h,
+                            packedShape.d,
+                            source.texture.format,
+                            AexisGraphSession.GetStrictPack4ScratchIdentity(layer, suffix));
+                        owner.Ops.ReshapePack4ToPack4(
+                            context.commandBuffer,
+                            source.texture,
+                            rank3.w,
+                            rank3.h,
+                            rank3.d,
+                            rank3.c,
+                            rank3.dims,
+                            packedShape.w,
+                            packedShape.h,
+                            packedShape.d,
+                            packedShape.c,
+                            packedShape.dims,
+                            channelBatchReshape);
+                        if (rank3Index == 0)
+                        {
+                            matmulATexture = channelBatchReshape;
+                            matmulAShape = packedShape;
+                        }
+                        else
+                        {
+                            matmulBTexture = channelBatchReshape;
+                            matmulBShape = packedShape;
+                        }
+                    }
+                }
 
-            var outPacks = Mathf.Max(1, Mathf.CeilToInt(outShape.c / 4f));
-            var outSlices = Mathf.Max(1, outShape.d) * outPacks;
-            var outRt = owner.RentTempArray(context.commandBuffer, outShape.w, outShape.h, outSlices, AexisGraphSession.ResolveTensorTextureFormat(outShape.dims));
-            owner.Ops.MatMulPack4Cdhw(
-                context.commandBuffer,
-                aTex.texture,
-                aRows,
-                aCols,
-                aShape.d,
-                aShape.c,
-                bTex.texture,
-                bRows,
-                bCols,
-                bShape.d,
-                bShape.c,
-                transB,
-                outShape.d,
-                outShape.c,
-                outRt);
-            context.blobs[layer.topNames[0]] = new AexisGraphSession.CmdTensorRef
+                var outBatchD = Mathf.Max(matmulAShape.d, matmulBShape.d);
+                var outBatchC = Mathf.Max(matmulAShape.c, matmulBShape.c);
+                if ((matmulAShape.d != 1 && matmulAShape.d != outBatchD)
+                    || (matmulBShape.d != 1 && matmulBShape.d != outBatchD)
+                    || (matmulAShape.c != 1 && matmulAShape.c != outBatchC)
+                    || (matmulBShape.c != 1 && matmulBShape.c != outBatchC))
+                    return false;
+
+                var maxDims = Mathf.Max(matmulAShape.dims, matmulBShape.dims);
+                AexisGraphSession.BufferShape outShape;
+                if (outBatchD == 1 && outBatchC == 1)
+                    outShape = new AexisGraphSession.BufferShape(2, Mathf.Max(1, n), Mathf.Max(1, aRows), 1, 1);
+                else if (maxDims >= 4 || outBatchD > 1)
+                    outShape = new AexisGraphSession.BufferShape(4, Mathf.Max(1, n), Mathf.Max(1, aRows), Mathf.Max(1, outBatchD), Mathf.Max(1, outBatchC));
+                else
+                    outShape = new AexisGraphSession.BufferShape(3, Mathf.Max(1, n), Mathf.Max(1, aRows), 1, Mathf.Max(1, outBatchC));
+
+                var outPacks = Mathf.Max(1, Mathf.CeilToInt(outShape.c / 4f));
+                var outSlices = Mathf.Max(1, outShape.d) * outPacks;
+                var outRt = owner.RentTempArray(
+                    context.commandBuffer,
+                    outShape.w,
+                    outShape.h,
+                    outSlices,
+                    AexisGraphSession.ResolveTensorTextureFormat(outShape.dims),
+                    layer.topNames[0]);
+                owner.Ops.MatMulPack4Cdhw(
+                    context.commandBuffer,
+                    matmulATexture,
+                    aRows,
+                    aCols,
+                    matmulAShape.d,
+                    matmulAShape.c,
+                    matmulBTexture,
+                    bRows,
+                    bCols,
+                    matmulBShape.d,
+                    matmulBShape.c,
+                    transB,
+                    outShape.d,
+                    outShape.c,
+                    outRt);
+                context.blobs[layer.topNames[0]] = new AexisGraphSession.CmdTensorRef
+                {
+                    texture = outRt,
+                    width = outShape.w,
+                    height = outShape.h,
+                    packs = outPacks,
+                    refs = 1,
+                    owned = true,
+                    hasLogicalShape = true,
+                    logicalShape = outShape,
+                    hasStorageShape = true,
+                    storageShape = outShape
+                };
+                context.shapes[layer.topNames[0]] = outShape;
+                owner.DebugLog?.Invoke(
+                    "[MatMulPack4CDHW][cmd] applied"
+                    + " | layer=" + layer.name
+                    + " | transB=" + (transB ? "1" : "0")
+                    + " | a=d" + matmulAShape.dims + ":" + matmulAShape.w + "x" + matmulAShape.h + "x" + matmulAShape.d + "x" + matmulAShape.c
+                    + " | b=d" + matmulBShape.dims + ":" + matmulBShape.w + "x" + matmulBShape.h + "x" + matmulBShape.d + "x" + matmulBShape.c
+                    + " | out=d" + outShape.dims + ":" + outShape.w + "x" + outShape.h + "x" + outShape.d + "x" + outShape.c);
+                owner.ConsumeCmd(context.commandBuffer, context.blobs, context.remaining, layer.bottomNames, context.pinnedNames, context.shapes);
+                return true;
+            }
+            finally
             {
-                texture = outRt,
-                width = outShape.w,
-                height = outShape.h,
-                packs = outPacks,
-                refs = 1,
-                owned = true,
-                hasLogicalShape = true,
-                logicalShape = outShape,
-                hasStorageShape = true,
-                storageShape = outShape
-            };
-            context.shapes[layer.topNames[0]] = outShape;
-            owner.DebugLog?.Invoke(
-                "[MatMulPack4CDHW][cmd] applied"
-                + " | layer=" + layer.name
-                + " | transB=" + (transB ? "1" : "0")
-                + " | a=d" + aShape.dims + ":" + aShape.w + "x" + aShape.h + "x" + aShape.d + "x" + aShape.c
-                + " | b=d" + bShape.dims + ":" + bShape.w + "x" + bShape.h + "x" + bShape.d + "x" + bShape.c
-                + " | out=d" + outShape.dims + ":" + outShape.w + "x" + outShape.h + "x" + outShape.d + "x" + outShape.c);
-            owner.ConsumeCmd(context.commandBuffer, context.blobs, context.remaining, layer.bottomNames, context.pinnedNames, context.shapes);
-            return true;
+                if (channelBatchReshape != null)
+                    owner.ReturnTempArray(context.commandBuffer, channelBatchReshape);
+            }
         }
 
         private static bool TryExecuteVistaTailPack4Path(AexisGraphSession owner, AexisGraphModel.Layer layer, AexisLayerBufferContext context)

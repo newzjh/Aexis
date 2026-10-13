@@ -167,7 +167,8 @@ void AexisQuantizePack4_Impl(uint3 id)
 
         int axis = AexisPack4QuantAxis(_QuantDims, _QuantW, _QuantH, _QuantD, (int)id.x, (int)id.y, z, channel);
         float scale = AexisResolveQuantScaleIn(axis);
-        float value = clamp(AexisRoundToNearest(AexisReadLane(src, lane) * scale), -127.0, 127.0);
+        // ONNX QuantizeLinear with tensor(int8) has the full signed range.
+        float value = clamp(AexisRoundToNearest(AexisReadLane(src, lane) * scale), -128.0, 127.0);
         AexisWriteLane(dst, lane, value);
     }
 
@@ -230,7 +231,7 @@ void AexisRequantizePack4_Impl(uint3 id)
         float bias = AexisResolveQuantBias(axis);
         float value = AexisRoundToNearest(AexisReadLane(src, lane)) * scaleIn + bias;
         value = AexisApplyActivationScalarQuant(value);
-        value = clamp(AexisRoundToNearest(value * scaleOut), -127.0, 127.0);
+        value = clamp(AexisRoundToNearest(value * scaleOut), -128.0, 127.0);
         AexisWriteLane(dst, lane, value);
     }
 

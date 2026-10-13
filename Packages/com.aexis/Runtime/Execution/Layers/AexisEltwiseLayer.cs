@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
@@ -11,6 +11,10 @@ namespace Aexis.Execution
     public sealed class AexisEltwiseLayer : AexisBaseLayer
     {
         public AexisEltwiseLayer() : base(AexisLayerTypes.Eltwise, supportsBufferPath: true, supportsCommandBufferPath: true) { }
+
+        // [TTS-DIAG] tail eltwise 输出 staging（debug）。
+        private static RenderTexture s_tailEltRt;
+        public static RenderTexture GetTailEltRt() => s_tailEltRt;
 
         private static float[] ParseEltwiseCoeffs(AexisGraphModel.Layer layer)
         {
@@ -234,7 +238,31 @@ namespace Aexis.Execution
                                                     accum = next;
                                                 }
 
-                                                blobs[layer.topNames[0]] = new AexisGraphSession.CmdTensorRef { texture = accum, width = a.width, height = a.height, packs = a.packs, refs = 1, owned = true };
+                                                blobs[layer.topNames[0]] = AexisGraphSession.CreateCmdTensorRef(
+                                                    accum, aShape, AexisGraphSession.GetCmdStorageShape(a, aShape), owned: true);
+                                                // [TTS-DIAG] tail eltwise 残差和 staging + 输入 nameID 日志
+                                                if (a.width >= 16000)
+                                                {
+                                                    try
+                                                    {
+                                                        var sb = new System.Text.StringBuilder();
+                                                        if (AexisGraphSession.s_ttsVerbose) sb.Append($"[TTS-DIAG] ELTWISE {layer.name} top={layer.topNames[0]} a0={layer.bottomNames[0]}({a.texture.nameID})");
+                                                        for (int bi = 1; bi < layer.bottomNames.Length; bi++)
+                                                        { var bb = AexisGraphSession.GetCmdTensor(blobs, layer.bottomNames[bi]); sb.Append($" b{bi}={layer.bottomNames[bi]}({bb.texture.nameID})"); }
+                                                        UnityEngine.Debug.Log(sb.ToString());
+                                                        if (s_tailEltRt == null || s_tailEltRt.width != accum.width || s_tailEltRt.volumeDepth != accum.depth)
+                                                        {
+                                                            if (s_tailEltRt != null) { s_tailEltRt.Release(); UnityEngine.Object.DestroyImmediate(s_tailEltRt); }
+                                                            var tdd = new RenderTextureDescriptor(accum.width, accum.height, RenderTextureFormat.ARGBFloat, 0)
+                                                            { dimension = TextureDimension.Tex2DArray, volumeDepth = accum.depth, enableRandomWrite = true, msaaSamples = 1 };
+                                                            s_tailEltRt = new RenderTexture(tdd) { filterMode = FilterMode.Point, wrapMode = TextureWrapMode.Clamp };
+                                                            s_tailEltRt.Create();
+                                                        }
+                                                        for (int sl = 0; sl < accum.depth; sl++)
+                                                            cmd.CopyTexture(accum.nameID, sl, 0, s_tailEltRt, sl, 0);
+                                                    }
+                                                    catch (System.Exception edx) { UnityEngine.Debug.Log($"[TTS-DIAG] eltwise staging fail {layer.name}: {edx.Message}"); }
+                                                }
                                                 if (shapes != null)
                                                     shapes[layer.topNames[0]] = aShape;
                                                 owner.ConsumeCmd(cmd, blobs, remaining, layer.bottomNames, pinnedNames, shapes);

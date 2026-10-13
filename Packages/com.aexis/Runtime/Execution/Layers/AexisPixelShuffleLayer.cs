@@ -146,17 +146,25 @@ namespace Aexis.Execution
             var src = AexisGraphSession.GetCmdTensor(blobs, layer.bottomNames[0]);
             if (CanUsePack4PixelShuffle(src, srcShape, upscaleFactor))
             {
-                var outArr = owner.RentTempArray(cmd, outShape.w, outShape.h, Mathf.Max(1, Mathf.CeilToInt(outShape.c / 4f)), RenderTextureFormat.ARGBHalf);
+                var outArr = owner.RentTempArray(
+                    cmd,
+                    outShape.w,
+                    outShape.h,
+                    Mathf.Max(1, Mathf.CeilToInt(outShape.c / 4f)),
+                    RenderTextureFormat.ARGBHalf,
+                    layer.topNames[0]);
                 owner.Ops.PixelShufflePack4(cmd, src.texture, outShape.c, upscaleFactor, mode, outArr);
-                blobs[layer.topNames[0]] = new AexisGraphSession.CmdTensorRef
-                {
-                    texture = outArr,
-                    width = outShape.w,
-                    height = outShape.h,
-                    packs = Mathf.Max(1, Mathf.CeilToInt(outShape.c / 4f)),
-                    refs = 1,
-                    owned = true
-                };
+                // Do not publish a bare CmdTensorRef here.  The physical Pack4 RT
+                // has one slice, but SESR's PixelShuffle produces three logical
+                // channels.  Preserving that contract prevents a following NHWC
+                // transpose from treating the padding lane as a fourth channel and
+                // keeps the runtime allocation identical to the strict plan.
+                blobs[layer.topNames[0]] = AexisGraphSession.CreateCmdTensorRef(
+                    outArr,
+                    outShape,
+                    outShape,
+                    owned: true,
+                    blobName: layer.topNames[0]);
                 if (shapes != null)
                     shapes[layer.topNames[0]] = outShape;
             }

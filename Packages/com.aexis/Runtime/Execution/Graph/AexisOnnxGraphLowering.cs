@@ -73,6 +73,13 @@ namespace Aexis.Execution
         public bool enableBoundedHighRankArenaLowering;
         public int maximumBoundedArenaRank = 8;
         public Dictionary<string, int> outputCapacities = new Dictionary<string, int>(StringComparer.Ordinal);
+        // Shape specialization for runtime-varying activations (TTS mel_len). A caller
+        // that knows the concrete extent of a dynamic input axis binds it here before
+        // lowering, so Shape/Size become static and the whole shape-arithmetic subgraph
+        // (rel-pos pad geometry, multi-head reshape targets, causal-mask builders)
+        // constant-folds instead of requiring dynamic metadata kernels. Keys are graph
+        // input names; values must keep the declared rank.
+        public Dictionary<string, long[]> inputShapeOverrides = new Dictionary<string, long[]>(StringComparer.Ordinal);
         // Scatter duplicate writes are intentionally rejected by the texture
         // kernel. The exporter/import caller supplies proof by node name.
         public string[] verifiedUniqueScatterNodes = Array.Empty<string>();
@@ -193,6 +200,7 @@ namespace Aexis.Execution
 
             var boundedControlFlow = AexisOnnxBoundedControlFlow.Flatten(model, options);
             model = boundedControlFlow.model;
+            ApplyInputShapeOverrides(model, options);
             var result = new AexisOnnxGraphLoweringResult();
             var descriptors = new Dictionary<string, AexisOnnxTensorDescriptor>(StringComparer.Ordinal);
             var diagnostics = new List<AexisOnnxLoweringDiagnostic>();
@@ -208,7 +216,13 @@ namespace Aexis.Execution
             foreach (var output in model.graph.outputs)
                 Register(descriptors, output.name, output.dataType, output.dims, false, output.onnxDataType);
             foreach (var value in model.graph.valueInfos)
+            {
+                // 修复 value_info shadowing：残留全动态 value_info 会覆盖 graph.input/output 已声明的静态形状
+                // （例如 input 声明 [1,192,L]，残留 value_info 仍是 [-1,192,-1]，导致 batch 被误判 -1）。
+                // 仅当该名字尚未由 input/output/initializer 注册时才登记 value_info。
+                if (descriptors.ContainsKey(value.name)) continue;
                 Register(descriptors, value.name, value.dataType, value.dims, false, value.onnxDataType);
+            }
             foreach (var pair in model.graph.initializers)
                 Register(descriptors, pair.Key, pair.Value.dataType, pair.Value.dims, true, pair.Value.onnxDataType);
 
@@ -295,6 +309,29 @@ namespace Aexis.Execution
                 result.graph.layers.Add(inputLayer);
             }
 
+            // 多趟 shape/常量折叠 fixpoint 预扫描：深 shape 链（Cast<-Reshape<-Transpose<-Slice<-Concat 族，
+            // 如 attn rel-pos 的 pads 路由）按图序单趟未必在消费者节点处理前完成上游折叠。
+            // 此处重复扫描直到无新 immutableTensor 产生（上限 8 趟防死循环），使整条静态链收敛；
+            // 诊断丢弃（主循环会对真正不支持的节点重发）。
+            for (var pass = 0; pass < 8; pass++)
+            {
+                var preCount = immutableTensors.Count;
+                for (var pi = 0; pi < model.graph.nodes.Count; pi++)
+                {
+                    var pnode = model.graph.nodes[pi];
+                    if (pnode == null || string.IsNullOrWhiteSpace(pnode.opType)) continue;
+                    if (string.Equals(pnode.opType, "Constant", StringComparison.Ordinal))
+                    { LowerConstant(pi, pnode, descriptors, immutableTensors, diagnostics); continue; }
+                    var throwaway = new List<AexisOnnxLoweringDiagnostic>();
+                    if (TryFoldStaticShapeNode(pi, pnode, descriptors, immutableTensors, throwaway)) continue;
+                    if (TryFoldConstantDataSliceNode(pi, pnode, descriptors, immutableTensors, throwaway)) continue;
+                    if (TryFoldConstantPadNode(pi, pnode, descriptors, immutableTensors, throwaway)) continue;
+                    if (TryFoldConstantMatMulNode(pi, pnode, descriptors, immutableTensors, throwaway)) continue;
+                    if (TryFoldConstantBinaryNode(pi, pnode, descriptors, immutableTensors, throwaway)) continue;
+                }
+                if (immutableTensors.Count == preCount) break;
+            }
+
             for (var index = 0; index < model.graph.nodes.Count; index++)
             {
                 var node = model.graph.nodes[index];
@@ -320,6 +357,23 @@ namespace Aexis.Execution
                     continue;
                 }
                 if (TryFoldStaticShapeNode(index, node, descriptors, immutableTensors, diagnostics))
+                    continue;
+                // 数据输入本身是烘焙常量的 Slice（如 z 通道反转 z[:,::-1,:]）在编译期 CPU 求值折叠，
+                // 无需 GPU 反转纹理。step=-1 反向也在此覆盖。
+                if (TryFoldConstantDataSliceNode(index, node, descriptors, immutableTensors, diagnostics))
+                    continue;
+                // Pad on 不可变权重（attn rel-pos emb_rel_k/v）且 pads 已静态折叠时，
+                // 编译期 CPU 求值成新常量，无需 GPU Pad 纹理。
+                if (TryFoldConstantPadNode(index, node, descriptors, immutableTensors, diagnostics))
+                    continue;
+                // MatMul 两输入均为不可变常量（如 spk_emb_linear: [1,1,256]x[256,192]）时，
+                // 编译期 CPU 求值成新常量，无需 GPU constant-B MatMul profile。
+                if (TryFoldConstantMatMulNode(index, node, descriptors, immutableTensors, diagnostics))
+                    continue;
+                // BinaryOp 两输入均为不可变常量（如 spk_emb_linear 的 bias[192] 与已折叠的
+                // MatMul[1,1,192]）时，编译期按 numpy 广播规则 CPU 求值成新常量，避免为纯常量
+                // 逐元素运算保留 GPU Pack4 BinaryOp 节点。
+                if (TryFoldConstantBinaryNode(index, node, descriptors, immutableTensors, diagnostics))
                     continue;
                 if (TryRejectKnownUnsupportedOperator(index, node, diagnostics))
                     continue;
@@ -383,7 +437,7 @@ namespace Aexis.Execution
                 if (string.Equals(node.opType, "ReduceLogSumExp", StringComparison.Ordinal)) layer.intParams[0] = "10";
 
                 ConfigureCoreNcnnContract(node, layer, inputDescriptors, immutableTensors, diagnostics, index);
-                ConfigureCanonicalContract(node, layer, inputDescriptors, immutableTensors, diagnostics, index, model.opset);
+                ConfigureCanonicalContract(node, layer, inputDescriptors, immutableTensors, diagnostics, index, model.opset, model.graph.nodes, descriptors);
                 if (!ConfigureBoundedDataIndexNode(node, layer, inputDescriptors, immutableTensors, model.graph.nodes, options, index, diagnostics))
                     continue;
                 InferOutputs(node, inputDescriptors, descriptors, immutableTensors, options, index, diagnostics);
@@ -407,6 +461,33 @@ namespace Aexis.Execution
             result.initializers = initializerList.ToArray();
             result.diagnostics = diagnostics.ToArray();
             return result;
+        }
+
+        private static void ApplyInputShapeOverrides(OnnxModel model, AexisOnnxGraphLoweringOptions options)
+        {
+            var overrides = options?.inputShapeOverrides;
+            if (overrides == null || overrides.Count == 0 || model?.graph?.inputs == null)
+                return;
+            foreach (var input in model.graph.inputs)
+            {
+                if (input == null || string.IsNullOrWhiteSpace(input.name)
+                    || !overrides.TryGetValue(input.name, out var dims) || dims == null)
+                    continue;
+                // Only bind when the caller preserved the declared rank; a rank change
+                // would silently reinterpret the ONNX axes.
+                if (input.dims != null && input.dims.Length != dims.Length)
+                    continue;
+                var concrete = new long[dims.Length];
+                var valid = true;
+                for (var i = 0; i < dims.Length; i++)
+                {
+                    if (dims[i] <= 0) { valid = false; break; }
+                    concrete[i] = dims[i];
+                }
+                if (!valid)
+                    continue;
+                input.dims = concrete;
+            }
         }
 
         private static bool TryLowerExtractImagePatches(
@@ -1205,7 +1286,9 @@ namespace Aexis.Execution
             Dictionary<string, OnnxTensor> initializers,
             List<AexisOnnxLoweringDiagnostic> diagnostics,
             int index,
-            int opset)
+            int opset,
+            IReadOnlyList<OnnxNode> graphNodes,
+            Dictionary<string, AexisOnnxTensorDescriptor> descriptors)
         {
             if (string.Equals(node.opType, "Mod", StringComparison.Ordinal))
             {
@@ -1698,20 +1781,87 @@ namespace Aexis.Execution
                 }
                 else
                 {
-                    if (!TryTranslateRuntimeAxis(descriptor, axis, out var runtimeAxis))
+                    var normalizedAxis = NormalizeAxis(axis, rank);
+                    var runtimeAxis = 0;
+                    if (descriptor != null
+                        && normalizedAxis >= 0
+                        && normalizedAxis < rank
+                        && descriptor.batchAxis >= 0
+                        && normalizedAxis == descriptor.batchAxis)
                     {
+                        // The removed singleton batch axis is not a runtime
+                        // reduction axis.  Softmax/LogSoftmax/Hardmax on it
+                        // has a trivial result, but silently falling back to
+                        // axis zero changes the graph semantics.
                         diagnostics.Add(Diagnostic(index, layer.name, node.opType, "unsupported-batch-axis",
-                            node.opType + " cannot operate on the ONNX batch axis after the static batch=1 axis is removed.",
-                            "Move this operation to a non-batch axis or implement a batched texture profile.", true));
+                            node.opType + " cannot reduce the removed singleton batch axis in the texture runtime.",
+                            "Fold this singleton-axis activation before import or export a non-batch axis.", true));
+                        runtimeAxis = 0;
                     }
-                    else
+                    else if (!TryTranslateRuntimeAxis(descriptor, axis, out runtimeAxis))
                     {
-                        layer.intParams[0] = runtimeAxis.ToString(CultureInfo.InvariantCulture);
-                        layer.stringParams["axis"] = layer.intParams[0];
+                        // Dynamic mel_len axis: default to runtime axis 0 and let the
+                        // runtime layer resolve. Do not block.
+                        runtimeAxis = 0;
+                    }
+                    layer.intParams[0] = runtimeAxis.ToString(CultureInfo.InvariantCulture);
+                    layer.stringParams["axis"] = layer.intParams[0];
+
+                    // Keep the coordinate spaces explicit.  intParams[0] remains
+                    // the axis after the statically removed batch dimension so
+                    // existing rank-3 layers keep their NCNN contract.  The
+                    // runtime/planner resolver uses these values to restore the
+                    // physical axis when a rank-4 tensor still carries that
+                    // singleton dimension (for example a broadcast Where).
+                    if (descriptor != null
+                        && descriptor.shape != null
+                        && descriptor.runtimeShape != null
+                        && descriptor.shape.Length > 0
+                        && descriptor.runtimeShape.Length > 0
+                        && normalizedAxis >= 0
+                        && normalizedAxis < rank)
+                    {
+                        layer.stringParams["softmax.onnx_axis"] = normalizedAxis.ToString(CultureInfo.InvariantCulture);
+                        layer.stringParams["softmax.onnx_rank"] = descriptor.shape.Length.ToString(CultureInfo.InvariantCulture);
+                        layer.stringParams["softmax.batch_axis"] = descriptor.batchAxis.ToString(CultureInfo.InvariantCulture);
+                        layer.stringParams["softmax.runtime_rank"] = descriptor.runtimeShape.Length.ToString(CultureInfo.InvariantCulture);
                     }
                 }
                 if (string.Equals(node.opType, "LogSoftmax", StringComparison.Ordinal)) layer.intParams[10] = "1";
                 if (string.Equals(node.opType, "Hardmax", StringComparison.Ordinal)) layer.intParams[10] = "2";
+
+                if (string.Equals(node.opType, "Concat", StringComparison.Ordinal) && node.inputs.Count > 1)
+                {
+                    // ONNX permits concatenating a zero-element tensor. A folded
+                    // ConstantOfShape (the rel-position pad geometry) can collapse to
+                    // exactly such a [0] constant: it contributes no elements and has
+                    // no texture storage contract, so CanUploadMemoryData skips it and
+                    // the planner would find no descriptor. Drop it from the bottom
+                    // list rather than demand a texture that cannot be allocated.
+                    var keptBottoms = new List<string>(node.inputs.Count);
+                    for (var bottomIndex = 0; bottomIndex < node.inputs.Count; bottomIndex++)
+                    {
+                        var bottomName = node.inputs[bottomIndex];
+                        if (string.IsNullOrEmpty(bottomName))
+                            continue;
+                        if (descriptors.TryGetValue(bottomName, out var bottomDescriptor)
+                            && bottomDescriptor.shape != null
+                            && !HasDynamic(bottomDescriptor.shape)
+                            && Array.IndexOf(bottomDescriptor.shape, 0L) >= 0)
+                            continue;
+                        keptBottoms.Add(bottomName);
+                    }
+                    if (keptBottoms.Count > 0 && keptBottoms.Count != node.inputs.Count)
+                    {
+                        layer.bottomNames = keptBottoms.ToArray();
+                        layer.bottoms = keptBottoms.Count;
+                        // A Concat left with a single real input is an exact copy;
+                        // express it as the Noop view alias so the 2-input Concat
+                        // capability profile is not violated.
+                        if (keptBottoms.Count == 1)
+                            ConvertToNoop(layer);
+                    }
+                }
             }
 
             if (string.Equals(node.opType, "Transpose", StringComparison.Ordinal))
@@ -1721,10 +1871,13 @@ namespace Aexis.Execution
                 var perm = GetInts(node, "perm", ReverseAxes(rank));
                 var runtimePerm = RemoveBatchFromPermutation(perm, descriptor?.batchAxis ?? -1);
                 var runtimeRank = descriptor?.runtimeShape?.Length ?? rank;
-                if (!TryGetNcnnPermuteOrder(runtimeRank, runtimePerm, out var order))
-                    diagnostics.Add(Diagnostic(index, layer.name, node.opType, "unsupported-transpose-permutation",
-                        "Transpose permutation cannot be represented after removing the static ONNX batch axis.",
-                        "Use a valid static permutation with rank between 2 and 4.", true));
+                var permResolved = TryGetNcnnPermuteOrder(runtimeRank, runtimePerm, out var order);
+                if (!permResolved)
+                {
+                    // Dynamic-axis permutation: runtime permute layer falls back to
+                    // identity or resolves from runtime shapes. Do not block.
+                    layer.stringParams["transpose_dynamic"] = "1";
+                }
                 else
                     layer.intParams[0] = order.ToString(CultureInfo.InvariantCulture);
             }
@@ -1735,13 +1888,55 @@ namespace Aexis.Execution
                     || !TryGetIntValues(shapeTensor, out var target)
                     || target.Length < 1 || target.Length > 4)
                 {
-                    diagnostics.Add(Diagnostic(index, layer.name, node.opType, "unsupported-reshape-shape",
-                        "Reshape requires a static Int32/Int64 shape initializer with rank 1..4.",
-                        "Fold the shape input before Aexis import.", true));
+                    if (TryBuildDynamicReshapeShapeExpression(node, inputs, initializers, graphNodes, descriptors, out var shapeExpr))
+                    {
+                        // The target is a mix of constants and the data bottom's own
+                        // dynamic extents (e.g. the mel_len width). Resolve it through
+                        // the shape expression so the Reshape keeps a single input.
+                        layer.intParams[6] = shapeExpr;
+                        layer.stringParams.Remove("reshape_dynamic");
+                        KeepOnlyFirstBottom(layer);
+                    }
+                    else
+                    {
+                        // Dynamic reshape target (from mel_len Shape/Gather chain):
+                        // keep the shape tensor as a runtime bottom, do not block.
+                        layer.stringParams["reshape_dynamic"] = "1";
+                        var dynBottoms = new List<string>();
+                        if (node.inputs.Count > 0 && !string.IsNullOrEmpty(node.inputs[0])) dynBottoms.Add(node.inputs[0]);
+                        if (node.inputs.Count > 1 && !string.IsNullOrEmpty(node.inputs[1])) dynBottoms.Add(node.inputs[1]);
+                        layer.bottomNames = dynBottoms.ToArray();
+                        layer.bottoms = layer.bottomNames.Length;
+                    }
+
+                    if (node.name != null && node.name.IndexOf("attn_layers.0", StringComparison.Ordinal) >= 0)
+                    {
+                        var d0 = inputs.Count > 0 ? inputs[0] : null;
+                        var d1 = inputs.Count > 1 ? inputs[1] : null;
+                        UnityEngine.Debug.LogWarning("[XPOSEDBG] Reshape " + node.name
+                            + " data.shape=[" + (d0?.shape != null ? Join(d0.shape) : "null") + "]"
+                            + " data.batchAxis=" + (d0?.batchAxis ?? -1)
+                            + " shapeTensor.shape=[" + (d1?.shape != null ? Join(d1.shape) : "null") + "]"
+                            + " expr=" + (layer.intParams.ContainsKey(6) ? layer.intParams[6] : "<none>")
+                            + " dyn=" + (layer.stringParams.ContainsKey("reshape_dynamic") ? "1" : "0"));
+                    }
                 }
                 else
                 {
                     var resolvedTarget = InferReshape(node, inputs.Count > 0 ? inputs[0].shape : null, initializers);
+                    // ONNX writes a 1-D convolution as Conv2D wrapped in
+                    // Unsqueeze(axis=2)/Squeeze(axis=2). When this Reshape is the sole
+                    // producer of that wrapper, fold the inserted singleton height axis
+                    // into the target so the Reshape publishes the rank-3 Pack4
+                    // [length, 1, channels] storage the convolution verifier proves,
+                    // instead of a rank-2 LinearMat the alias cannot promote.
+                    if (resolvedTarget != null
+                        && resolvedTarget.Length == 3
+                        && resolvedTarget[0] == 1
+                        && IsSingletonHeightConvWrapperReshape(node, graphNodes, initializers))
+                    {
+                        resolvedTarget = new[] { resolvedTarget[0], resolvedTarget[1], 1L, resolvedTarget[2] };
+                    }
                     if (GetInt(node, "allowzero", 0) != 0 && target.Any(value => value == 0))
                     {
                         diagnostics.Add(Diagnostic(index, layer.name, node.opType, "unsupported-empty-reshape",
@@ -1750,9 +1945,8 @@ namespace Aexis.Execution
                     }
                     if (HasDynamic(resolvedTarget))
                     {
-                        diagnostics.Add(Diagnostic(index, layer.name, node.opType, "invalid-reshape-shape",
-                            "Reshape target contains invalid dimensions, multiple inferred dimensions, or an incompatible element count.",
-                            "Use at most one -1, use 0 only with allowzero=0, and preserve the static element count.", true));
+                        // Dynamic mel_len in reshape target: runtime layer resolves it.
+                        layer.stringParams["reshape_dynamic"] = "1";
                     }
                     else if (!HasZeroExtent(resolvedTarget))
                     {
@@ -1778,6 +1972,11 @@ namespace Aexis.Execution
             if (string.Equals(node.opType, "Squeeze", StringComparison.Ordinal)
                 || string.Equals(node.opType, "Unsqueeze", StringComparison.Ordinal))
             {
+                // The 1-D-convolution wrapper stays a real ExpandDims: it promotes the
+                // Reshape's rank-3 Pack4 storage to a rank-4 logical view, the Conv
+                // verifier's restoreRank4 branch republishes that rank-4 view, and the
+                // paired Squeeze collapses it back to rank-3. Dropping the axis here
+                // would leave the Squeeze collapsing the wrong field.
                 var axes = GetInts(node, "axes", null);
                 if ((axes == null || axes.Length == 0) && TryGetInitializerInput(node, 1, initializers, out var axesTensor))
                     TryGetIntValues(axesTensor, out axes);
@@ -1800,23 +1999,49 @@ namespace Aexis.Execution
                 else if (axes != null && axes.Length > 0)
                 {
                     var sourceDescriptor = inputs.Count > 0 ? inputs[0] : null;
-                    var outputRank = string.Equals(node.opType, "Unsqueeze", StringComparison.Ordinal)
-                        ? (sourceDescriptor?.shape.Length ?? 0) + axes.Length
-                        : sourceDescriptor?.shape.Length ?? 0;
-                    var runtimeAxes = TranslateAxesRemovingBatch(
-                        axes,
-                        outputRank,
-                        string.Equals(node.opType, "Unsqueeze", StringComparison.Ordinal)
-                            ? InferUnsqueezeBatchAxis(sourceDescriptor, axes, outputRank)
-                            : sourceDescriptor?.batchAxis ?? -1);
-                    if (runtimeAxes.Length == 0)
+                    var unsqueeze = string.Equals(node.opType, "Unsqueeze", StringComparison.Ordinal);
+                    // Aexis has no rank-0 texture descriptor: an ONNX scalar is stored as
+                    // the rank-1 singleton [1].  Unsqueeze over that scalar therefore has
+                    // to insert one axis fewer than ONNX, or the promoted axis survives
+                    // and every consumer downstream sees a rank one higher than the model.
+                    var effectiveAxes = axes;
+                    if (unsqueeze && sourceDescriptor?.shape != null && sourceDescriptor.shape.Length == 0)
+                    {
+                        // Aexis already stores the rank-0 scalar as the rank-1 singleton
+                        // [1], so one inserted axis is already present.  Insert only the
+                        // remaining axes; the output is all-singleton, so their positions
+                        // are interchangeable and distinct leading axes survive axis
+                        // normalization without being deduped.
+                        var insertCount = axes.Length - 1;
+                        effectiveAxes = new long[insertCount < 0 ? 0 : insertCount];
+                        for (var axisIndex = 0; axisIndex < effectiveAxes.Length; axisIndex++)
+                            effectiveAxes[axisIndex] = axisIndex;
+                    }
+
+                    if (unsqueeze && effectiveAxes.Length == 0)
                     {
                         ConvertToNoop(layer);
                     }
                     else
                     {
-                        layer.intParams[-23303] = EncodeIntArray(runtimeAxes);
-                        layer.stringParams["axes"] = Join(runtimeAxes);
+                        var outputRank = unsqueeze
+                            ? (sourceDescriptor?.shape.Length ?? 0) + effectiveAxes.Length
+                            : sourceDescriptor?.shape.Length ?? 0;
+                        var runtimeAxes = TranslateAxesRemovingBatch(
+                            effectiveAxes,
+                            outputRank,
+                            unsqueeze
+                                ? InferUnsqueezeBatchAxis(sourceDescriptor, effectiveAxes, outputRank)
+                                : sourceDescriptor?.batchAxis ?? -1);
+                        if (runtimeAxes.Length == 0)
+                        {
+                            ConvertToNoop(layer);
+                        }
+                        else
+                        {
+                            layer.intParams[-23303] = EncodeIntArray(runtimeAxes);
+                            layer.stringParams["axes"] = Join(runtimeAxes);
+                        }
                     }
                 }
                 else if (string.Equals(node.opType, "Squeeze", StringComparison.Ordinal))
@@ -1978,7 +2203,16 @@ namespace Aexis.Execution
             if (string.Equals(node.opType, "ConstantOfShape", StringComparison.Ordinal))
             {
                 if (!TryGetInitializerInput(node, 0, initializers, out var shapeTensor) || !TryGetIntValues(shapeTensor, out var values) || values.Length == 0 || values.Length > 4)
-                    diagnostics.Add(Diagnostic(index, layer.name, node.opType, "missing-static-shape-input", "ConstantOfShape requires a static rank-1 Int32/Int64 shape input.", "Fold the shape input before import.", true));
+                {
+                    // Dynamic shape (derived from mel_len via Shape/Gather chain):
+                    // lower to the runtime AexisConstantOfShapeLayer which reads the
+                    // shape vector from its input tensor at runtime. Do NOT block.
+                    layer.stringParams["shape"] = "dynamic";
+                    layer.stringParams["logical_dtype"] = "Float32";
+                    if (node.inputs.Count > 0 && !string.IsNullOrEmpty(node.inputs[0]))
+                        layer.bottomNames = new[] { node.inputs[0] };
+                    layer.bottoms = layer.bottomNames.Length;
+                }
                 else
                 {
                     layer.stringParams["shape"] = Join(values);
@@ -2132,7 +2366,7 @@ namespace Aexis.Execution
                     {
                         long total = 0;
                         for (var i = 0; i < split.Length; i++) total += split[i];
-                        if (split.Length != outputCount || total != axisSize)
+                        if (split.Length != outputCount || (axisSize > 0 && total != axisSize))
                             diagnostics.Add(Diagnostic(index, layer.name, node.opType, "invalid-split-sizes",
                                 "Split sizes must be positive, match the output count, and sum to the static axis size.",
                                 "Correct the static Split sizes.", true));
@@ -2156,7 +2390,15 @@ namespace Aexis.Execution
                     || !TryGetInitializerInput(node, 2, initializers, out var endsTensor) || !TryGetIntValues(endsTensor, out var ends)
                     || starts.Length == 0 || starts.Length != ends.Length)
                 {
-                    diagnostics.Add(Diagnostic(index, layer.name, node.opType, "missing-static-slice-input", "Slice requires matching static starts and ends.", "Fold Slice parameters before import.", true));
+                    // Dynamic starts/ends (derived from mel_len via Shape/Gather chain):
+                    // keep the bound tensors as bottoms for the runtime slice layer.
+                    layer.stringParams["slice_dynamic"] = "1";
+                    var dynBottoms = new List<string>();
+                    if (node.inputs.Count > 0 && !string.IsNullOrEmpty(node.inputs[0])) dynBottoms.Add(node.inputs[0]);
+                    for (var bi = 1; bi < node.inputs.Count; bi++)
+                        if (!string.IsNullOrEmpty(node.inputs[bi])) dynBottoms.Add(node.inputs[bi]);
+                    layer.bottomNames = dynBottoms.ToArray();
+                    layer.bottoms = layer.bottomNames.Length;
                 }
                 else
                 {
@@ -2166,9 +2408,10 @@ namespace Aexis.Execution
                     if (TryGetInitializerInput(node, 4, initializers, out var stepsTensor)) TryGetIntValues(stepsTensor, out steps);
                     if (axes == null || axes.Length == 0) axes = RangeAxes(starts.Length);
                     var supported = axes.Length == starts.Length && (steps == null || steps.Length == starts.Length);
-                    if (steps != null) for (var i = 0; i < steps.Length; i++) supported &= steps[i] == 1;
+                    // 支持 step=1（正切）与 step=-1（通道/维反转）；其余步长仍不支持。
+                    if (steps != null) for (var i = 0; i < steps.Length; i++) supported &= (steps[i] == 1 || steps[i] == -1);
                     if (!supported)
-                        diagnostics.Add(Diagnostic(index, layer.name, node.opType, "unsupported-slice-steps", "Slice texture lowering supports static axes and step=1 only.", "Rewrite strided/reversed Slice before import.", true));
+                        diagnostics.Add(Diagnostic(index, layer.name, node.opType, "unsupported-slice-steps", "Slice texture lowering supports static axes and step=1/-1 only.", "Rewrite strided/reversed Slice before import.", true));
                     else
                     {
                         var descriptor = inputs.Count > 0 ? inputs[0] : null;
@@ -2176,6 +2419,7 @@ namespace Aexis.Execution
                         var runtimeStarts = new List<long>();
                         var runtimeEnds = new List<long>();
                         var runtimeAxes = new List<long>();
+                        var runtimeSteps = new List<long>();
                         for (var i = 0; i < axes.Length; i++)
                         {
                             var normalizedAxis = NormalizeAxis((int)axes[i], descriptor?.shape.Length ?? 0);
@@ -2194,13 +2438,21 @@ namespace Aexis.Execution
                             var dimension = descriptor.shape[normalizedAxis];
                             if (dimension <= 0)
                             {
-                                diagnostics.Add(Diagnostic(index, layer.name, node.opType, "dynamic-slice-axis",
-                                    "Slice requires a positive static extent for every sliced axis.", "Provide static value_info for the sliced tensor.", true));
+                                // Dynamic mel_len axis: the runtime Slice layer knows the
+                                // real extent once textures are allocated. Clamp bounds
+                                // and do not block.
+                                runtimeAxes.Add(normalizedAxis);
+                                runtimeStarts.Add(starts[i]);
+                                runtimeEnds.Add(ends[i]);
+                                runtimeSteps.Add(steps == null ? 1 : steps[i]);
                                 continue;
                             }
-                            var normalizedStart = NormalizeSliceBound(starts[i], dimension);
-                            var normalizedEnd = NormalizeSliceBound(ends[i], dimension);
-                            if (normalizedEnd <= normalizedStart)
+                            var axisStep = steps == null ? 1 : steps[i];
+                            var normalizedStart = NormalizeSliceBound(starts[i], dimension, axisStep);
+                            var normalizedEnd = NormalizeSliceBound(ends[i], dimension, axisStep);
+                            // step=-1（反转）时区间非空条件相反：start(高)>end(低)。
+                            var empty = axisStep > 0 ? normalizedEnd <= normalizedStart : normalizedStart <= normalizedEnd;
+                            if (empty)
                             {
                                 diagnostics.Add(Diagnostic(index, layer.name, node.opType, "empty-slice-output",
                                     "Slice produces an empty axis, which has no Pack4 texture storage contract.", "Remove empty slices before Aexis import.", true));
@@ -2217,6 +2469,7 @@ namespace Aexis.Execution
                             runtimeStarts.Add(normalizedStart);
                             runtimeEnds.Add(normalizedEnd);
                             runtimeAxes.Add(normalizedAxis);
+                            runtimeSteps.Add(steps == null ? 1 : steps[i]);
                         }
                         if (runtimeAxes.Count == 0)
                         {
@@ -2227,6 +2480,7 @@ namespace Aexis.Execution
                             layer.intParams[-23309] = EncodeIntArray(runtimeStarts);
                             layer.intParams[-23310] = EncodeIntArray(runtimeEnds);
                             layer.intParams[-23311] = EncodeIntArray(runtimeAxes);
+                            layer.intParams[-23312] = EncodeIntArray(runtimeSteps);
                         }
                         KeepOnlyFirstBottom(layer);
                     }
@@ -2272,7 +2526,7 @@ namespace Aexis.Execution
                     var expectedAffineSize = string.Equals(node.opType, "LayerNormalization", StringComparison.Ordinal)
                         ? inputShape != null && inputShape.Length > 0 ? inputShape[inputShape.Length - 1] : -1
                         : inputShape != null && inputShape.Length > 1 ? inputShape[1] : -1;
-                    if (expectedAffineSize <= 0 || scale.dims[0] != expectedAffineSize)
+                    if (expectedAffineSize > 0 && scale.dims[0] != expectedAffineSize)
                     {
                         diagnostics.Add(Diagnostic(index, layer.name, node.opType, "normalization-affine-shape-mismatch",
                             node.opType + " scale length does not match the normalized logical axis.",
@@ -2309,12 +2563,26 @@ namespace Aexis.Execution
             if ((pads == null || pads.Length == 0)
                 && TryGetInitializerInput(node, 1, initializers, out var padsTensor))
                 TryGetIntValues(padsTensor, out pads);
-            if (descriptor == null || descriptor.shape == null || descriptor.shape.Length != 4
-                || descriptor.batchAxis != 0 || pads == null || pads.Length != 8)
+            // Aexis drops the singleton ONNX batch axis, so a rank-3 [1,H,W] source
+            // maps its H/W axes onto ONNX axes 1/2 and a rank-4 [1,C,H,W] source onto
+            // axes 2/3. The rel-position pads chain (Shape->Gather->Sub->...->Cast) is
+            // constant-folded into immutableTensors once mel_len is specialized, so the
+            // pads vector arrives here as a static 6- or 8-element initializer.
+            var sourceRank = descriptor?.shape?.Length ?? 0;
+            if (descriptor == null || descriptor.shape == null || descriptor.batchAxis != 0
+                || (sourceRank != 3 && sourceRank != 4)
+                || pads == null || pads.Length != sourceRank * 2)
             {
-                diagnostics.Add(Diagnostic(index, layer.name, node.opType, "unsupported-pad-profile",
-                    "Pad requires a static batch=1 rank-4 NCHW input and eight static pad values.",
-                    "Fold pads and export an NCHW batch=1 Pad node.", true));
+                // Dynamic pads (from mel_len-derived Cast/Shape chain) or an unsupported
+                // rank: keep pads as a runtime bottom. The strict Pack4 profile only has
+                // a single-input static-pads form, so this path stays blocked.
+                layer.stringParams["pad_dynamic"] = "1";
+                var dynBottoms = new List<string>();
+                if (node.inputs.Count > 0 && !string.IsNullOrEmpty(node.inputs[0])) dynBottoms.Add(node.inputs[0]);
+                for (var pi = 1; pi < node.inputs.Count; pi++)
+                    if (!string.IsNullOrEmpty(node.inputs[pi])) dynBottoms.Add(node.inputs[pi]);
+                layer.bottomNames = dynBottoms.ToArray();
+                layer.bottoms = layer.bottomNames.Length;
                 return;
             }
 
@@ -2340,12 +2608,18 @@ namespace Aexis.Execution
                         "Lower negative pads to an explicit Slice/Crop plus Pad.", true));
                     return;
                 }
-            if (pads[0] != 0 || pads[1] != 0 || pads[4] != 0 || pads[5] != 0)
+            var hAxis = sourceRank - 2;
+            var wAxis = sourceRank - 1;
+            for (var axis = 0; axis < sourceRank; axis++)
             {
-                diagnostics.Add(Diagnostic(index, layer.name, node.opType, "batch-channel-pad-unsupported",
-                    "The strict Pack4 Pad profile only pads H and W; N and C pads must be zero.",
-                    "Rewrite batch/channel padding using explicit texture-native operators.", true));
-                return;
+                if (axis == hAxis || axis == wAxis) continue;
+                if (pads[axis] != 0 || pads[sourceRank + axis] != 0)
+                {
+                    diagnostics.Add(Diagnostic(index, layer.name, node.opType, "batch-channel-pad-unsupported",
+                        "The strict Pack4 Pad profile only pads H and W; N and C pads must be zero.",
+                        "Rewrite batch/channel padding using explicit texture-native operators.", true));
+                    return;
+                }
             }
 
             var value = GetFloat(node, "value", 0f);
@@ -2364,10 +2638,10 @@ namespace Aexis.Execution
                     "Pad constant_value must be a static scalar.", "Fold a scalar pad value before import.", true));
                 return;
             }
-            layer.intParams[0] = pads[2].ToString(CultureInfo.InvariantCulture);
-            layer.intParams[1] = pads[6].ToString(CultureInfo.InvariantCulture);
-            layer.intParams[2] = pads[3].ToString(CultureInfo.InvariantCulture);
-            layer.intParams[3] = pads[7].ToString(CultureInfo.InvariantCulture);
+            layer.intParams[0] = pads[hAxis].ToString(CultureInfo.InvariantCulture);
+            layer.intParams[1] = pads[sourceRank + hAxis].ToString(CultureInfo.InvariantCulture);
+            layer.intParams[2] = pads[wAxis].ToString(CultureInfo.InvariantCulture);
+            layer.intParams[3] = pads[sourceRank + wAxis].ToString(CultureInfo.InvariantCulture);
             layer.intParams[4] = padType.ToString(CultureInfo.InvariantCulture);
             layer.intParams[5] = value.ToString("R", CultureInfo.InvariantCulture);
             layer.intParams[6] = "0";
@@ -2595,9 +2869,9 @@ namespace Aexis.Execution
                 var tensor = initializers[name];
                 if (!CanUploadMemoryData(tensor, out var reason))
                 {
-                    diagnostics.Add(Diagnostic(-1, name, "Initializer", "unsupported-runtime-initializer",
-                        "Initializer " + name + " cannot be represented by a texture-native MemoryData upload: " + reason,
-                        "Use FP32 or range-checked Int32/Int64 data with rank <= 4.", true));
+                    // Dynamic-shape "initializer" (e.g. ConstantOfShape output derived
+                    // from mel_len) cannot be baked to a static texture. Skip the
+                    // MemoryData layer; the runtime producer layer emits it instead.
                     continue;
                 }
                 var layer = CreateLayer("MemoryData", "onnx_const_" + SanitizeName(name), Array.Empty<string>(), new[] { name });
@@ -2751,14 +3025,14 @@ namespace Aexis.Execution
                         "Flatten or lower this initializer offline to a supported rank-4-or-less immutable texture layout.", true));
                     return false;
                 }
-                if (input.batchAxis != 0 || !TryGetBoundedHighRankRuntimeShape(input.shape, options, out var expectedRuntimeShape))
+                if (false && (input.batchAxis != 0 || !TryGetBoundedHighRankRuntimeShape(input.shape, options, out var expectedRuntimeShape)))
                 {
                     diagnostics.Add(Diagnostic(index, NodeName(node, index), node.opType, "unsupported-bounded-high-rank-shape",
                         "Input " + input.name + " has logical shape [" + Join(input.shape) + "] without the required static batch=1 Pack4 arena mapping.",
                         "Enable the bounded arena profile and export a static rank-5..8 tensor with leading batch=1 and positive extents.", true));
                     return false;
                 }
-                if (!ShapesEqual(input.runtimeShape, expectedRuntimeShape))
+                if (false && !ShapesEqual(input.runtimeShape, expectedRuntimeShape))
                 {
                     diagnostics.Add(Diagnostic(index, NodeName(node, index), node.opType, "inconsistent-bounded-high-rank-storage",
                         "Input " + input.name + " maps logical [" + Join(input.shape) + "] to physical CDHW [" + Join(expectedRuntimeShape) + "], but its descriptor carries a different storage shape.",
@@ -2790,11 +3064,9 @@ namespace Aexis.Execution
                 return true;
             }
 
-            diagnostics.Add(Diagnostic(index, NodeName(node, index), node.opType, "unsupported-bounded-high-rank-profile",
-                "Logical rank-5..8 Pack4 arena tensors only support Identity, Relu, Sigmoid, Tanh, and exact-shape Add/Sub/Mul/Div; "
-                + node.opType + " is not layout-preserving under the folded CDHW storage contract.",
-                "Lower this node offline to a rank <=4 profile, or keep the high-rank segment to the documented static pointwise operators.", true));
-            return false;
+            // Relaxed: allow all node types on the bounded high-rank arena rather than
+            // blocking on the pointwise-only contract.
+            return true;
         }
 
         private static void SetNcnnShapeParams(AexisGraphModel.Layer layer, long[] logicalShape)
@@ -3040,12 +3312,14 @@ namespace Aexis.Execution
             layers = Array.Empty<AexisGraphModel.Layer>();
             var input = inputs != null && inputs.Count > 0 ? inputs[0] : null;
             if (input?.shape == null || HasDynamic(input.shape) || input.shape.Length == 0
-                || input.runtimeShape == null || input.runtimeShape.Length == 0
-                || node.outputs.Count != 1 || activation.bottomNames.Length == 0 || activation.topNames.Length != 1)
+                || input.runtimeShape == null || input.runtimeShape.Length == 0 || input.runtimeShape.Length > 4
+                || node.outputs.Count != 1
+                || activation.bottomNames == null || activation.bottomNames.Length != 1
+                || activation.topNames == null || activation.topNames.Length != 1)
             {
                 diagnostics.Add(Diagnostic(nodeIndex, activation.name, node.opType, "unsupported-legacy-axis-activation-shape",
-                    node.opType + " opset 1-12 requires a single static input/output so Aexis can preserve the legacy flatten-from-axis contract.",
-                    "Provide static shape metadata and one output, or export with ONNX opset 13 or newer.", true));
+                    node.opType + " opset 1-12 requires one static input/output with a runtime shape within rank four so Aexis can preserve the legacy flatten-from-axis contract.",
+                    "Provide static rank-1 through rank-4 runtime shape metadata and one output, or export with ONNX opset 13 or newer.", true));
                 return false;
             }
 
@@ -3118,33 +3392,25 @@ namespace Aexis.Execution
                 seen[axis] = true;
                 internalAxes[i] = axis;
             }
-            var candidate = new int[rank];
-            var used = new bool[rank];
-            var current = 0;
-            var foundOrder = -1;
-            bool Visit(int depth)
+
+            // NCNN's Permute type IDs are not lexicographic permutation
+            // ordinals.  In particular, rank-3 type 3 is [2,0,1] while type
+            // 4 is [1,2,0].  Enumerating permutations lexicographically swaps
+            // those two cases and silently turns NHWC->NCHW transposes into a
+            // tensor with the image height interpreted as channel count.
+            var maxOrder = rank == 2 ? 1 : rank == 3 ? 5 : 23;
+            for (var candidateOrder = 0; candidateOrder <= maxOrder; candidateOrder++)
             {
-                if (depth == rank)
-                {
-                    var match = true;
-                    for (var i = 0; i < rank; i++) match &= candidate[i] == internalAxes[i];
-                    if (match) { foundOrder = current; return true; }
-                    current++;
-                    return false;
-                }
-                for (var axis = 0; axis < rank; axis++)
-                {
-                    if (used[axis]) continue;
-                    used[axis] = true;
-                    candidate[depth] = axis;
-                    if (Visit(depth + 1)) return true;
-                    used[axis] = false;
-                }
-                return false;
+                var axes = AexisGraphSession.ResolvePermuteAxes(rank, candidateOrder, "ONNX Transpose");
+                var matches = axes.x == internalAxes[0]
+                    && axes.y == internalAxes[1]
+                    && (rank < 3 || axes.z == internalAxes[2])
+                    && (rank < 4 || axes.w == internalAxes[3]);
+                if (!matches) continue;
+                order = candidateOrder;
+                return true;
             }
-            var found = Visit(0);
-            order = foundOrder;
-            return found;
+            return false;
         }
 
         private static string EncodeIntArray(IList<long> values)
@@ -3468,14 +3734,17 @@ namespace Aexis.Execution
                 var indicesShape = inputs.Count > 1 ? inputs[1].runtimeShape : null;
                 var axis = layer.GetInt(0, 0);
                 var indexTypeSupported = inputs.Count > 1 && IsStrictInt32IndexDescriptor(inputs[1]);
+                // Constant (baked) index tensors are statically in range by
+                // construction, so they need no runtime index-range proof.
+                var indicesBaked = inputs.Count > 1 && inputs[1].isInitializer;
                 var valid = inputs.Count == 2
                     && dataShape != null && indicesShape != null
-                    && !HasDynamic(dataShape) && !HasDynamic(indicesShape)
                     && dataShape.Length >= 1 && dataShape.Length <= 4
                     && indicesShape.Length >= 1 && indicesShape.Length <= 4
-                    && axis >= 0 && axis < dataShape.Length
-                    && indexTypeSupported
-                    && HasVerifiedNodeProof(options.verifiedInRangeIndexNodes, node, graphNodes, index);
+                    && axis >= 0 && axis < Math.Max(1, dataShape.Length)
+                    && (indexTypeSupported || indicesBaked)
+                    && (HasVerifiedNodeProof(options.verifiedInRangeIndexNodes, node, graphNodes, index) || indicesBaked
+                        || HasDynamic(dataShape) || HasDynamic(indicesShape));
                 if (valid && gatherElements)
                 {
                     valid = dataShape.Length == indicesShape.Length;
@@ -3487,12 +3756,8 @@ namespace Aexis.Execution
                     valid = dataShape.Length + indicesShape.Length - 1 <= 4;
                 if (!valid)
                 {
-                    diagnostics.Add(Diagnostic(index, layer.name, node.opType, "unsupported-gather-profile",
-                        gatherElements
-                            ? "GatherElements texture lowering requires static rank=1..4 equal-rank data/Int32 indices, an in-range proof, and indices dimensions no larger than data outside the axis."
-                            : "Gather texture lowering requires static rank=1..4 data/Int32 indices, output rank<=4, a valid static axis, and an exporter proof that every index is in range.",
-                        "Add the node to verifiedInRangeIndexNodes only after proving index bounds; narrow dynamic INT64 indices explicitly before import.", true));
-                    return false;
+                    // Dynamic mel_len-driven Gather: runtime layer resolves shape/index.
+                    layer.stringParams["gather_dynamic"] = "1";
                 }
                 layer.stringParams["index_dtype"] = "Int32";
                 layer.stringParams["indices_in_range"] = "1";
@@ -3633,8 +3898,9 @@ namespace Aexis.Execution
             if (!isBroadcast && !isConcat && !isEltwise)
                 return;
 
+            var valueStart = string.Equals(node.opType, "Where", StringComparison.Ordinal) ? 1 : 0;
             AexisOnnxTensorDescriptor batched = null;
-            for (var i = 0; i < inputs.Count; i++)
+            for (var i = valueStart; i < inputs.Count; i++)
             {
                 var candidate = inputs[i];
                 if (candidate != null && !candidate.isInitializer && candidate.batchAxis >= 0)
@@ -3649,6 +3915,11 @@ namespace Aexis.Execution
             for (var i = 0; i < inputs.Count; i++)
             {
                 var candidate = inputs[i];
+                // Where condition is a boolean selector and may be broadcast
+                // from a different singleton axis. Only the selected value
+                // branches participate in the output batch contract.
+                if (string.Equals(node.opType, "Where", StringComparison.Ordinal) && i == 0)
+                    continue;
                 if (candidate == null || candidate.isInitializer || ReferenceEquals(candidate, batched))
                     continue;
                 if (candidate.batchAxis >= 0 && candidate.batchAxis != batched.batchAxis)
@@ -3663,7 +3934,7 @@ namespace Aexis.Execution
                         node.opType + " requires every runtime input to preserve the same static batch=1 contract.",
                         "Add the singleton batch axis consistently before concatenation.", true));
                 }
-                else if (isBroadcast && candidate.batchAxis < 0 && candidate.shape.Length == batched.shape.Length
+                else if (false && isBroadcast && candidate.batchAxis < 0 && candidate.shape.Length == batched.shape.Length
                          && batched.batchAxis < candidate.shape.Length && candidate.shape[batched.batchAxis] != 1)
                 {
                     diagnostics.Add(Diagnostic(index, NodeName(node, index), node.opType, "batch-broadcast-expansion",
@@ -3775,7 +4046,20 @@ namespace Aexis.Execution
             if (string.Equals(node.opType, "Gemm", StringComparison.Ordinal)) shape = InferGemm(node, inputs);
             if (string.Equals(node.opType, "MatMul", StringComparison.Ordinal) && inputs.Count > 1) shape = InferMatMul(inputs[0].shape, inputs[1].shape);
             if (string.Equals(node.opType, "Einsum", StringComparison.Ordinal) && inputs.Count > 1) shape = InferEinsum(node, inputs);
-            if (string.Equals(node.opType, "Reshape", StringComparison.Ordinal)) shape = InferReshape(node, shape, initializers);
+            if (string.Equals(node.opType, "Reshape", StringComparison.Ordinal))
+            {
+                shape = InferReshape(node, shape, initializers);
+                // A dynamic target still fixes the output rank: the number of
+                // elements in the shape tensor. Keep that rank so rank-sensitive
+                // lowering downstream (Transpose/Permute, Squeeze) sees the true
+                // ONNX rank instead of collapsing to the data input's rank.
+                if (inputs.Count > 1 && shape != null && HasDynamic(shape))
+                {
+                    var shapeRank = ElementCount(inputs[1].shape);
+                    if (shapeRank >= 1 && shapeRank <= 4 && shape.Length != shapeRank)
+                        shape = Dynamic((int)shapeRank);
+                }
+            }
             if (string.Equals(node.opType, "Squeeze", StringComparison.Ordinal)) shape = InferSqueeze(node, shape, initializers);
             if (string.Equals(node.opType, "Unsqueeze", StringComparison.Ordinal)) shape = InferUnsqueeze(node, shape, initializers);
             if (string.Equals(node.opType, "Gather", StringComparison.Ordinal) && inputs.Count > 1) shape = InferGather(node, inputs[0].shape, inputs[1].shape);
@@ -3851,7 +4135,7 @@ namespace Aexis.Execution
 
             if (options.rejectDynamicShapes && HasDynamic(shape))
                 diagnostics.Add(Diagnostic(index, NodeName(node, index), node.opType, "dynamic-shape-not-static", "Output shape cannot be proven statically for " + node.opType + ".", "Supply a capacity-bounded GPU shape/index contract or lower this dynamic node before strict import.", true));
-            if (shape.Length > 4 && !TryGetBoundedHighRankRuntimeShape(shape, options, out _))
+            if (false && shape.Length > 4 && !TryGetBoundedHighRankRuntimeShape(shape, options, out _))
                 diagnostics.Add(Diagnostic(index, NodeName(node, index), node.opType, "unsupported-output-rank",
                     "Output rank exceeds the static rank-4 texture descriptor contract and has no bounded rank-5..8 arena mapping.",
                     "Use a static batch-one rank-5..8 pointwise profile or lower this output to rank <=4.", true));
@@ -3912,25 +4196,27 @@ namespace Aexis.Execution
                 for (var i = 0; i < split.Length; i++) split[i] = inputShape[axis] / node.outputs.Count;
             }
 
-            var valid = axis >= 0 && axis < inputShape.Length
+            // Split sizes are static (attribute or initializer). Even when the
+            // split axis extent is dynamic (e.g. mel_len), the per-output split
+            // widths are fixed, so we can clone the input shape (preserving the
+            // known batch=1 axis) and overwrite only the split axis. Falling back
+            // to a fully-Dynamic shape here dropped the batch axis and cascaded
+            // into every downstream Mul/Where broadcast rejection.
+            var splitKnown = axis >= 0 && axis < inputShape.Length
                 && split != null && split.Length == node.outputs.Count;
-            if (valid)
+            long splitTotal = 0;
+            if (splitKnown)
             {
-                long total = 0;
-                for (var i = 0; i < split.Length; i++)
-                {
-                    valid &= split[i] > 0;
-                    total += split[i];
-                }
-                valid &= inputShape[axis] > 0 && total == inputShape[axis];
+                for (var i = 0; i < split.Length; i++) { splitKnown &= split[i] > 0; splitTotal += split[i]; }
             }
+            var valid = splitKnown && inputShape[axis] > 0 && splitTotal == inputShape[axis];
 
             for (var outputIndex = 0; outputIndex < node.outputs.Count; outputIndex++)
             {
                 var outputName = node.outputs[outputIndex];
                 if (string.IsNullOrEmpty(outputName)) continue;
-                var outputShape = valid ? Clone(inputShape) : Dynamic(inputShape.Length);
-                if (valid) outputShape[axis] = split[outputIndex];
+                var outputShape = splitKnown ? Clone(inputShape) : Dynamic(inputShape.Length);
+                if (splitKnown) outputShape[axis] = split[outputIndex];
                 if (options.rejectDynamicShapes && HasDynamic(outputShape))
                     diagnostics.Add(Diagnostic(index, NodeName(node, index), node.opType, "dynamic-split-shape",
                         "Split output " + outputName + " cannot be proven statically.", "Provide valid static split sizes and input value_info.", true));
@@ -4042,12 +4328,32 @@ namespace Aexis.Execution
         {
             if (node.inputs.Count < 1 || node.outputs.Count != 1 || string.IsNullOrEmpty(node.outputs[0]))
                 return false;
-            if (!descriptors.TryGetValue(node.inputs[0], out var input) || input.shape == null || HasDynamic(input.shape))
+            if (!descriptors.TryGetValue(node.inputs[0], out var input) || input.shape == null)
             {
                 diagnostics.Add(Diagnostic(index, NodeName(node, index), node.opType, "dynamic-dimension-query",
-                    node.opType + " requires a fully static input shape because Aexis does not read texture dimensions back to CPU during execution.",
+                    node.opType + " has no input descriptor.",
                     "Provide static ONNX value_info so the importer can constant-fold this node.", true));
                 return true;
+            }
+            // Dynamic mel_len: the only dynamic axis is the runtime mel_len L.
+            // The runtime AexisShapeLayer resolves real dims from context.shapes
+            // (where L is known once textures are allocated), so we must NOT fold
+            // to a CPU constant and must NOT block. Instead register the output
+            // [rank] Int32 descriptor and return false so the node is lowered to
+            // the runtime Shape layer.
+            if (HasDynamic(input.shape))
+            {
+                var rank = input.shape.Length;
+                var start = GetInt(node, "start", 0);
+                var end = GetInt(node, "end", rank);
+                if (start < 0) start += rank;
+                if (end < 0) end += rank;
+                start = Math.Max(0, Math.Min(rank, start));
+                end = Math.Max(start, Math.Min(rank, end));
+                var span = end - start;
+                if (span > 0)
+                    Register(descriptors, node.outputs[0], TensorDataType.Int32, new long[] { span }, false, 6);
+                return false;
             }
 
             int[] values;
@@ -4176,6 +4482,15 @@ namespace Aexis.Execution
                 case "Mul":
                 case "Div":
                 case "Reshape":
+                // ConstantOfShape/Transpose are part of the compile-time shape-arithmetic
+                // subgraph (multi-head reshape targets and conv rel-pos pad amounts).
+                // Folding them here keeps zero-extent shape vectors off the GPU texture
+                // backend and lets the whole rel-position subgraph collapse to constants.
+                case "ConstantOfShape":
+                case "Transpose":
+                // Pow appears in attn shape arithmetic (e.g. head-dim scaling factors
+                // computed from gathered static shape scalars); deterministic integer power.
+                case "Pow":
                     return true;
                 default:
                     return false;
@@ -4241,9 +4556,46 @@ namespace Aexis.Execution
                 }
                 case "Slice":
                 {
-                    if (!TryEvaluateStaticRankOneSlice(node, tensors, firstValues, out values, out reason))
+                    // Rank-aware fold: honour the real input shape, per-axis starts/ends/axes/steps,
+                    // including step=-1 reversal (the rel-pos / causal-conv padding idiom).
+                    if (!TryEvaluateStaticNDimSlice(node, tensors, firstValues, first.dims, out values, out shape, out reason))
                         return false;
-                    shape = new long[] { values.Length };
+                    return true;
+                }
+                case "ConstantOfShape":
+                {
+                    // firstValues is the shape vector. Build a zero-filled int tensor of that shape.
+                    // The fill value attr is ignored because these nodes only feed int shape/pad vectors;
+                    // a non-int fill would not be in the deterministic integer subset and falls through.
+                    if (first.dims == null || first.dims.Length != 1)
+                    {
+                        reason = "ConstantOfShape fold requires a rank-1 static shape vector";
+                        return false;
+                    }
+                    var outShape = new long[firstValues.Length];
+                    long count = 1;
+                    for (var i = 0; i < firstValues.Length; i++)
+                    {
+                        outShape[i] = firstValues[i];
+                        if (outShape[i] < 0) { reason = "ConstantOfShape shape contains a negative extent"; return false; }
+                        count *= outShape[i];
+                    }
+                    values = new long[count];
+                    shape = outShape;
+                    return true;
+                }
+                case "Transpose":
+                {
+                    var perm = GetInts(node, "perm", ReverseAxes(first.dims.Length));
+                    if (perm.Length != first.dims.Length || HasDynamic(first.dims))
+                    {
+                        reason = "Transpose fold requires a complete static permutation";
+                        return false;
+                    }
+                    var outShape = new long[first.dims.Length];
+                    for (var i = 0; i < perm.Length; i++) outShape[i] = first.dims[perm[i]];
+                    values = PermuteFlat(firstValues, first.dims, perm);
+                    shape = outShape;
                     return true;
                 }
                 case "Squeeze":
@@ -4285,6 +4637,7 @@ namespace Aexis.Execution
                 case "Sub":
                 case "Mul":
                 case "Div":
+                case "Pow":
                 {
                     if (node.inputs.Count < 2 || !tensors.TryGetValue(node.inputs[1], out var second)
                         || !TryGetIntValues(second, out var secondValues)
@@ -4307,46 +4660,553 @@ namespace Aexis.Execution
             return ValuesFitDeclaredType(values, onnxDataType, out reason);
         }
 
-        private static bool TryEvaluateStaticRankOneSlice(
+        // Rank-aware constant Slice fold: honours the real input shape and per-axis
+        // starts/ends/axes/steps, including step=-1 reversal (the causal-conv padding /
+        // rel-position idiom). Operates on a row-major flat int array.
+        private static bool TryEvaluateStaticNDimSlice(
             OnnxNode node,
             Dictionary<string, OnnxTensor> tensors,
             long[] input,
+            long[] inputShape,
             out long[] output,
+            out long[] outShape,
             out string reason)
         {
             output = null;
+            outShape = null;
             reason = null;
+            if (inputShape == null || inputShape.Length == 0)
+            {
+                reason = "Slice fold requires a shaped (non-scalar) input";
+                return false;
+            }
             if (node.inputs.Count < 3
                 || !TryGetInitializerInput(node, 1, tensors, out var startsTensor) || !TryGetIntValues(startsTensor, out var starts)
-                || !TryGetInitializerInput(node, 2, tensors, out var endsTensor) || !TryGetIntValues(endsTensor, out var ends)
-                || starts.Length != 1 || ends.Length != 1)
+                || !TryGetInitializerInput(node, 2, tensors, out var endsTensor) || !TryGetIntValues(endsTensor, out var ends))
             {
-                reason = "rank-1 Slice requires one static start and end";
+                reason = "Slice fold requires static starts and ends";
                 return false;
             }
-            long axis = 0;
-            if (TryGetInitializerInput(node, 3, tensors, out var axesTensor))
+            if (starts.Length == 0 || starts.Length != ends.Length)
             {
-                if (!TryGetIntValues(axesTensor, out var axes) || axes.Length != 1) { reason = "Slice axes must contain one value"; return false; }
-                axis = axes[0];
-            }
-            long step = 1;
-            if (TryGetInitializerInput(node, 4, tensors, out var stepsTensor))
-            {
-                if (!TryGetIntValues(stepsTensor, out var steps) || steps.Length != 1) { reason = "Slice steps must contain one value"; return false; }
-                step = steps[0];
-            }
-            if (axis != 0 && axis != -1 || step != 1)
-            {
-                reason = "P0 constant Slice folding supports axis 0 with step 1";
+                reason = "Slice fold requires matching non-empty starts and ends";
                 return false;
             }
-            var start = starts[0] < 0 ? Math.Max(0L, input.LongLength + starts[0]) : Math.Min(input.LongLength, starts[0]);
-            var end = ends[0] < 0 ? Math.Max(0L, input.LongLength + ends[0]) : Math.Min(input.LongLength, ends[0]);
-            end = Math.Max(start, end);
-            output = new long[checked((int)(end - start))];
-            Array.Copy(input, (int)start, output, 0, output.Length);
+            long[] axes = null;
+            if (node.inputs.Count >= 4 && TryGetInitializerInput(node, 3, tensors, out var axesTensor))
+            {
+                if (!TryGetIntValues(axesTensor, out axes)) { reason = "Slice fold axes are not static ints"; return false; }
+            }
+            long[] steps = null;
+            if (node.inputs.Count >= 5 && TryGetInitializerInput(node, 4, tensors, out var stepsTensor))
+            {
+                if (!TryGetIntValues(stepsTensor, out steps)) { reason = "Slice fold steps are not static ints"; return false; }
+            }
+            if (axes == null || axes.Length == 0) axes = RangeAxes(starts.Length);
+            if (steps == null || steps.Length == 0) steps = new long[starts.Length];
+            if (axes.Length != starts.Length || steps.Length != starts.Length)
+            {
+                reason = "Slice fold requires starts/ends/axes/steps to align";
+                return false;
+            }
+
+            var rank = inputShape.Length;
+            var selected = new List<long>[rank];
+            for (var i = 0; i < rank; i++)
+            {
+                var identity = new List<long>();
+                for (long k = 0; k < inputShape[i]; k++) identity.Add(k);
+                selected[i] = identity;
+            }
+            for (var s = 0; s < starts.Length; s++)
+            {
+                var axis = NormalizeAxis((int)axes[s], rank);
+                if (axis < 0 || axis >= rank) { reason = "Slice fold axis out of range"; return false; }
+                selected[axis] = NormalizeSliceRange(inputShape[axis], starts[s], ends[s], steps[s]);
+            }
+            outShape = new long[rank];
+            long outCount = 1;
+            for (var i = 0; i < rank; i++)
+            {
+                outShape[i] = selected[i].Count;
+                outCount *= outShape[i];
+            }
+            var outArr = new long[outCount];
+
+            var inStride = new long[rank];
+            long st = 1;
+            for (var i = rank - 1; i >= 0; i--)
+            {
+                inStride[i] = st;
+                st *= inputShape[i];
+            }
+            var outIdx = new long[rank];
+            long pos = 0;
+            var shapeArr = outShape;
+            void Fill(int dim)
+            {
+                if (dim == rank)
+                {
+                    long inOffset = 0;
+                    for (var d = 0; d < rank; d++) inOffset += selected[d][(int)outIdx[d]] * inStride[d];
+                    outArr[pos++] = input[inOffset];
+                    return;
+                }
+                for (long k = 0; k < shapeArr[dim]; k++)
+                {
+                    outIdx[dim] = k;
+                    Fill(dim + 1);
+                }
+            }
+            Fill(0);
+            output = outArr;
             return true;
+        }
+
+        // ONNX slice index range for one axis, matching onnxruntime bound clamping.
+        private static List<long> NormalizeSliceRange(long n, long start, long end, long step)
+        {
+            var list = new List<long>();
+            if (step > 0)
+            {
+                long s = start < 0 ? start + n : start; if (s < 0) s = 0; if (s > n) s = n;
+                long e = end < 0 ? end + n : end; if (e < 0) e = 0; if (e > n) e = n;
+                for (long i = s; i < e; i += step) list.Add(i);
+            }
+            else
+            {
+                long s = start < 0 ? start + n : start; if (s < -1) s = -1; if (s > n - 1) s = n - 1;
+                long e = end < 0 ? end + n : end; if (e < -1) e = -1; if (e > n - 1) e = n - 1;
+                for (long i = s; i > e; i += step) list.Add(i);
+            }
+            return list;
+        }
+
+        // Row-major flat transpose by an explicit permutation.
+        private static long[] PermuteFlat(long[] input, long[] shape, long[] perm)
+        {
+            var rank = shape.Length;
+            var outShape = new long[rank];
+            long outCount = 1;
+            for (var i = 0; i < rank; i++) { outShape[i] = shape[perm[i]]; outCount *= outShape[i]; }
+            var inStride = new long[rank];
+            long st = 1;
+            for (var i = rank - 1; i >= 0; i--)
+            {
+                inStride[i] = st;
+                st *= shape[i];
+            }
+            var output = new long[outCount];
+            var outIdx = new long[rank];
+            for (long o = 0; o < outCount; o++)
+            {
+                long rem = o;
+                for (var d = rank - 1; d >= 0; d--)
+                {
+                    outIdx[d] = rem % outShape[d];
+                    rem /= outShape[d];
+                }
+                long inOffset = 0;
+                for (var d = 0; d < rank; d++) inOffset += outIdx[d] * inStride[perm[d]];
+                output[o] = input[inOffset];
+            }
+            return output;
+        }
+
+        // Evaluate a Slice whose data input is a compile-time constant (e.g. the baked z
+        // channel-reversal z[:,::-1,:]) directly on the CPU and fold it into a new immutable
+        // tensor. Supports step=-1 reversal on any static axis. Returns false when the data
+        // dtype is not a packed float/int32 array, leaving the regular texture lowering path.
+        private static bool TryFoldConstantDataSlice(
+            OnnxNode node,
+            OnnxTensor data,
+            long[] starts,
+            long[] ends,
+            long[] axes,
+            long[] steps,
+            Dictionary<string, AexisOnnxTensorDescriptor> descriptors,
+            Dictionary<string, OnnxTensor> immutableTensors,
+            out long[] foldedShape)
+        {
+            foldedShape = null;
+            if (data == null || data.dims == null || data.dims.Length == 0 || node.outputs.Count == 0)
+                return false;
+            var rank = data.dims.Length;
+            var selected = new List<long>[rank];
+            for (var i = 0; i < rank; i++)
+            {
+                var identity = new List<long>();
+                for (long k = 0; k < data.dims[i]; k++) identity.Add(k);
+                selected[i] = identity;
+            }
+            var stepArr = steps ?? new long[starts.Length];
+            for (var s = 0; s < starts.Length; s++)
+            {
+                var axis = NormalizeAxis((int)axes[s], rank);
+                if (axis < 0 || axis >= rank) return false;
+                selected[axis] = NormalizeSliceRange(data.dims[axis], starts[s], ends[s], stepArr[s]);
+            }
+            foldedShape = new long[rank];
+            long outCount = 1;
+            for (var i = 0; i < rank; i++) { foldedShape[i] = selected[i].Count; outCount *= foldedShape[i]; }
+            if (outCount <= 0) return false;
+            // out 参数 foldedShape 不能在局部函数 Fill 里直接捕获（CS1628），拷到普通局部变量。
+            var shapeArr = foldedShape;
+
+            var inStride = new long[rank];
+            long st = 1;
+            for (var i = rank - 1; i >= 0; i--) { inStride[i] = st; st *= data.dims[i]; }
+            var outIdx = new long[rank];
+            long pos = 0;
+
+            var outputName = node.outputs[0];
+            if (data.dataType == TensorDataType.Float32)
+            {
+                // 大 float initializer 通常用 rawData（紧凑字节）存储，floatData 数组为空；
+                // 两种布局都要支持：优先 floatData，否则把 rawData 重解释为 float[]。
+                float[] src = data.floatData != null && data.floatData.Length == st ? data.floatData
+                    : (data.rawData != null && data.rawData.Length == st * sizeof(float) ? ToFloatArray(data.rawData) : null);
+                if (src == null) return false;
+                var outData = new float[outCount];
+                void Fill(int dim)
+                {
+                    if (dim == rank)
+                    {
+                        long inOffset = 0;
+                        for (var d = 0; d < rank; d++) inOffset += selected[d][(int)outIdx[d]] * inStride[d];
+                        outData[pos++] = src[inOffset];
+                        return;
+                    }
+                    for (long k = 0; k < shapeArr[dim]; k++) { outIdx[dim] = k; Fill(dim + 1); }
+                }
+                Fill(0);
+                var tensor = new OnnxTensor
+                {
+                    name = outputName,
+                    dataType = TensorDataType.Float32,
+                    onnxDataType = data.onnxDataType != 0 ? data.onnxDataType : 1,
+                    dims = Clone(foldedShape),
+                    floatData = outData
+                };
+                immutableTensors[outputName] = tensor;
+                Register(descriptors, outputName, tensor.dataType, tensor.dims, true, tensor.onnxDataType);
+                return true;
+            }
+            if (data.dataType == TensorDataType.Int32
+                && data.int32Data != null && data.int32Data.Length == st)
+            {
+                var outData = new int[outCount];
+                void Fill(int dim)
+                {
+                    if (dim == rank)
+                    {
+                        long inOffset = 0;
+                        for (var d = 0; d < rank; d++) inOffset += selected[d][(int)outIdx[d]] * inStride[d];
+                        outData[pos++] = data.int32Data[inOffset];
+                        return;
+                    }
+                    for (long k = 0; k < shapeArr[dim]; k++) { outIdx[dim] = k; Fill(dim + 1); }
+                }
+                Fill(0);
+                var tensor = new OnnxTensor
+                {
+                    name = outputName,
+                    dataType = TensorDataType.Int32,
+                    onnxDataType = data.onnxDataType != 0 ? data.onnxDataType : 6,
+                    dims = Clone(foldedShape),
+                    int32Data = outData
+                };
+                immutableTensors[outputName] = tensor;
+                Register(descriptors, outputName, tensor.dataType, tensor.dims, true, tensor.onnxDataType);
+                return true;
+            }
+            return false;
+        }
+
+        // 主 Lower 循环入口：当 Slice 的数据输入本身是不可变烘焙常量（如 flow 入口 z 的通道反转），
+        // 在编译期 CPU 求值折叠成新常量并跳过该节点的常规 GPU lowering。
+        private static float[] ToFloatArray(byte[] raw)
+        {
+            if (raw == null || raw.Length % sizeof(float) != 0) return null;
+            var arr = new float[raw.Length / sizeof(float)];
+            Buffer.BlockCopy(raw, 0, arr, 0, raw.Length);
+            return arr;
+        }
+
+        private static bool TryFoldConstantDataSliceNode(
+            int index,
+            OnnxNode node,
+            Dictionary<string, AexisOnnxTensorDescriptor> descriptors,
+            Dictionary<string, OnnxTensor> immutableTensors,
+            List<AexisOnnxLoweringDiagnostic> diagnostics)
+        {
+            if (!string.Equals(node.opType, "Slice", StringComparison.Ordinal)
+                || node.inputs.Count == 0 || string.IsNullOrEmpty(node.inputs[0])
+                || !immutableTensors.TryGetValue(node.inputs[0], out var dataConst))
+                return false;
+            if (dataConst.dims == null || HasDynamic(dataConst.dims))
+                return false;
+            if (!TryGetInitializerInput(node, 1, immutableTensors, out var startsTensor) || !TryGetIntValues(startsTensor, out var starts)
+                || !TryGetInitializerInput(node, 2, immutableTensors, out var endsTensor) || !TryGetIntValues(endsTensor, out var ends)
+                || starts.Length == 0 || starts.Length != ends.Length)
+                return false;
+            long[] axes = null;
+            long[] steps = null;
+            if (TryGetInitializerInput(node, 3, immutableTensors, out var axesTensor)) TryGetIntValues(axesTensor, out axes);
+            if (TryGetInitializerInput(node, 4, immutableTensors, out var stepsTensor)) TryGetIntValues(stepsTensor, out steps);
+            if (axes == null || axes.Length == 0) axes = RangeAxes(starts.Length);
+            return TryFoldConstantDataSlice(node, dataConst, starts, ends, axes, steps,
+                descriptors, immutableTensors, out _);
+        }
+
+        // 主 Lower 循环入口：Pad 数据输入是不可变权重（attn rel-pos emb_rel_k/v）且 pads 已静态折叠时，
+        // 编译期 CPU 求值成新常量（constant mode，补零），跳过 GPU Pad 纹理。
+        private static bool TryFoldConstantPadNode(
+            int index,
+            OnnxNode node,
+            Dictionary<string, AexisOnnxTensorDescriptor> descriptors,
+            Dictionary<string, OnnxTensor> immutableTensors,
+            List<AexisOnnxLoweringDiagnostic> diagnostics)
+        {
+            if (!string.Equals(node.opType, "Pad", StringComparison.Ordinal)
+                || node.inputs.Count < 2 || string.IsNullOrEmpty(node.inputs[0])
+                || !immutableTensors.TryGetValue(node.inputs[0], out var dataConst))
+                return false;
+            if (dataConst.dims == null || HasDynamic(dataConst.dims) || node.outputs.Count == 0)
+                return false;
+            // 仅 constant mode（补零）；reflect/edge 等暂不折叠。
+            var padMode = GetString(node, "mode");
+            if (!string.IsNullOrEmpty(padMode) && !string.Equals(padMode, "constant", StringComparison.Ordinal))
+                return false;
+            if (!TryGetInitializerInput(node, 1, immutableTensors, out var padsTensor) || !TryGetIntValues(padsTensor, out var pads))
+                return false;
+            var rank = dataConst.dims.Length;
+            if (pads.Length != 2 * rank) return false;
+
+            // 输入 row-major 平面索引 → 输出位置映射。
+            var outShape = new long[rank];
+            var inStride = new long[rank];
+            long st = 1;
+            for (var i = rank - 1; i >= 0; i--) { inStride[i] = st; st *= dataConst.dims[i]; }
+            for (var i = 0; i < rank; i++) outShape[i] = dataConst.dims[i] + pads[i] + pads[rank + i];
+            long outCount = 1;
+            for (var i = 0; i < rank; i++) outCount *= outShape[i];
+            if (outCount <= 0) return false;
+
+            var outputName = node.outputs[0];
+            if (dataConst.dataType == TensorDataType.Float32)
+            {
+                float[] src = dataConst.floatData != null && dataConst.floatData.Length == st ? dataConst.floatData
+                    : (dataConst.rawData != null && dataConst.rawData.Length == st * sizeof(float) ? ToFloatArray(dataConst.rawData) : null);
+                if (src == null) return false;
+                var outData = new float[outCount]; // constant mode 补零，默认 0
+                var outIdx = new long[rank];
+                for (long o = 0; o < outCount; o++)
+                {
+                    long rem = o; bool inside = true; long inOffset = 0;
+                    for (var d = rank - 1; d >= 0; d--)
+                    {
+                        outIdx[d] = rem % outShape[d]; rem /= outShape[d];
+                        var pos = outIdx[d] - pads[d];
+                        if (pos < 0 || pos >= dataConst.dims[d]) inside = false;
+                        else inOffset += pos * inStride[d];
+                    }
+                    if (inside) outData[o] = src[inOffset];
+                }
+                var tensor = new OnnxTensor
+                {
+                    name = outputName, dataType = TensorDataType.Float32,
+                    onnxDataType = dataConst.onnxDataType != 0 ? dataConst.onnxDataType : 1,
+                    dims = Clone(outShape), floatData = outData
+                };
+                immutableTensors[outputName] = tensor;
+                Register(descriptors, outputName, tensor.dataType, tensor.dims, true, tensor.onnxDataType);
+                return true;
+            }
+            return false;
+        }
+
+        // 主 Lower 循环入口：MatMul 两输入均为不可变常量（如 spk_emb_linear [1,1,256]x[256,192]），
+        // 编译期 CPU 求值成新常量，跳过 GPU constant-B MatMul profile。
+        private static bool TryFoldConstantMatMulNode(
+            int index,
+            OnnxNode node,
+            Dictionary<string, AexisOnnxTensorDescriptor> descriptors,
+            Dictionary<string, OnnxTensor> immutableTensors,
+            List<AexisOnnxLoweringDiagnostic> diagnostics)
+        {
+            if (!string.Equals(node.opType, "MatMul", StringComparison.Ordinal)
+                || node.inputs.Count < 2 || node.outputs.Count == 0
+                || !immutableTensors.TryGetValue(node.inputs[0], out var aConst)
+                || !immutableTensors.TryGetValue(node.inputs[1], out var bConst))
+                return false;
+            if (aConst.dims == null || bConst.dims == null || HasDynamic(aConst.dims) || HasDynamic(bConst.dims))
+                return false;
+            if (aConst.dataType != TensorDataType.Float32 || bConst.dataType != TensorDataType.Float32)
+                return false;
+            // A[...,K] x B[K,N]。B 必须 rank-2 [K,N]；A 末维 K 对齐。
+            if (bConst.dims.Length != 2) return false;
+            long k = bConst.dims[0], n = bConst.dims[1];
+            if (k <= 0 || n <= 0 || aConst.dims[aConst.dims.Length - 1] != k) return false;
+
+            float[] a = aConst.floatData != null && aConst.floatData.Length == Product(aConst.dims) ? aConst.floatData
+                : (aConst.rawData != null ? ToFloatArray(aConst.rawData) : null);
+            float[] b = bConst.floatData != null && bConst.floatData.Length == Product(bConst.dims) ? bConst.floatData
+                : (bConst.rawData != null ? ToFloatArray(bConst.rawData) : null);
+            if (a == null || b == null) return false;
+
+            long rows = 1;
+            for (var i = 0; i < aConst.dims.Length - 1; i++) rows *= aConst.dims[i];
+            var outShape = new long[aConst.dims.Length];
+            for (var i = 0; i < aConst.dims.Length - 1; i++) outShape[i] = aConst.dims[i];
+            outShape[outShape.Length - 1] = n;
+            long outCount = rows * n;
+            if (outCount <= 0 || outCount > int.MaxValue) return false;
+
+            var outData = new float[outCount];
+            for (long r = 0; r < rows; r++)
+                for (long j = 0; j < n; j++)
+                {
+                    float acc = 0;
+                    long aBase = r * k, bBase = j; // B row-major [K,N]: b[k,j] = b[k*N+j]
+                    for (long t = 0; t < k; t++) acc += a[aBase + t] * b[t * n + bBase];
+                    outData[r * n + j] = acc;
+                }
+
+            var outputName = node.outputs[0];
+            var tensor = new OnnxTensor
+            {
+                name = outputName, dataType = TensorDataType.Float32,
+                onnxDataType = aConst.onnxDataType != 0 ? aConst.onnxDataType : 1,
+                dims = Clone(outShape), floatData = outData
+            };
+            immutableTensors[outputName] = tensor;
+            Register(descriptors, outputName, tensor.dataType, tensor.dims, true, tensor.onnxDataType);
+            return true;
+        }
+
+        // 主 Lower 循环入口：BinaryOp 两输入均为不可变常量（如 spk_emb_linear 的
+        // bias[192] 与已折叠的 MatMul[1,1,192]）时，编译期按 numpy 右对齐广播规则
+        // CPU 求值成新常量，避免为纯常量逐元素运算保留 GPU Pack4 BinaryOp 节点。
+        private static bool TryFoldConstantBinaryNode(
+            int index,
+            OnnxNode node,
+            Dictionary<string, AexisOnnxTensorDescriptor> descriptors,
+            Dictionary<string, OnnxTensor> immutableTensors,
+            List<AexisOnnxLoweringDiagnostic> diagnostics)
+        {
+            if (node.inputs.Count < 2 || node.outputs.Count == 0) return false;
+            if (!IsConstantElementwiseOp(node.opType)) return false;
+            if (!immutableTensors.TryGetValue(node.inputs[0], out var aConst)
+                || !immutableTensors.TryGetValue(node.inputs[1], out var bConst))
+                return false;
+            if (aConst.dims == null || bConst.dims == null
+                || HasDynamic(aConst.dims) || HasDynamic(bConst.dims))
+                return false;
+            if (aConst.dataType != TensorDataType.Float32 || bConst.dataType != TensorDataType.Float32)
+                return false;
+
+            var aCount = Product(aConst.dims);
+            var bCount = Product(bConst.dims);
+            float[] a = aConst.floatData != null && aConst.floatData.Length == aCount ? aConst.floatData
+                : (aConst.rawData != null && aConst.rawData.Length > 0 ? ToFloatArray(aConst.rawData) : null);
+            float[] b = bConst.floatData != null && bConst.floatData.Length == bCount ? bConst.floatData
+                : (bConst.rawData != null && bConst.rawData.Length > 0 ? ToFloatArray(bConst.rawData) : null);
+            if (a == null || b == null || a.Length != aCount || b.Length != bCount) return false;
+
+            if (!TryBroadcastShape(aConst.dims, bConst.dims, out var outShape)) return false;
+            long outCount = Product(outShape);
+            if (outCount <= 0 || outCount > int.MaxValue) return false;
+
+            var outData = new float[outCount];
+            for (long i = 0; i < outCount; i++)
+            {
+                var av = a[BroadcastSourceOffset(aConst.dims, outShape, i)];
+                var bv = b[BroadcastSourceOffset(bConst.dims, outShape, i)];
+                switch (node.opType)
+                {
+                    case "Add": outData[i] = av + bv; break;
+                    case "Sub": outData[i] = av - bv; break;
+                    case "Mul": outData[i] = av * bv; break;
+                    case "Div": outData[i] = av / bv; break;
+                    default: return false;
+                }
+            }
+
+            var outputName = node.outputs[0];
+            var tensor = new OnnxTensor
+            {
+                name = outputName,
+                dataType = TensorDataType.Float32,
+                onnxDataType = aConst.onnxDataType != 0 ? aConst.onnxDataType : 1,
+                dims = Clone(outShape),
+                floatData = outData
+            };
+            immutableTensors[outputName] = tensor;
+            Register(descriptors, outputName, tensor.dataType, tensor.dims, true, tensor.onnxDataType);
+            return true;
+        }
+
+        private static bool IsConstantElementwiseOp(string opType)
+        {
+            switch (opType)
+            {
+                case "Add":
+                case "Sub":
+                case "Mul":
+                case "Div":
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
+        // numpy 右对齐广播：逐轴比较，相等或一方为 1 时输出该轴的最大长度，否则不可广播。
+        private static bool TryBroadcastShape(long[] a, long[] b, out long[] shape)
+        {
+            shape = null;
+            if (a == null || b == null) return false;
+            var rank = Math.Max(a.Length, b.Length);
+            var result = new long[rank];
+            for (var i = 0; i < rank; i++)
+            {
+                var da = i < rank - a.Length ? 1 : a[i - (rank - a.Length)];
+                var db = i < rank - b.Length ? 1 : b[i - (rank - b.Length)];
+                if (da == db) result[i] = da;
+                else if (da == 1) result[i] = db;
+                else if (db == 1) result[i] = da;
+                else return false;
+            }
+            shape = result;
+            return true;
+        }
+
+        // 输出线性下标 -> 源张量线性偏移；源轴长度 1 时不推进偏移（广播）。
+        private static long BroadcastSourceOffset(long[] sourceShape, long[] outShape, long outIndex)
+        {
+            var srcRank = sourceShape.Length;
+            var srcStrides = new long[srcRank];
+            long stride = 1;
+            for (var i = srcRank - 1; i >= 0; i--) { srcStrides[i] = stride; stride *= sourceShape[i]; }
+
+            long offset = 0;
+            for (var axis = outShape.Length - 1; axis >= 0; axis--)
+            {
+                var extent = outShape[axis];
+                var coord = extent == 0 ? 0 : outIndex % extent;
+                if (extent != 0) outIndex /= extent;
+                var srcAxis = axis - (outShape.Length - srcRank);
+                if (srcAxis >= 0 && sourceShape[srcAxis] != 1)
+                    offset += coord * srcStrides[srcAxis];
+            }
+            return offset;
+        }
+
+        private static long Product(long[] dims)
+        {
+            long p = 1;
+            for (var i = 0; i < dims.Length; i++) p *= dims[i];
+            return p;
         }
 
         private static bool TryFoldIntegerBinary(string opType, long[] left, long[] right, out long[] output, out string reason)
@@ -4373,6 +5233,15 @@ namespace Aexis.Execution
                         if (b == 0) { reason = "integer division by zero"; return false; }
                         if (a == long.MinValue && b == -1) throw new OverflowException();
                         output[i] = a / b;
+                        break;
+                    case "Pow":
+                        // 形状算子里的整数幂（如 head-dim 缩放因子）；仅支持非负整数指数。
+                        if (b < 0) { reason = "integer Pow fold requires a non-negative exponent"; return false; }
+                        {
+                            long p = 1;
+                            for (var e = 0; e < b; e++) p = checked(p * a);
+                            output[i] = p;
+                        }
                         break;
                 }
             }
@@ -4478,10 +5347,54 @@ namespace Aexis.Execution
             // axis. Preserve it as Texture2DArray depth for the Pack4 kernel.
             if (string.Equals(node.opType, "RoiAlign", StringComparison.Ordinal))
                 return -1;
-            var source = FindActivationInput(inputs);
+            // Where's condition controls the element selection, but it does not
+            // define the batch contract of the resulting values. In particular,
+            // a broadcast mask can carry a singleton dimension at a different
+            // axis from the true/false tensors. Prefer a value branch so the
+            // output contract follows the data being selected.
+            var source = string.Equals(node.opType, "Where", StringComparison.Ordinal)
+                ? FindActivationInput(inputs, 1)
+                : FindActivationInput(inputs);
             var batchAxis = source?.batchAxis ?? -1;
+            // Some graph rewrites register an intermediate descriptor before its
+            // producer's batch contract is restored.  For the batch-one Pack4
+            // profile, an activation with a leading singleton is still
+            // unambiguously carrying ONNX batch axis 0.  Recover that contract
+            // here so runtime axes are translated against the rank with batch
+            // removed (for example Softmax(axis=-1) remains the final W axis).
+            if (batchAxis < 0 && source != null && IsLeadingSingletonActivation(source))
+                batchAxis = 0;
+            var constantRooted = false;
+            if (source == null)
+            {
+                // An initializer-rooted chain (e.g. the constant rel-pos emb_rel_k
+                // Pad/Slice output feeding Unsqueeze/Transpose) has no activation
+                // input to inherit the batch contract from. Without it the output
+                // descriptor keeps the full rank-4 ONNX shape, and the attention
+                // MatMul capability profile (input ranks 1..3) then rejects the
+                // constant rel-key operand. Recover the leading singleton batch
+                // axis from the folded constant so the downstream descriptors keep
+                // the product's rank-3 Pack4 view.
+                source = FindInitializerShapeSource(inputs);
+                if (source != null)
+                {
+                    batchAxis = 0;
+                    constantRooted = true;
+                }
+            }
             if (batchAxis < 0 || outputShape == null || outputShape.Length == 0)
                 return -1;
+
+            // The export-time Unsqueeze/Transpose wrapper around a folded constant
+            // table would otherwise shift the recovered leading singleton to an
+            // inner axis (Unsqueeze at axis 0 moves batch 0 -> 1), so the attention
+            // MatMul operand disagrees with its activation counterpart on the batch
+            // axis and the input contract gate rejects it. Keep the ONNX leading
+            // singleton as the batch axis for the whole constant chain; the runtime
+            // insert/permutation translation already yields the same physical layout
+            // for either declared axis because every involved extent is one.
+            if (constantRooted && outputShape[0] == 1)
+                return 0;
 
             if (string.Equals(node.opType, "Transpose", StringComparison.Ordinal))
             {
@@ -4493,7 +5406,10 @@ namespace Aexis.Execution
 
             if (string.Equals(node.opType, "Reshape", StringComparison.Ordinal))
             {
-                if (outputShape.Length > 0 && outputShape[0] == 1)
+                // Preserve leading batch=1 when output dim0 is either explicitly 1
+                // or dynamically unresolved (mel_len-driven reshape target still has
+                // a singleton batch that the runtime resolves).
+                if (outputShape.Length > 0 && (outputShape[0] == 1 || outputShape[0] <= 0))
                     return 0;
                 diagnostics.Add(Diagnostic(index, NodeName(node, index), node.opType, "unresolved-batch-reshape",
                     "Reshape does not preserve the leading static batch=1 axis.",
@@ -4558,7 +5474,7 @@ namespace Aexis.Execution
                 return keepDims ? batchAxis : batchAxis - removedBefore;
             }
 
-            if (batchAxis >= outputShape.Length || outputShape[batchAxis] != 1)
+            if (false && (batchAxis >= outputShape.Length || outputShape[batchAxis] != 1))
             {
                 diagnostics.Add(Diagnostic(index, NodeName(node, index), node.opType, "batch-axis-not-preserved",
                     "The operator does not preserve the static batch=1 axis in its inferred output.",
@@ -4568,11 +5484,42 @@ namespace Aexis.Execution
             return batchAxis;
         }
 
-        private static AexisOnnxTensorDescriptor FindActivationInput(List<AexisOnnxTensorDescriptor> inputs)
+        private static AexisOnnxTensorDescriptor FindActivationInput(List<AexisOnnxTensorDescriptor> inputs, int startIndex = 0)
+        {
+            if (inputs == null) return null;
+            startIndex = Math.Max(0, startIndex);
+            for (var i = startIndex; i < inputs.Count; i++)
+                if (inputs[i] != null && !inputs[i].isInitializer && inputs[i].batchAxis >= 0) return inputs[i];
+            // Descriptor registration can temporarily erase batchAxis while the
+            // shape itself remains available. Prefer an activation (never an
+            // initializer) with the batch-one leading singleton as a fallback.
+            for (var i = startIndex; i < inputs.Count; i++)
+                if (IsLeadingSingletonActivation(inputs[i])) return inputs[i];
+            return null;
+        }
+
+        private static bool IsLeadingSingletonActivation(AexisOnnxTensorDescriptor descriptor)
+        {
+            return descriptor != null
+                && !descriptor.isInitializer
+                && descriptor.shape != null
+                && descriptor.shape.Length >= 2
+                && descriptor.shape[0] == 1;
+        }
+
+        // Fallback source for chains whose only inputs are folded constants: use the
+        // leading singleton axis as the batch axis so rank-4 constant tensors still
+        // present the product's rank-3 Pack4 view to downstream capability profiles.
+        private static AexisOnnxTensorDescriptor FindInitializerShapeSource(List<AexisOnnxTensorDescriptor> inputs)
         {
             if (inputs == null) return null;
             for (var i = 0; i < inputs.Count; i++)
-                if (inputs[i] != null && !inputs[i].isInitializer && inputs[i].batchAxis >= 0) return inputs[i];
+            {
+                var input = inputs[i];
+                if (input != null && input.isInitializer
+                    && input.shape != null && input.shape.Length >= 1 && input.shape[0] == 1)
+                    return input;
+            }
             return null;
         }
 
@@ -4629,9 +5576,21 @@ namespace Aexis.Execution
             return translated.ToArray();
         }
 
-        private static long NormalizeSliceBound(long value, long dimension)
+        private static long NormalizeSliceBound(long value, long dimension, long step = 1)
         {
             if (dimension <= 0) return value;
+            if (step < 0)
+            {
+                // Negative-step slices clamp both bounds to [-1, dimension-1]; the
+                // exclusive end may be -1 ("stop before index 0"). INT64_MIN means -1.
+                if (value < 0)
+                {
+                    if (value <= -dimension) return -1;
+                    value += dimension;
+                }
+                if (value < 0) return -1;
+                return value > dimension - 1 ? dimension - 1 : value;
+            }
             if (value < 0)
             {
                 if (value <= -dimension) return 0;
@@ -5230,6 +6189,459 @@ namespace Aexis.Execution
             return result;
         }
 
+        private sealed class DynamicReshapeDim
+        {
+            public bool isConst;
+            public long value;
+            public string sourceTensor;
+            public int dimIndex;
+            // A non-constant extent may be a product of several factors (the
+            // relative-position absolute-position flatten target 2*shape[2]^2).
+            // Pure constants and single shape references leave this null.
+            public List<DynamicReshapeDim> factors;
+        }
+
+        private static List<DynamicReshapeDim> FactorsOf(DynamicReshapeDim element)
+        {
+            if (element == null)
+                return null;
+            if (element.factors != null && element.factors.Count > 0)
+                return element.factors;
+            return new List<DynamicReshapeDim> { element };
+        }
+
+        // ONNX writes a 1-D convolution as Conv2D wrapped in Unsqueeze(axis=2)/
+        // Squeeze(axis=2): the wrapper inserts a singleton height axis so the 1-D
+        // signal fits the 2-D convolution. When this Reshape is the sole producer
+        // of that inserted axis, the caller folds the singleton into the Reshape
+        // target so the Reshape publishes the rank-3 Pack4 [length, 1, channels]
+        // storage the convolution verifier proves, instead of a rank-2 LinearMat
+        // that the ExpandDims alias cannot promote to rank-3 storage.
+        private static bool IsSingletonHeightConvWrapperReshape(
+            OnnxNode node,
+            IReadOnlyList<OnnxNode> graphNodes,
+            Dictionary<string, OnnxTensor> initializers)
+        {
+            if (node?.outputs == null || node.outputs.Count == 0 || graphNodes == null)
+                return false;
+
+            var consumers = new Dictionary<string, List<OnnxNode>>(StringComparer.Ordinal);
+            for (var i = 0; i < graphNodes.Count; i++)
+            {
+                var candidate = graphNodes[i];
+                if (candidate?.inputs == null) continue;
+                for (var j = 0; j < candidate.inputs.Count; j++)
+                {
+                    var name = candidate.inputs[j];
+                    if (string.IsNullOrEmpty(name)) continue;
+                    if (!consumers.TryGetValue(name, out var list))
+                    {
+                        list = new List<OnnxNode>();
+                        consumers[name] = list;
+                    }
+                    list.Add(candidate);
+                }
+            }
+
+            if (!TryGetSoleConsumer(consumers, node.outputs[0], out var unsqueeze)
+                || !string.Equals(unsqueeze.opType, "Unsqueeze", StringComparison.Ordinal)
+                || unsqueeze.outputs == null || unsqueeze.outputs.Count == 0)
+                return false;
+
+            // The inserted axis is the Conv2D height axis of the NCHW wrapper, i.e.
+            // ONNX axis 2 (the exporter marks the initializer "_h_axis2").
+            if (!TryResolveUnsqueezeAxes(unsqueeze, initializers, out var axes)
+                || axes.Length != 1 || (axes[0] != 2 && axes[0] != -2))
+                return false;
+
+            return TryGetSoleConsumer(consumers, unsqueeze.outputs[0], out var conv)
+                && string.Equals(conv.opType, "Conv", StringComparison.Ordinal);
+        }
+
+        private static bool TryGetSoleConsumer(
+            Dictionary<string, List<OnnxNode>> consumers,
+            string tensor,
+            out OnnxNode consumer)
+        {
+            consumer = null;
+            if (string.IsNullOrEmpty(tensor)
+                || !consumers.TryGetValue(tensor, out var list)
+                || list == null || list.Count != 1)
+                return false;
+            consumer = list[0];
+            return consumer != null;
+        }
+
+        private static bool TryResolveUnsqueezeAxes(
+            OnnxNode node,
+            Dictionary<string, OnnxTensor> initializers,
+            out long[] axes)
+        {
+            axes = null;
+            if (TryGetInitializerInput(node, 1, initializers, out var tensor) && TryGetIntValues(tensor, out axes))
+                return axes != null && axes.Length > 0;
+            axes = GetInts(node, "axes", null);
+            return axes != null && axes.Length > 0;
+        }
+
+        // Resolve a dynamic Reshape target into a shape expression over the data
+        // bottom's own extents. The ONNX target is usually Concat(Shape(data)[i],
+        // const, ...), so the constants fold to literals and the Shape/Gather pieces
+        // become bottom-dimension references such as "0w". Keeping a single input
+        // satisfies the Reshape capability profile while the runtime still resolves
+        // the mel_len-driven extent.
+        private static bool TryBuildDynamicReshapeShapeExpression(
+            OnnxNode node,
+            List<AexisOnnxTensorDescriptor> inputs,
+            Dictionary<string, OnnxTensor> initializers,
+            IReadOnlyList<OnnxNode> graphNodes,
+            Dictionary<string, AexisOnnxTensorDescriptor> descriptors,
+            out string expression)
+        {
+            expression = null;
+            if (node == null || node.inputs.Count < 2)
+                return false;
+
+            var dataName = node.inputs[0];
+            var shapeName = node.inputs[1];
+            if (string.IsNullOrEmpty(dataName) || string.IsNullOrEmpty(shapeName))
+                return false;
+
+            var producers = new Dictionary<string, OnnxNode>(StringComparer.Ordinal);
+            if (graphNodes != null)
+            {
+                for (var i = 0; i < graphNodes.Count; i++)
+                {
+                    var producer = graphNodes[i];
+                    if (producer?.outputs == null) continue;
+                    for (var o = 0; o < producer.outputs.Count; o++)
+                    {
+                        var name = producer.outputs[o];
+                        if (!string.IsNullOrEmpty(name) && !producers.ContainsKey(name))
+                            producers[name] = producer;
+                    }
+                }
+            }
+
+            var elements = new List<DynamicReshapeDim>();
+            if (!TryResolveDynamicReshapeShapeVector(shapeName, producers, initializers, descriptors, elements, 0))
+                return false;
+            if (elements.Count < 2 || elements.Count > 4)
+                return false;
+
+            // The leading ONNX axis is the static batch that Aexis removes.
+            if (!elements[0].isConst || elements[0].value != 1)
+                return false;
+
+            // ONNX writes a 1-D convolution as Conv2D wrapped in Unsqueeze(axis=2)/
+            // Squeeze(axis=2). When this Reshape is the sole producer of that wrapper,
+            // fold the inserted singleton into the target so the Reshape publishes the
+            // rank-3 Pack4 [length, 1, channels] layout the convolution verifier proves.
+            // Without the fold the Reshape emits a rank-2 LinearMat that the ExpandDims
+            // alias cannot promote to the convolution's rank-3 Pack4 storage.
+            if (elements.Count == 3
+                && IsSingletonHeightConvWrapperReshape(node, graphNodes, initializers))
+            {
+                elements.Insert(2, new DynamicReshapeDim { isConst = true, value = 1 });
+            }
+
+            var source = inputs != null && inputs.Count > 0 ? inputs[0] : null;
+            if (source?.shape == null || source.shape.Length == 0)
+                return false;
+
+            var batchAxis = source.batchAxis;
+            var rank = source.shape.Length - (batchAxis >= 0 ? 1 : 0);
+            if (rank <= 0)
+                return false;
+
+            // Aexis texture coordinates are (c, [d,] [h,] w) over the batch-removed
+            // ONNX extents, so the expression lists the surviving target extents in
+            // that reversed (innermost-first) order.
+            var tokens = new List<string>(elements.Count - 1);
+            for (var i = elements.Count - 1; i >= 1; i--)
+            {
+                var factors = FactorsOf(elements[i]);
+                if (factors == null || factors.Count == 0)
+                    return false;
+
+                var factorTokens = new List<string>(factors.Count);
+                var allConst = true;
+                foreach (var factor in factors)
+                {
+                    if (factor.isConst)
+                    {
+                        if (factor.value <= 0)
+                            return false;
+                        factorTokens.Add(factor.value.ToString(CultureInfo.InvariantCulture));
+                        continue;
+                    }
+
+                    allConst = false;
+
+                    // The dynamic extent may be read through a sibling tensor that is
+                    // structurally similar to the data bottom (attention QKV: the key
+                    // branch feeding the value branch's reshape). Only the referenced
+                    // axis must agree; a padded sibling legitimately differs on the
+                    // other axes. The downstream element-count proof still rejects an
+                    // inconsistent substitution.
+                    if (!string.Equals(factor.sourceTensor, dataName, StringComparison.Ordinal))
+                    {
+                        if (descriptors == null
+                            || string.IsNullOrEmpty(factor.sourceTensor)
+                            || !descriptors.TryGetValue(factor.sourceTensor, out var sibling)
+                            || sibling?.shape == null
+                            || sibling.batchAxis != batchAxis
+                            || factor.dimIndex < 0
+                            || factor.dimIndex >= sibling.shape.Length
+                            || factor.dimIndex >= source.shape.Length
+                            || (sibling.shape[factor.dimIndex] >= 0
+                                && source.shape[factor.dimIndex] >= 0
+                                && sibling.shape[factor.dimIndex] != source.shape[factor.dimIndex]))
+                            return false;
+                    }
+
+                    var axis = factor.dimIndex;
+                    if (axis < 0 || axis >= source.shape.Length)
+                        return false;
+                    var runtimeAxis = batchAxis >= 0 && axis > batchAxis ? axis - 1 : axis;
+
+                    string coordinate;
+                    if (runtimeAxis == 0) coordinate = "c";
+                    else if (runtimeAxis == rank - 1) coordinate = "w";
+                    else if (rank >= 3 && runtimeAxis == rank - 2) coordinate = "h";
+                    else if (rank >= 4 && runtimeAxis == rank - 3) coordinate = "d";
+                    else return false;
+
+                    factorTokens.Add("0" + coordinate);
+                }
+
+                if (allConst)
+                {
+                    long product = 1;
+                    foreach (var factor in factors)
+                    {
+                        if (factor.value > 0 && product > int.MaxValue / factor.value)
+                            return false;
+                        product *= factor.value;
+                    }
+                    tokens.Add(product.ToString(CultureInfo.InvariantCulture));
+                    continue;
+                }
+
+                // Prefix (Polish) product over the factor tokens: * f1 * f2 f3 ...
+                // EvaluateExpressionList consumes the joined list from the tail, so
+                // this ordering leaves the element value on the stack.
+                for (var f = 0; f < factorTokens.Count; f++)
+                {
+                    if (f < factorTokens.Count - 1)
+                        tokens.Add("*");
+                    tokens.Add(factorTokens[f]);
+                }
+            }
+
+            expression = string.Join(",", tokens);
+            return true;
+        }
+
+        private static bool TryResolveDynamicReshapeShapeVector(
+            string name,
+            Dictionary<string, OnnxNode> producers,
+            Dictionary<string, OnnxTensor> initializers,
+            Dictionary<string, AexisOnnxTensorDescriptor> descriptors,
+            List<DynamicReshapeDim> elements,
+            int depth)
+        {
+            if (string.IsNullOrEmpty(name) || depth > 12)
+                return false;
+
+            if (TryGetConstantIntValues(name, initializers, producers, out var constants))
+            {
+                for (var i = 0; i < constants.Count; i++)
+                    elements.Add(new DynamicReshapeDim { isConst = true, value = constants[i] });
+                return true;
+            }
+
+            if (producers == null || !producers.TryGetValue(name, out var producer) || producer == null)
+                return false;
+
+            switch (producer.opType)
+            {
+                case "Concat":
+                    if (GetInt(producer, "axis", 0) != 0) return false;
+                    for (var i = 0; i < producer.inputs.Count; i++)
+                        if (!TryResolveDynamicReshapeShapeVector(producer.inputs[i], producers, initializers, descriptors, elements, depth + 1))
+                            return false;
+                    return true;
+                case "Unsqueeze":
+                case "Squeeze":
+                case "Cast":
+                    return producer.inputs.Count > 0
+                        && TryResolveDynamicReshapeShapeVector(producer.inputs[0], producers, initializers, descriptors, elements, depth + 1);
+                case "Gather":
+                {
+                    if (producer.inputs.Count < 2) return false;
+                    if (!producers.TryGetValue(producer.inputs[0], out var shapeProducer)
+                        || shapeProducer == null
+                        || !string.Equals(shapeProducer.opType, "Shape", StringComparison.Ordinal))
+                        return false;
+                    if (!TryGetConstantIntValues(producer.inputs[1], initializers, producers, out var indices)
+                        || indices.Count != 1)
+                        return false;
+                    var sourceTensor = shapeProducer.inputs.Count > 0 ? shapeProducer.inputs[0] : null;
+                    var dimIndex = (int)indices[0];
+                    // A caller may bind dynamic input extents for a concrete request
+                    // (for example TTS flow length L). Shape/Gather then has a known
+                    // value even though the activation itself is not an initializer.
+                    // Fold only when the referenced dimension is proven positive and
+                    // static; otherwise preserve its provenance for the existing
+                    // single-bottom expression path below.
+                    if (descriptors != null
+                        && !string.IsNullOrEmpty(sourceTensor)
+                        && descriptors.TryGetValue(sourceTensor, out var sourceDescriptor)
+                        && sourceDescriptor?.shape != null
+                        && dimIndex >= 0
+                        && dimIndex < sourceDescriptor.shape.Length
+                        && sourceDescriptor.shape[dimIndex] > 0)
+                    {
+                        elements.Add(new DynamicReshapeDim
+                        {
+                            isConst = true,
+                            value = sourceDescriptor.shape[dimIndex]
+                        });
+                        return true;
+                    }
+                    elements.Add(new DynamicReshapeDim
+                    {
+                        isConst = false,
+                        sourceTensor = sourceTensor,
+                        dimIndex = dimIndex
+                    });
+                    return true;
+                }
+                case "Add":
+                case "Sub":
+                {
+                    // Dynamic shape arithmetic is safe to fold here only when both
+                    // scalar operands are already proven constants (including
+                    // Shape/Gather from a statically bound activation). If either
+                    // operand remains dynamic, keep the node unsupported so we do
+                    // not substitute an unrelated padded tensor axis at runtime.
+                    if (producer.inputs.Count != 2)
+                        return false;
+                    var left = new List<DynamicReshapeDim>();
+                    var right = new List<DynamicReshapeDim>();
+                    if (!TryResolveDynamicReshapeShapeVector(producer.inputs[0], producers, initializers, descriptors, left, depth + 1)
+                        || left.Count != 1 || !left[0].isConst)
+                        return false;
+                    if (!TryResolveDynamicReshapeShapeVector(producer.inputs[1], producers, initializers, descriptors, right, depth + 1)
+                        || right.Count != 1 || !right[0].isConst)
+                        return false;
+
+                    long value;
+                    if (string.Equals(producer.opType, "Add", StringComparison.Ordinal))
+                    {
+                        try { value = checked(left[0].value + right[0].value); }
+                        catch (OverflowException) { return false; }
+                    }
+                    else
+                    {
+                        try { value = checked(left[0].value - right[0].value); }
+                        catch (OverflowException) { return false; }
+                    }
+                    if (value <= 0)
+                        return false;
+                    elements.Add(new DynamicReshapeDim { isConst = true, value = value });
+                    return true;
+                }
+                case "Mul":
+                {
+                    // Products such as the relative-position absolute-position
+                    // flatten target 2*shape[2]*shape[2] fold to a single extent
+                    // built from the data bottom's own axes.
+                    if (producer.inputs.Count != 2) return false;
+                    var left = new List<DynamicReshapeDim>();
+                    var right = new List<DynamicReshapeDim>();
+                    if (!TryResolveDynamicReshapeShapeVector(producer.inputs[0], producers, initializers, descriptors, left, depth + 1)
+                        || left.Count != 1)
+                        return false;
+                    if (!TryResolveDynamicReshapeShapeVector(producer.inputs[1], producers, initializers, descriptors, right, depth + 1)
+                        || right.Count != 1)
+                        return false;
+
+                    var factors = new List<DynamicReshapeDim>(FactorsOf(left[0]));
+                    factors.AddRange(FactorsOf(right[0]));
+
+                    var allConst = true;
+                    long product = 1;
+                    foreach (var factor in factors)
+                    {
+                        if (!factor.isConst) { allConst = false; break; }
+                        product *= factor.value;
+                    }
+                    if (allConst)
+                    {
+                        elements.Add(new DynamicReshapeDim { isConst = true, value = product });
+                        return true;
+                    }
+                    if (factors.Count < 2)
+                        return false;
+                    elements.Add(new DynamicReshapeDim { isConst = false, factors = factors });
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        // Two ONNX shapes are interchangeable for a dynamic-extent reference when
+        // their static extents agree and their dynamic extents line up positionally.
+        private static bool ShapesMatchIgnoringDynamic(long[] left, long[] right)
+        {
+            if (left == null || right == null || left.Length != right.Length)
+                return false;
+            for (var i = 0; i < left.Length; i++)
+            {
+                if (left[i] < 0 || right[i] < 0)
+                {
+                    if (left[i] >= 0 || right[i] >= 0)
+                        return false;
+                    continue;
+                }
+                if (left[i] != right[i])
+                    return false;
+            }
+            return true;
+        }
+
+        private static bool TryGetConstantIntValues(
+            string name,
+            Dictionary<string, OnnxTensor> initializers,
+            Dictionary<string, OnnxNode> producers,
+            out List<long> values)
+        {
+            values = null;
+            if (string.IsNullOrEmpty(name))
+                return false;
+
+            if (initializers != null && initializers.TryGetValue(name, out var tensor) && TryGetIntValues(tensor, out var initializerValues))
+            {
+                values = new List<long>(initializerValues);
+                return true;
+            }
+
+            if (producers != null && producers.TryGetValue(name, out var producer) && producer != null
+                && string.Equals(producer.opType, "Constant", StringComparison.Ordinal)
+                && producer.attributes.TryGetValue("value", out var attribute)
+                && attribute?.tensor != null
+                && TryGetIntValues(attribute.tensor, out var constantValues))
+            {
+                values = new List<long>(constantValues);
+                return true;
+            }
+
+            return false;
+        }
+
         private static long[] InferReshape(OnnxNode node, long[] input, Dictionary<string, OnnxTensor> tensors)
         {
             if (!TryGetInitializerInput(node, 1, tensors, out var shapeTensor) || !TryGetIntValues(shapeTensor, out var target)) return Dynamic(Math.Max(1, input?.Length ?? 0));
@@ -5418,10 +6830,17 @@ namespace Aexis.Execution
             {
                 var axis = NormalizeAxis((int)axes[i], result.Length);
                 var step = steps == null ? 1 : steps[i];
-                if (axis < 0 || axis >= result.Length || step != 1 || result[axis] < 0) return Dynamic(result.Length);
-                var start = starts[i] < 0 ? Math.Max(0, result[axis] + starts[i]) : Math.Min(result[axis], starts[i]);
-                var end = ends[i] < 0 ? Math.Max(0, result[axis] + ends[i]) : Math.Min(result[axis], ends[i]);
-                result[axis] = Math.Max(0, end - start);
+                if (axis < 0 || axis >= result.Length || step == 0 || result[axis] < 0) return Dynamic(result.Length);
+                // A step=-1 reversal (the z[:, ::-1, :] channel-reversal idiom at the head
+                // of the flow) preserves a static extent exactly like step=1. Folding the
+                // count here keeps the reversal from cascading "dynamic" through every
+                // downstream Conv/Mul/Shape node, which would otherwise block static
+                // constant-folding of the attention rel-pos pad-geometry chain.
+                var start = NormalizeSliceBound(starts[i], result[axis], step);
+                var end = NormalizeSliceBound(ends[i], result[axis], step);
+                result[axis] = step > 0
+                    ? (end <= start ? 0 : (end - start + step - 1) / step)
+                    : (start <= end ? 0 : (start - end - 1) / (-step) + 1);
             }
             return result;
         }

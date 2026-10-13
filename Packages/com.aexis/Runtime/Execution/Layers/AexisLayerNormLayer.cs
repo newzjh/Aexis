@@ -53,7 +53,7 @@ namespace Aexis.Execution
             if (!owner.ShouldForceCurrentLayerBufferPath()
                 && owner._layerNorm.TryGetValue(layer.name, out var lp)
                 && AexisGraphSession.TryGetExistingTexture(context.textureBlobs, context.textureShapes, layer.bottomNames[0], out var src, out var srcShape)
-                && CanUsePack4WidthPath(src, srcShape, lp))
+                && (CanUsePack4WidthPath(src, srcShape, lp) || CanUsePack4ChannelPath(src, srcShape, lp)))
             {
                 ExecuteRenderTexturePath(owner, layer, context);
                 return;
@@ -116,10 +116,26 @@ namespace Aexis.Execution
 
             if (!owner._layerNorm.TryGetValue(layer.name, out var lp))
                 throw new InvalidOperationException("LayerNorm not found: " + layer.name);
-            if (!TryGetPack4WidthTexture(owner, layer, lp, textureBlobs, textureShapes, bufferBlobs, bufferViews, out var srcTex, out var srcShape))
-                throw new InvalidOperationException("LayerNorm render-texture path requires supported pack4 width-norm input: " + layer.name);
+            if (!TryGetPack4Texture(owner, layer, lp, textureBlobs, textureShapes, bufferBlobs, bufferViews, out var srcTex, out var srcShape))
+                throw new InvalidOperationException("LayerNorm render-texture path requires a supported Pack4 normalization input: " + layer.name);
+
+            if (CanUsePack4ChannelPath(srcTex, srcShape, lp) && CanUsePack4WidthPath(srcTex, srcShape, lp))
+                throw new InvalidOperationException("LayerNorm Pack4 axis is ambiguous for the logical width and channel extents: " + layer.name);
 
             var outFormat = ResolveLayerNormOutputFormat(owner, layer, srcShape);
+            if (CanUsePack4ChannelPath(srcTex, srcShape, lp))
+            {
+                var packs = srcShape.c / 4;
+                var depth = srcShape.dims == 4 ? Mathf.Max(1, srcShape.d) : 1;
+                var output = owner.RentTempArray(srcShape.w, srcShape.h, depth * packs, outFormat);
+                owner.Ops.LayerNormPack4ChannelsTex(srcTex.texture, srcShape.w, srcShape.h, depth,
+                    srcShape.c, packs, lp.eps, lp.affine, lp.gamma, lp.beta, output);
+                AexisGraphSession.SetTextureBlob(textureBlobs, textureShapes, layer.topNames[0], output,
+                    srcShape, srcShape);
+                owner.Consume(textureBlobs, context.bufferBlobs, context.bufferRefs, context.bufferViews,
+                    context.remaining, layer.bottomNames, context.pinnedNames);
+                return;
+            }
             if (CanUsePack4Linear2DPath(srcTex, srcShape, lp))
             {
                 var storageShape = AexisGraphSession.GetTextureStorageShape(srcTex, srcShape);
@@ -311,6 +327,28 @@ namespace Aexis.Execution
             if (!owner._layerNorm.TryGetValue(layer.name, out var lp))
                 throw new InvalidOperationException("LayerNorm not found: " + layer.name);
 
+            if (CanUsePack4ChannelCmdPath(src, srcShape, lp) && CanUsePack4WidthCmdPath(src, srcShape, lp))
+                throw new InvalidOperationException("LayerNorm CommandBuffer Pack4 axis is ambiguous for the logical width and channel extents: " + layer.name);
+
+            if (CanUsePack4ChannelCmdPath(src, srcShape, lp))
+            {
+                var outFormat = ResolveLayerNormOutputFormat(owner, layer, srcShape);
+                var packs = srcShape.c / 4;
+                var depth = srcShape.dims == 4 ? Mathf.Max(1, srcShape.d) : 1;
+                // This is the layer's published tensor, so bind it to the graph
+                // output descriptor instead of inventing an unplanned scratch RT.
+                var output = owner.RentTempArray(cmd, srcShape.w, srcShape.h, depth * packs, outFormat,
+                    layer.topNames[0]);
+                owner.Ops.LayerNormPack4ChannelsTex(cmd, src.texture, srcShape.w, srcShape.h, depth,
+                    srcShape.c, packs, lp.eps, lp.affine, lp.gamma, lp.beta, output);
+                blobs[layer.topNames[0]] = AexisGraphSession.CreateCmdTensorRef(output, srcShape, srcShape,
+                    owned: true, blobName: layer.topNames[0]);
+                if (shapes != null)
+                    shapes[layer.topNames[0]] = srcShape;
+                owner.ConsumeCmd(cmd, blobs, remaining, layer.bottomNames, pinnedNames, shapes);
+                return;
+            }
+
             if (CanUsePack4WidthCmdPath(src, srcShape, lp))
             {
                 var outFormat = ResolveLayerNormOutputFormat(owner, layer, srcShape);
@@ -411,7 +449,7 @@ namespace Aexis.Execution
             return AexisGraphSession.ResolveTensorTextureFormat(srcShape.dims);
         }
 
-        private static bool TryGetPack4WidthTexture(
+        private static bool TryGetPack4Texture(
             AexisGraphSession owner,
             AexisGraphModel.Layer layer,
             AexisGraphSession.LayerNormPack lp,
@@ -432,7 +470,42 @@ namespace Aexis.Execution
             if (!AexisGraphSession.TryGetExistingTexture(textureBlobs, textureShapes, inputName, out srcTex, out srcShape))
                 return false;
 
-            return CanUsePack4WidthPath(srcTex, srcShape, lp);
+            return CanUsePack4WidthPath(srcTex, srcShape, lp)
+                || CanUsePack4ChannelPath(srcTex, srcShape, lp);
+        }
+
+        private static bool CanUsePack4ChannelPath(
+            AexisGraphSession.TensorRef src,
+            AexisGraphSession.BufferShape shape,
+            AexisGraphSession.LayerNormPack pack)
+        {
+            if (src == null || src.texture == null || AexisGraphSession.IsStrictLinearMatTexture(src)
+                || pack == null || !pack.affine || pack.gamma == null || pack.beta == null
+                || (shape.dims != 3 && shape.dims != 4) || shape.c <= 0 || (shape.c & 3) != 0
+                || pack.affineSize != shape.c || pack.gamma.count != shape.c || pack.beta.count != shape.c
+                || shape.w <= 0 || shape.h <= 0 || shape.w != src.width || shape.h != src.height
+                || src.packs != shape.c / 4)
+                return false;
+
+            var depth = shape.dims == 4 ? Mathf.Max(1, shape.d) : 1;
+            return Mathf.Max(1, src.texture.volumeDepth) == depth * src.packs;
+        }
+
+        private static bool CanUsePack4ChannelCmdPath(
+            AexisGraphSession.CmdTensorRef src,
+            AexisGraphSession.BufferShape shape,
+            AexisGraphSession.LayerNormPack pack)
+        {
+            if (src == null || src.texture == null || AexisGraphSession.IsStrictLinearMatTexture(src)
+                || pack == null || !pack.affine || pack.gamma == null || pack.beta == null
+                || (shape.dims != 3 && shape.dims != 4) || shape.c <= 0 || (shape.c & 3) != 0
+                || pack.affineSize != shape.c || pack.gamma.count != shape.c || pack.beta.count != shape.c
+                || shape.w <= 0 || shape.h <= 0 || shape.w != src.width || shape.h != src.height
+                || src.packs != shape.c / 4)
+                return false;
+
+            var depth = shape.dims == 4 ? Mathf.Max(1, shape.d) : 1;
+            return Mathf.Max(1, src.texture.depth) == depth * src.packs;
         }
 
         private static string BuildLayerNormUnsupportedMessage(

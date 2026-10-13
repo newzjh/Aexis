@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
@@ -11,6 +11,16 @@ namespace Aexis.Execution
     public sealed class AexisConvolutionLayer : AexisBaseLayer
     {
         public AexisConvolutionLayer() : base(AexisLayerTypes.Convolution, supportsBufferPath: true, supportsCommandBufferPath: true) { }
+
+        // [TTS-DIAG] conv_pre 输出回读 staging RT（debug 专用）。
+        private static RenderTexture s_diagOutRt;
+        public static RenderTexture GetDiagOutRt() => s_diagOutRt;
+        // [TTS-DIAG] 全 conv 层输出回读字典（debug 专用）。
+        private static readonly Dictionary<string, RenderTexture> s_layerOutRt = new Dictionary<string, RenderTexture>();
+        public static IReadOnlyDictionary<string, RenderTexture> GetLayerOutRt() => s_layerOutRt;
+        // [TTS-DIAG] conv_post 输入回读 staging RT（debug 专用）。
+        private static RenderTexture s_diagInRt;
+        public static RenderTexture GetDiagInRt() => s_diagInRt;
 
         public override AexisGraphSession.LayerLoadMetrics LoadLayer(AexisGraphSession owner, AexisGraphModel.Layer layer, AexisWeightReader br)
         {
@@ -77,8 +87,25 @@ namespace Aexis.Execution
                                                                        && pack.kernelW > 0
                                                                        && pack.kernelH == pack.kernelW
                                                                        && !(pack.kernelW == 1 && pack.kernelH == 1 && !owner.EnableConv1x1TextureConvolution);
+                                        // 1D (kernelH==1) convolutions dominate the TTS vocoder/flow graphs. They never
+                                        // satisfy the square-kernel gate above, yet the pack4-rt path ships flat and
+                                        // register-tiled ConvPack4General kernels that avoid the scalar-channel
+                                        // Conv2dGroupPack4 fallback. Pack their O4I4K weights so dispatch can select them.
+                                        var canUseGeneral1DTexturePack = !pack.isDepthWise
+                                                                         && pack.group == 1
+                                                                         && pack.kernelH == 1
+                                                                         && pack.kernelW > 0
+                                                                         && pack.strideH == 1
+                                                                         && pack.dilationH == 1
+                                                                         // Pack4 stores a partially filled final output pack and the
+                                                                         // shader masks unused lanes with _OutC.  Keep the 1-channel
+                                                                         // vocoder tail eligible (outC need not be divisible by 4).
+                                                                         && (pack.inC & 3) == 0
+                                                                         && w != null
+                                                                         && w.Length == pack.outC * pack.inC * pack.kernelW * pack.kernelH
+                                                                         && !(pack.kernelW == 1 && pack.kernelH == 1 && !owner.EnableConv1x1TextureConvolution);
                                         var needGeneralTexturePack = !owner.ForceBufferConvolutionAll
-                                                                     && (canUseSpecializedTexturePack || canUseGeneralTexturePack);
+                                                                     && (canUseSpecializedTexturePack || canUseGeneralTexturePack || canUseGeneral1DTexturePack);
                                         var needDepthWiseTexturePack = !owner.ForceBufferConvolutionAll
                                                                        && owner.EnableDepthWiseTextureConvolution
                                                                        && pack.isDepthWise
@@ -98,7 +125,12 @@ namespace Aexis.Execution
                                         if (owner.UsesInt4WeightOnlyForLayer(layer))
                                             AexisGraphSession.UploadInt4WeightOnlyConvWeights(pack, w, b, layer.name);
                                         else if (owner.UsesInt8WeightOnlyForLayer(layer))
-                                            AexisGraphSession.UploadInt8WeightOnlyConvWeights(pack, w, b, layer.name);
+                                        {
+                                            if (owner.UsesOfficialAmdSesrM7Int8ForLayer(layer))
+                                                AexisGraphSession.UploadOfficialAmdSesrM7Int8ConvWeights(pack, w, b, layer.name);
+                                            else
+                                                AexisGraphSession.UploadInt8WeightOnlyConvWeights(pack, w, b, layer.name);
+                                        }
                                         else
                                             AexisGraphSession.UploadRawConvWeights(pack, w, b);
                                         phaseSw.Stop();
@@ -107,7 +139,7 @@ namespace Aexis.Execution
                                         if (needGeneralTexturePack && !owner.UsesQuantizedWeightsForLayer(layer))
                                         {
                                             phaseSw.Restart();
-                                            var w4 = AexisGraphSession.PackWeightsToO4I4K(w, pack.outC, pack.inC, pack.kernelW, pack.outPacks, pack.inPacks);
+                                            var w4 = AexisGraphSession.PackWeightsToO4I4K2D(w, pack.outC, pack.inC, pack.kernelW, pack.kernelH, pack.outPacks, pack.inPacks);
                                             var b4 = AexisGraphSession.PackBiasToO4(b, pack.outC, pack.outPacks);
                                             pack.packedWeight4 = new ComputeBuffer(w4.Length, sizeof(float) * 4, ComputeBufferType.Structured);
                                             pack.packedBias4 = new ComputeBuffer(b4.Length, sizeof(float) * 4, ComputeBufferType.Structured);
@@ -245,7 +277,13 @@ namespace Aexis.Execution
                                            && conv.packedWeight4 != null
                                            && conv.packedBias4 != null
                                            && conv.kernelW > 0
-                                           && conv.kernelH == conv.kernelW
+                                           // 1-D ONNX convolutions are represented
+                                           // as rectangular 2-D kernels (1xK).
+                                           // ConvPack4General already accepts this
+                                           // profile, so keep it on the immediate
+                                           // RenderTexture path as well as the
+                                           // command-buffer path.
+                                           && (conv.kernelH == 1 || conv.kernelH == conv.kernelW)
                                            && !(conv.kernelW == 1 && conv.kernelH == 1 && !owner.EnableConv1x1TextureConvolution);
 
             AexisGraphSession.TensorRef src;
@@ -276,6 +314,16 @@ namespace Aexis.Execution
                 if (!AexisGraphSession.IsStrictLinearMatTexture(src))
                     src = AexisGraphSession.CreateTextureRef(src.texture, promotedShape, promotedShape, owned: false, sharedTextureOwner: src, blobName: layer.bottomNames[0]);
                 srcShape = promotedShape;
+            }
+
+            // Same 1-D-as-2-D Unsqueeze/Squeeze wrapper as the CommandBuffer
+            // path: collapse the singleton depth axis and restore it on output.
+            var restoreRank4 = srcShape.dims == 4;
+            if (restoreRank4)
+            {
+                if (srcShape.d != 1)
+                    throw new InvalidOperationException("Convolution texture path rejects rank-4 input with depth!=1: " + layer.name);
+                srcShape = new AexisGraphSession.BufferShape(3, srcShape.w, srcShape.h, 1, srcShape.c);
             }
 
             if (srcShape.dims != 3 || srcShape.d != 1 || srcShape.c != conv.inC)
@@ -337,10 +385,42 @@ namespace Aexis.Execution
                                         && conv.packedWeight4Fp16 != null
                                         && conv.group == 1
                                         && !conv.isDepthWise
-                                        && conv.kernelW == conv.kernelH;
+                                        && (conv.kernelH == 1 || conv.kernelW == conv.kernelH)
+                                        // Direct Pack4 3x3 supports the same half-weight binding,
+                                        // preserves its group-shared optimization and can keep a
+                                        // following channel PReLU fused.
+                                        && !canUseSpecialized3x3TexturePath;
+            var useFp16Direct3x3Weights = owner.UsesFp16WeightsForLayer(layer)
+                                           && conv.packedWeight4Fp16 != null
+                                           && conv.group == 1
+                                           && !conv.isDepthWise
+                                           && canUseSpecialized3x3TexturePath;
             var useInt8WeightOnly = owner.UsesInt8WeightsForLayer(layer);
             var useInt4WeightOnly = owner.UsesInt4WeightsForLayer(layer);
-            owner.Ops.SetFp16ConvWeights(useFp16GeneralWeights ? conv.packedWeight4Fp16 : null);
+            var useOfficialInt8Raw5x5Pack4 = owner.EnableExperimentalRawInt8Pack4
+                                               && useInt8WeightOnly
+                                               && owner.UsesOfficialAmdSesrM7Int8ForLayer(layer)
+                                               && conv.rawWeightInt8Packed != null
+                                               && conv.rawBias != null
+                                               && conv.group == 1
+                                               && !conv.isDepthWise
+                                               && conv.kernelW == 5
+                                               && conv.kernelH == 5
+                                               && conv.strideW == 1
+                                               && conv.strideH == 1
+                                               && conv.dilationW == 1
+                                               && conv.dilationH == 1
+                                               && conv.padLeft == 2
+                                               && conv.padRight == 2
+                                               && conv.padTop == 2
+                                               && conv.padBottom == 2
+                                               && (conv.outC & 3) == 0;
+            // Direct Pack4 3x3 uses the same packed-weight ABI as the general
+            // kernel. Keep feature textures FP32, but bind compact FP16 weights
+            // here too; otherwise the Real-ESRGAN trunk silently stays FP32.
+            owner.Ops.SetFp16ConvWeights((useFp16GeneralWeights || useFp16Direct3x3Weights)
+                ? conv.packedWeight4Fp16
+                : null);
             owner.Ops.SetInt8ConvWeights(
                 useInt8WeightOnly ? conv.rawWeightInt8Packed : null,
                 useInt8WeightOnly ? conv.rawWeightInt8Scales : null);
@@ -355,11 +435,35 @@ namespace Aexis.Execution
                                       && (conv.dilationW != 1 || conv.dilationH != 1)
                                       && conv.rawWeight != null
                                       && conv.rawBias != null;
-            if (useInt8WeightOnly || useInt4WeightOnly)
+            // The imported Melo vocoder contains 1-D ConvInteger/Conv layers
+            // (for example conv_post, kernel 1x7).  The regular packed O4I4K
+            // upload is intentionally skipped for those arbitrary kernels, but
+            // the raw OIHW Pack4 kernel supports the same shape directly.  Keep
+            // this GPU path available whenever immutable raw weights exist so a
+            // strict Pack4 run never falls back to a CPU buffer conversion.
+            var forceRawGroupForKernel = (conv.packedWeight4 == null && conv.rawWeight != null && conv.rawBias != null)
+                                         || owner.ForceRawGroupPack4Convolution
+                                         || (owner.ForceRawGroupPack4Convolution3x3
+                                             && conv.kernelW == 3 && conv.kernelH == 3)
+                                         || (owner.ForceRawGroupPack4Convolution5x5
+                                             && conv.kernelW == 5 && conv.kernelH == 5);
+            forceRawGroupForKernel |= (owner.ForceRawGroupPack4ConvolutionHead5x5
+                                       && conv.kernelW == 5 && conv.kernelH == 5
+                                       && conv.inC == 3 && conv.outC == 16)
+                                      || (owner.ForceRawGroupPack4ConvolutionTail5x5
+                                          && conv.kernelW == 5 && conv.kernelH == 5
+                                          && conv.inC == 16 && conv.outC == 12);
+            if (useOfficialInt8Raw5x5Pack4 && !owner.ForceRawGroupPack4Convolution)
+            {
+                owner.Ops.Conv5x5RawInt8Pack4(
+                    src.texture, conv.rawWeightInt8Packed, conv.rawBias, conv.inC, conv.outC,
+                    conv.activationType, conv.activationSlope, outRt);
+            }
+            else if (useInt8WeightOnly || useInt4WeightOnly || forceRawGroupForKernel)
             {
                 owner.Ops.Conv2dGroupPack4(
                     src.texture,
-                    useInt4WeightOnly ? conv.rawWeightInt4Packed : conv.rawWeightInt8Packed,
+                    useInt4WeightOnly ? conv.rawWeightInt4Packed : useInt8WeightOnly ? conv.rawWeightInt8Packed : conv.rawWeight,
                     conv.rawBias,
                     conv.inC,
                     conv.outC,
@@ -420,10 +524,13 @@ namespace Aexis.Execution
             }
             else if (canUseSpecialized3x3TexturePath)
             {
-                if (AexisGraphSession.EnableWinograd23 && conv.useWinograd23)
-                    owner.Ops.Conv3x3Pack4Winograd23(src.texture, conv.inPacks, conv.packedWeightTm23, conv.packedBias4, conv.outPacks, conv.biasTerm, conv.activationType, conv.activationSlope, outRt);
+                if (AexisGraphSession.EnableWinograd23 && conv.useWinograd23
+                    && AexisWinograd23.ShouldPreferForShape(src.width, src.height, conv.inPacks, conv.outPacks))
+                    owner.Ops.Conv3x3Pack4Winograd23(src.texture, conv.inPacks, conv.packedWeightTm23, conv.packedBias4, conv.outPacks, conv.biasTerm, conv.activationType, conv.activationSlope, outRt,
+                        conv.fusedPReluSlope, conv.fusedPReluSlopeCount);
                 else
-                    owner.Ops.Conv3x3Pack4(src.texture, conv.inPacks, conv.packedWeight4, conv.packedBias4, conv.outPacks, conv.padLeft, conv.activationType, conv.activationSlope, outRt);
+                    owner.Ops.Conv3x3Pack4(src.texture, conv.inPacks, conv.packedWeight4, conv.packedBias4, conv.outPacks, conv.padLeft, conv.activationType, conv.activationSlope, outRt,
+                        conv.fusedPReluSlope, conv.fusedPReluSlopeCount);
                 if (owner.ShouldCompareTextureConvLayer(layer.name))
                     owner.CompareTextureConvPath(layer.name, layer.bottomNames[0], conv, outWTex, outHTex, outRt, textureBlobs, bufferBlobs, textureShapes, bufferViews, tempOwned);
             }
@@ -439,7 +546,10 @@ namespace Aexis.Execution
             }
 
             var outShape = new AexisGraphSession.BufferShape(3, outWTex, outHTex, 1, conv.outC);
-            AexisGraphSession.SetTextureBlob(textureBlobs, textureShapes, layer.topNames[0], outRt, outShape, outShape);
+            var logicalOutShape = restoreRank4
+                ? new AexisGraphSession.BufferShape(4, outWTex, outHTex, 1, conv.outC)
+                : outShape;
+            AexisGraphSession.SetTextureBlob(textureBlobs, textureShapes, layer.topNames[0], outRt, logicalOutShape, outShape);
             if (tempInputTex != null)
                 owner.ReturnTempArray(tempInputTex);
             owner.Consume(textureBlobs, bufferBlobs, context.bufferRefs, bufferViews, remaining, layer.bottomNames, pinnedNames);
@@ -451,11 +561,11 @@ namespace Aexis.Execution
             var shapes = context.shapes;
             var src = AexisGraphSession.GetCmdTensor(blobs, layer.bottomNames[0]);
             var srcShape = AexisGraphSession.GetCmdShape(shapes, blobs, layer.bottomNames[0]);
+            if (AexisGraphSession.s_ttsVerbose) UnityEngine.Debug.Log($"[TTS-BIND] conv {layer.name} bottom={layer.bottomNames[0]} src.texture.nameID={(src.texture==null?-1:src.texture.nameID)} w={(src.texture==null?-1:src.texture.width)} h={(src.texture==null?-1:src.texture.height)} depth={(src.texture==null?-1:src.texture.depth)}");
             if (!owner._conv.TryGetValue(layer.name, out var conv))
                 throw new InvalidOperationException("Convolution not found: " + layer.name);
             if (!SupportsCommandBufferPack4(conv, out var reason))
                 throw new InvalidOperationException(BuildUnsupportedMessage(layer, src, srcShape, reason));
-
             ComputeTexture tempInput = null;
             ComputeTexture output = null;
             try
@@ -466,6 +576,20 @@ namespace Aexis.Execution
                     if (!AexisGraphSession.IsStrictLinearMatTexture(src))
                         src = AexisGraphSession.CreateCmdTensorRef(src.texture, promotedShape, promotedShape, owned: false, sharedTextureOwner: src, blobName: layer.bottomNames[0]);
                     srcShape = promotedShape;
+                }
+
+                // ONNX writes a 1-D convolution as Conv2D wrapped in
+                // Unsqueeze(axis=2)/Squeeze(axis=2). The inserted depth axis is a
+                // singleton, so the rank-4 logical view shares the rank-3 Pack4
+                // storage byte-for-byte. Collapse it for the 2-D kernel and
+                // restore the rank-4 logical shape on the output so the paired
+                // Squeeze still removes the axis it added.
+                var restoreRank4 = srcShape.dims == 4;
+                if (restoreRank4)
+                {
+                    if (srcShape.d != 1)
+                        throw new InvalidOperationException(BuildUnsupportedMessage(layer, src, srcShape, "rank-4 input with depth!=1 is not a 2-D convolution"));
+                    srcShape = new AexisGraphSession.BufferShape(3, srcShape.w, srcShape.h, 1, srcShape.c);
                 }
 
                 if (AexisGraphSession.IsStrictLinearMatTexture(src)
@@ -479,30 +603,138 @@ namespace Aexis.Execution
                     src = AexisGraphSession.CreateCmdTensorRef(tempInput, srcShape, srcShape, owned: false);
                 }
 
-                if (!CanUsePack4CmdPath(src, srcShape, conv))
+                var tiledTailInput = owner.IsVocoderTail8192TilingLayer(layer.name)
+                    && srcShape.w > 8192 && srcShape.h == 1 && srcShape.w % 8192 == 0
+                    && src.texture != null && src.texture.width == 8192
+                    && src.texture.height == srcShape.w / 8192;
+                if (!CanUsePack4CmdPath(src, srcShape, conv, tiledTailInput))
                     throw new InvalidOperationException(BuildUnsupportedMessage(layer, src, srcShape, "source is not a matching Pack4 texture-array"));
 
                 var outShape = ResolveCmdOutputShape(srcShape, conv);
-                output = owner.RentTempArray(cmd, outShape.w, outShape.h, conv.outPacks, owner.ResolveActivationTextureFormat(layer, 3));
+                var tiledTailOutput = tiledTailInput && outShape.w == srcShape.w && outShape.h == 1;
+                var storageOutShape = tiledTailOutput
+                    ? new AexisGraphSession.BufferShape(3, 8192, outShape.w / 8192, 1, outShape.c)
+                    : outShape;
+                output = owner.RentTempArray(cmd, storageOutShape.w, storageOutShape.h, conv.outPacks, owner.ResolveActivationTextureFormat(layer, 3));
                 var useFp16GeneralWeights = owner.UsesFp16WeightsForLayer(layer)
                                             && conv.packedWeight4Fp16 != null
                                             && conv.group == 1
                                             && !conv.isDepthWise
-                                            && conv.kernelW == conv.kernelH;
-                owner.Ops.SetFp16ConvWeights(useFp16GeneralWeights ? conv.packedWeight4Fp16 : null);
+                                            && (conv.kernelH == 1 || conv.kernelW == conv.kernelH)
+                                            && !(conv.kernelW == 3
+                                                && conv.kernelH == 3
+                                                && conv.strideW == 1
+                                                && conv.strideH == 1
+                                                && conv.padLeft == conv.padRight
+                                                && conv.padTop == conv.padBottom
+                                                && conv.padLeft == conv.padTop
+                                                && (conv.inC & 3) == 0
+                                                && (conv.outC & 3) == 0);
+                var useFp16Direct3x3Weights = owner.UsesFp16WeightsForLayer(layer)
+                                               && conv.packedWeight4Fp16 != null
+                                               && conv.group == 1
+                                               && !conv.isDepthWise
+                                               && conv.kernelW == 3
+                                               && conv.kernelH == 3
+                                               && conv.strideW == 1
+                                               && conv.strideH == 1
+                                               && conv.dilationW == 1
+                                               && conv.dilationH == 1
+                                               && conv.padLeft == conv.padRight
+                                               && conv.padTop == conv.padBottom
+                                               && conv.padLeft == conv.padTop
+                                               && (conv.inC & 3) == 0
+                                               && (conv.outC & 3) == 0;
+                owner.Ops.SetFp16ConvWeights((useFp16GeneralWeights || useFp16Direct3x3Weights)
+                    ? conv.packedWeight4Fp16
+                    : null);
                 var useInt8WeightOnly = owner.UsesInt8WeightsForLayer(layer);
                 var useInt4WeightOnly = owner.UsesInt4WeightsForLayer(layer);
+                var useOfficialInt8Pack4 = useInt8WeightOnly
+                    && owner.UsesOfficialAmdSesrM7Int8ForLayer(layer)
+                    && conv.packedWeight4Int8 != null
+                    && conv.packedBias4 != null
+                    && conv.group == 1
+                    && !conv.isDepthWise
+                    && conv.kernelW == 3
+                    && conv.kernelH == 3
+                    && conv.strideW == 1
+                    && conv.strideH == 1
+                    && conv.dilationW == 1
+                    && conv.dilationH == 1
+                    && conv.padLeft == conv.padRight
+                    && conv.padTop == conv.padBottom
+                    && conv.padLeft == conv.padTop
+                    && (conv.outC & 3) == 0;
+                var useOfficialInt8Raw5x5Pack4 = owner.EnableExperimentalRawInt8Pack4
+                    && useInt8WeightOnly
+                    && owner.UsesOfficialAmdSesrM7Int8ForLayer(layer)
+                    && conv.rawWeightInt8Packed != null
+                    && conv.rawBias != null
+                    && conv.group == 1
+                    && !conv.isDepthWise
+                    && conv.kernelW == 5
+                    && conv.kernelH == 5
+                    && conv.strideW == 1
+                    && conv.strideH == 1
+                    && conv.dilationW == 1
+                    && conv.dilationH == 1
+                    && conv.padLeft == 2
+                    && conv.padRight == 2
+                    && conv.padTop == 2
+                    && conv.padBottom == 2
+                    && (conv.outC & 3) == 0;
+                var forceRawGroupForKernel = owner.ForceRawGroupPack4Convolution
+                                             || (owner.ForceRawGroupPack4Convolution3x3
+                                                 && conv.kernelW == 3 && conv.kernelH == 3)
+                                             || (owner.ForceRawGroupPack4Convolution5x5
+                                                 && conv.kernelW == 5 && conv.kernelH == 5);
+                forceRawGroupForKernel |= (owner.ForceRawGroupPack4ConvolutionHead5x5
+                                           && conv.kernelW == 5 && conv.kernelH == 5
+                                           && conv.inC == 3 && conv.outC == 16)
+                                          || (owner.ForceRawGroupPack4ConvolutionTail5x5
+                                              && conv.kernelW == 5 && conv.kernelH == 5
+                                              && conv.inC == 16 && conv.outC == 12);
                 owner.Ops.SetInt8ConvWeights(
                     useInt8WeightOnly ? conv.rawWeightInt8Packed : null,
-                    useInt8WeightOnly ? conv.rawWeightInt8Scales : null);
+                    useInt8WeightOnly ? conv.rawWeightInt8Scales : null,
+                    useInt8WeightOnly && conv.rawWeightInt8UsesUniformScale,
+                    useInt8WeightOnly ? conv.rawWeightInt8UniformScale : 1f);
+                owner.Ops.SetInt8ConvPack4Weights(
+                    useOfficialInt8Pack4 ? conv.packedWeight4Int8 : null,
+                    useOfficialInt8Pack4 ? conv.rawWeightInt8UniformScale : 1f);
                 owner.Ops.SetInt4ConvWeights(
                     useInt4WeightOnly ? conv.rawWeightInt4Packed : null,
                     useInt4WeightOnly ? conv.rawWeightInt4Scales : null);
                 owner.ConfigureInt8ActivationQuantization(layer);
-                if (useInt8WeightOnly || useInt4WeightOnly)
+                if (tiledTailOutput)
+                {
+                    if (conv.group != 1 || conv.isDepthWise || conv.packedWeight4 == null || conv.packedBias4 == null
+                        || conv.kernelH != 1 || conv.kernelW > 13)
+                        throw new InvalidOperationException(BuildUnsupportedMessage(layer, src, srcShape, "tiled tail requires packed 1D convolution weights"));
+                    owner.Ops.ConvPack4General(cmd, src.texture, conv.inPacks, conv.packedWeight4, conv.packedBias4,
+                        conv.outPacks, conv.outC, conv.kernelW, conv.kernelH, conv.strideW, conv.strideH,
+                        conv.padLeft, conv.padTop, conv.dilationW, conv.dilationH, conv.activationType,
+                        conv.activationSlope, output, conv.inC, srcShape.w, outShape.w);
+                }
+                else if (useOfficialInt8Pack4 && !owner.ForceRawGroupPack4Convolution)
+                {
+                    // _ConvW4 is an inactive float fallback slot. The direct
+                    // shader reads the compact O4I4K INT8 buffer instead.
+                    owner.Ops.Conv3x3Pack4(cmd, src.texture, conv.inPacks, conv.packedBias4, conv.packedBias4,
+                        conv.outPacks, conv.padLeft, conv.activationType, conv.activationSlope, output,
+                        conv.fusedPReluSlope, conv.fusedPReluSlopeCount);
+                }
+                else if (useOfficialInt8Raw5x5Pack4 && !owner.ForceRawGroupPack4Convolution)
+                {
+                    owner.Ops.Conv5x5RawInt8Pack4(
+                        cmd, src.texture, conv.rawWeightInt8Packed, conv.rawBias, conv.inC, conv.outC,
+                        conv.activationType, conv.activationSlope, output);
+                }
+                else if (useInt8WeightOnly || useInt4WeightOnly || forceRawGroupForKernel)
                 {
                     owner.Ops.Conv2dGroupPack4(
-                        cmd, src.texture, useInt4WeightOnly ? conv.rawWeightInt4Packed : conv.rawWeightInt8Packed, conv.rawBias, conv.inC, conv.outC, conv.group,
+                        cmd, src.texture, useInt4WeightOnly ? conv.rawWeightInt4Packed : useInt8WeightOnly ? conv.rawWeightInt8Packed : conv.rawWeight, conv.rawBias, conv.inC, conv.outC, conv.group,
                         conv.kernelW, conv.kernelH, conv.strideW, conv.strideH, conv.padLeft, conv.padTop,
                         conv.dilationW, conv.dilationH, conv.activationType, conv.activationSlope, output);
                 }
@@ -544,12 +776,21 @@ namespace Aexis.Execution
                          && conv.packedWeight4 != null
                          && conv.packedBias4 != null)
                 {
-                    owner.Ops.Conv3x3Pack4(cmd, src.texture, conv.inPacks, conv.packedWeight4, conv.packedBias4, conv.outPacks, conv.padLeft, conv.activationType, conv.activationSlope, output);
+                    if (AexisGraphSession.EnableWinograd23 && conv.useWinograd23
+                        && AexisWinograd23.ShouldPreferForShape(src.width, src.height, conv.inPacks, conv.outPacks))
+                        owner.Ops.Conv3x3Pack4Winograd23(cmd, src.texture, conv.inPacks, conv.packedWeightTm23, conv.packedBias4, conv.outPacks, conv.biasTerm, conv.activationType, conv.activationSlope, output,
+                            conv.fusedPReluSlope, conv.fusedPReluSlopeCount);
+                    else
+                        owner.Ops.Conv3x3Pack4(cmd, src.texture, conv.inPacks, conv.packedWeight4, conv.packedBias4, conv.outPacks, conv.padLeft, conv.activationType, conv.activationSlope, output,
+                        conv.fusedPReluSlope, conv.fusedPReluSlopeCount);
                 }
                 else if (conv.group == 1
                          && !conv.isDepthWise
-                         && conv.kernelW == conv.kernelH
-                         && (conv.outC & 3) == 0
+                         && (conv.kernelH == 1 || conv.kernelW == conv.kernelH)
+                         && ((conv.outC & 3) == 0
+                             || (tiledTailOutput && layer.name == "/dec/conv_post/Conv"
+                                 && conv.outC == 1 && conv.inC == 16
+                                 && conv.kernelW == 7 && conv.kernelH == 1))
                          && conv.packedWeight4 != null
                          && conv.packedBias4 != null)
                 {
@@ -562,10 +803,51 @@ namespace Aexis.Execution
                         conv.kernelW, conv.kernelH, conv.strideW, conv.strideH, conv.padLeft, conv.padTop,
                         conv.dilationW, conv.dilationH, conv.activationType, conv.activationSlope, output);
                 }
-                blobs[layer.topNames[0]] = AexisGraphSession.CreateCmdTensorRef(output, outShape, outShape, owned: true);
+                // [TTS-DIAG] conv_pre 输出 staging 已禁用（OOM 精简）。
+                // [TTS-DIAG] 边界 conv 层输出回读字典已禁用（OOM 精简）。
+                bool stageLayer = false;
+                if (stageLayer)
+                try
+                {
+                    RenderTexture lr;
+                    if (!s_layerOutRt.TryGetValue(layer.name, out lr) || lr.width != output.width || lr.height != output.height || lr.volumeDepth != output.depth)
+                    {
+                        if (lr != null) { lr.Release(); UnityEngine.Object.DestroyImmediate(lr); }
+                        var ldd = new RenderTextureDescriptor(output.width, output.height, RenderTextureFormat.ARGBFloat, 0)
+                        { dimension = TextureDimension.Tex2DArray, volumeDepth = output.depth, enableRandomWrite = true, msaaSamples = 1 };
+                        lr = new RenderTexture(ldd) { filterMode = FilterMode.Point, wrapMode = TextureWrapMode.Clamp };
+                        lr.Create();
+                        s_layerOutRt[layer.name] = lr;
+                    }
+                    for (int sl = 0; sl < output.depth; sl++)
+                        cmd.CopyTexture(output.nameID, sl, 0, lr, sl, 0);
+                }
+                catch (System.Exception lex) { UnityEngine.Debug.Log($"[TTS-DIAG] layer_out staging fail {layer.name}: {lex.Message}"); }
+                // [TTS-DIAG] conv_post 输入回读 staging（debug）：cb 内把 src.texture 拷进持久 RT。
+                if (layer.name.Contains("conv_post") && src != null && src.texture != null)
+                {
+                    try
+                    {
+                        if (s_diagInRt == null || s_diagInRt.width != src.texture.width || s_diagInRt.volumeDepth != src.texture.depth)
+                        {
+                            if (s_diagInRt != null) { s_diagInRt.Release(); UnityEngine.Object.DestroyImmediate(s_diagInRt); }
+                            var idd = new RenderTextureDescriptor(src.texture.width, src.texture.height, src.texture.format, 0)
+                            { dimension = TextureDimension.Tex2DArray, volumeDepth = src.texture.depth, enableRandomWrite = true, msaaSamples = 1 };
+                            s_diagInRt = new RenderTexture(idd) { filterMode = FilterMode.Point, wrapMode = TextureWrapMode.Clamp };
+                            s_diagInRt.Create();
+                        }
+                        for (int sl = 0; sl < src.texture.depth; sl++)
+                            cmd.CopyTexture(src.texture.nameID, sl, 0, s_diagInRt, sl, 0);
+                    }
+                    catch (System.Exception dex2) { UnityEngine.Debug.Log($"[TTS-DIAG] conv_post input staging fail: {dex2.Message}"); }
+                }
+                var logicalOutShape = restoreRank4
+                    ? new AexisGraphSession.BufferShape(4, outShape.w, outShape.h, 1, outShape.c)
+                    : outShape;
+                blobs[layer.topNames[0]] = AexisGraphSession.CreateCmdTensorRef(output, logicalOutShape, storageOutShape, owned: true, blobName: layer.topNames[0]);
                 output = null;
                 if (shapes != null)
-                    shapes[layer.topNames[0]] = outShape;
+                    shapes[layer.topNames[0]] = logicalOutShape;
             }
             finally
             {
@@ -578,7 +860,7 @@ namespace Aexis.Execution
             owner.ConsumeCmd(cmd, blobs, context.remaining, layer.bottomNames, context.pinnedNames, shapes);
         }
 
-        private static bool CanUsePack4CmdPath(AexisGraphSession.CmdTensorRef src, AexisGraphSession.BufferShape srcShape, AexisGraphSession.ConvPack conv)
+        private static bool CanUsePack4CmdPath(AexisGraphSession.CmdTensorRef src, AexisGraphSession.BufferShape srcShape, AexisGraphSession.ConvPack conv, bool tiledTailInput = false)
         {
             return src != null
                 && src.texture != null
@@ -586,7 +868,7 @@ namespace Aexis.Execution
                 && srcShape.dims == 3
                 && srcShape.d == 1
                 && srcShape.c == conv.inC
-                && AexisGraphSession.MatchesPack4TextureStorage(src, srcShape)
+                && (tiledTailInput || AexisGraphSession.MatchesPack4TextureStorage(src, srcShape))
                 && src.packs == conv.inPacks;
         }
 
@@ -656,21 +938,32 @@ namespace Aexis.Execution
                                            && conv.packedWeight4 != null
                                            && conv.packedBias4 != null
                                            && conv.kernelW > 0
-                                           && conv.kernelH == conv.kernelW
+                                           // Rectangular 1-D-as-2-D kernels (1xK)
+                                           // are dispatched by ConvPack4General too.
+                                           && (conv.kernelH == 1 || conv.kernelH == conv.kernelW)
                                            && !(conv.kernelW == 1 && conv.kernelH == 1 && !owner.EnableConv1x1TextureConvolution);
+            var canUseRawGroupTexturePath = !conv.isDepthWise
+                                            && conv.group > 0
+                                            && conv.inC > 0
+                                            && conv.outC > 0
+                                            && conv.kernelW > 0
+                                            && conv.kernelH > 0
+                                            && conv.rawWeight != null
+                                            && conv.rawBias != null;
             var canUseQuantizedTexturePath = owner.UsesQuantizedWeightsForLayer(layer)
-                                             && SupportsCommandBufferPack4(conv, out _);
+                                              && SupportsCommandBufferPack4(conv, out _);
             var hasSupportedTexturePath = canUseConv1x1TexturePath
                                           || canUseDepthWiseTexturePath
                                           || canUseSpecialized3x3TexturePath
-                                          || canUseGeneralTexturePath
-                                          || canUseQuantizedTexturePath;
+                                           || canUseGeneralTexturePath
+                                           || canUseRawGroupTexturePath
+                                           || canUseQuantizedTexturePath;
 
             if (!hasSupportedTexturePath)
                 return false;
 
             var forceBufferThisConv = owner.ForceBufferConvolutionAll
-                                      || (conv.useBufferPath && !canUseDepthWiseTexturePath && !canUseGeneralTexturePath && !canUseQuantizedTexturePath)
+                                       || (conv.useBufferPath && !canUseDepthWiseTexturePath && !canUseGeneralTexturePath && !canUseRawGroupTexturePath && !canUseQuantizedTexturePath)
                                       || (conv.kernelW == 1 && conv.kernelH == 1 && !owner.EnableConv1x1TextureConvolution);
 
             if (forceBufferThisConv)

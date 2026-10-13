@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Text;
 using UnityEngine;
 
 namespace Aexis.Execution
@@ -85,6 +86,11 @@ namespace Aexis.Execution
         // producer of this blob are not dispatched and must not block a strict plan.
         // An unknown blob deliberately preserves complete-graph validation.
         public string stopAfterTopName;
+        // Layers that a model-local graph rewrite has folded into the preceding
+        // kernel. Their public output must already be registered by that kernel;
+        // the retained layer exists only to own immutable parameters and records
+        // no CommandBuffer dispatch of its own.
+        public string[] fusedNoOpLayerNames = Array.Empty<string>();
         public AexisTexturePlanTensorDescriptor[] inputs = Array.Empty<AexisTexturePlanTensorDescriptor>();
         [NonSerialized] public AexisTextureExecutionPlanNodeVerifier nodeVerifier;
     }
@@ -205,6 +211,22 @@ namespace Aexis.Execution
 
             var input = first.inputs != null && first.inputs.Length > 0 ? first.inputs[0] : null;
 
+            var inputDump = new StringBuilder();
+            var inputs = first.inputs ?? Array.Empty<AexisTexturePlanTensorDescriptor>();
+            for (var i = 0; i < inputs.Length; i++)
+            {
+                var item = inputs[i];
+                inputDump.Append(i == 0 ? " | inputs=" : "; ");
+                inputDump.Append("[")
+                    .Append(item?.blob ?? "<null>")
+                    .Append(" logical=").Append(FormatShape(item?.logicalShape))
+                    .Append(" storage=").Append(FormatShape(item?.storageShape))
+                    .Append(" layout=").Append(item?.layout ?? string.Empty)
+                    .Append(" dtype=").Append(item?.dtype ?? string.Empty)
+                    .Append(" texture=").Append(item?.textureBacked ?? false)
+                    .Append("]");
+            }
+
             return "StrictTextureInference rejected the CommandBuffer Pack4 execution plan"
                 + " | layer_index=" + first.layerIndex
                 + " | layer=" + (first.layer ?? string.Empty)
@@ -220,6 +242,7 @@ namespace Aexis.Execution
                 + " | storage_shape=" + FormatShape(input?.storageShape)
                 + " | layout=" + (input?.layout ?? string.Empty)
                 + " | dtype=" + (input?.dtype ?? string.Empty)
+                + inputDump.ToString()
                 + " | rejected_paths=" + string.Join(",", first.rejectedPaths ?? Array.Empty<string>())
                 + " | recommendation=" + (first.recommendedAction ?? string.Empty);
         }
@@ -272,6 +295,11 @@ namespace Aexis.Execution
                 if (input == null || string.IsNullOrWhiteSpace(input.blob))
                     continue;
                 descriptors[input.blob] = CloneDescriptor(input, input.blob);
+                if (input.blob == "/Add_2_output_0")
+                    UnityEngine.Debug.LogWarning("[PlanDbg] requestInput blob=" + input.blob
+                        + " logical=[" + string.Join(",", input.logicalShape ?? Array.Empty<int>()) + "]"
+                        + " storage=[" + string.Join(",", input.storageShape ?? Array.Empty<int>()) + "]"
+                        + " dtype=" + input.dtype + " layout=" + input.layout);
             }
 
             var nodes = new List<AexisTextureExecutionPlanNode>();
@@ -309,9 +337,33 @@ namespace Aexis.Execution
                     executionPath = "rejected"
                 };
 
+                if (layer.topNames != null
+                    && (Array.IndexOf(layer.topNames, "/flow/flows.7/Slice_output_0") >= 0
+                        || Array.IndexOf(layer.topNames, "/flow/flows.6/Split_output_0") >= 0))
+                {
+                    UnityEngine.Debug.LogWarning("[PlanDbg] idx=" + index + " layer=" + layer.name
+                        + " type=" + layer.type + " op=" + operatorName
+                        + " cap=" + (capability?.status ?? "<null>")
+                        + " bottoms=[" + string.Join(",", layer.bottomNames ?? Array.Empty<string>()) + "]"
+                        + " inputs=[" + string.Join(",", inputs.Select(i => i == null ? "<null>" : i.blob + "(" + string.Join(",", i.logicalShape ?? Array.Empty<int>()) + ")")) + "]");
+                }
+
                 if (string.Equals(operatorName, "Input", StringComparison.Ordinal))
                 {
                     PlanInputNode(request, layer, layers, node, descriptors, diagnostics);
+                    nodes.Add(node);
+                    continue;
+                }
+
+                // A loaded session can fold a parameterized activation into a
+                // preceding texture kernel while preserving this model layer to
+                // retain ownership of its immutable parameter buffer. The producer
+                // publishes this layer's public top directly, so there is neither
+                // an activation input nor an RT allocation/dispatch to plan here.
+                if (IsDeclaredFusedNoOpLayer(request, layer))
+                {
+                    node.accepted = true;
+                    node.executionPath = "fused-into-previous-kernel";
                     nodes.Add(node);
                     continue;
                 }
@@ -1038,6 +1090,25 @@ namespace Aexis.Execution
             return inputs;
         }
 
+        private static bool IsDeclaredFusedNoOpLayer(
+            AexisTextureExecutionPlanRequest request,
+            AexisGraphModel.Layer layer)
+        {
+            if (layer == null || string.IsNullOrWhiteSpace(layer.name)
+                || layer.bottomNames == null || layer.bottomNames.Length != 0
+                || layer.topNames == null || layer.topNames.Length != 1)
+            {
+                return false;
+            }
+
+            foreach (var name in request?.fusedNoOpLayerNames ?? Array.Empty<string>())
+            {
+                if (string.Equals(name, layer.name, StringComparison.Ordinal))
+                    return true;
+            }
+            return false;
+        }
+
         private static void TrimOptionalInitialSdpaKvCacheInputs(
             AexisGraphModel.Layer layer,
             List<AexisTexturePlanTensorDescriptor> inputs)
@@ -1238,6 +1309,11 @@ namespace Aexis.Execution
                 storageShape = CopyShape(source.storageShape),
                 layout = source.layout,
                 dtype = source.dtype,
+                // A view/alias keeps the source tensor's logical semantics. An
+                // identity Cast of a comparison result (Bool) must not fall back
+                // to the descriptor default, or downstream Where/Compress cannot
+                // prove the logical Bool condition contract.
+                logicalDtype = source.logicalDtype,
                 aliasGroup = source.aliasGroup,
                 textureBacked = source.textureBacked
             }).ToArray();
@@ -1761,6 +1837,9 @@ namespace Aexis.Execution
             }
 
             var maxTextureSize = GetSystemLimit(() => SystemInfo.maxTextureSize, 16384);
+            // Restored safety check: an over-sized storage extent is silently clamped by
+            // Unity, which corrupts every downstream read (observed as all-zero vocoder
+            // output). Reject it here so the failure is explicit instead of silent.
             if (storage[1] > maxTextureSize || storage[2] > maxTextureSize)
             {
                 reason = "Texture width/height exceeds SystemInfo.maxTextureSize=" + maxTextureSize + ".";

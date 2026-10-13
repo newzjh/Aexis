@@ -1076,6 +1076,110 @@ void AexisAttentionReshapePack4_Impl(uint3 id)
     _AttentionReshapeOutArr[int3(outX, outY, slice)] = o;
 }
 
+// Compact relative-position mask transform:
+//   source Pad_1: [srcW, srcH, depth=2, channels=1]
+//   Reshape_7:    two linear rows of srcW*srcH elements
+//   Pad_2:       append padRight zeros to both rows
+//   Reshape_10:   repack rows as channel 0/1 of [outW,outH,1,2]
+//
+// The ordinary implementation materializes the flattened rows as an RFloat
+// LinearMat. For long TTS sequences that width exceeds maxTextureSize. This
+// kernel preserves the same row-major element order while writing only the
+// final bounded Pack4 texture.
+void AexisAttentionMaskCompactPad4_Impl(uint3 id)
+{
+    uint ow, oh, od;
+    _TexOut0Arr.GetDimensions(ow, oh, od);
+    if (id.x >= ow || id.y >= oh || id.z >= od)
+        return;
+
+    int outW = max(1, _AttentionMaskCompactOutW);
+    int outH = max(1, _AttentionMaskCompactOutH);
+    int srcW = max(1, _AttentionMaskCompactSrcW);
+    int srcH = max(1, _AttentionMaskCompactSrcH);
+    int padRight = max(0, _AttentionMaskCompactPadRight);
+    int padLeft = max(0, _AttentionMaskCompactPadLeft);
+    int srcD = max(1, _AttentionMaskCompactSrcD);
+    int srcC = max(1, _AttentionMaskCompactSrcC);
+    int x = (int)id.x;
+    int y = (int)id.y;
+    float4 value = 0.0;
+
+    // The final logical tensor has two channels. It is always one Pack4 slice
+    // for this profile; leave tail lanes at zero if a caller supplies a wider
+    // physical pack.
+    [unroll]
+    for (int lane = 0; lane < 4; lane++)
+    {
+        int channel = lane;
+        if (channel >= 2)
+            continue;
+
+        // Each output channel is one padded flattened row. The output spatial
+        // coordinates identify an element within that row. `localIndex` must
+        // stay local to the lane: channel one begins a second flattened source
+        // row, rather than continuing after channel zero in the same row.
+        int localIndex = y * outW + x - padLeft;
+        int sourceCount = srcW * srcH;
+        float scalar = 0.0;
+        if (localIndex >= 0 && localIndex < sourceCount)
+        {
+            int sourceY = localIndex / srcW;
+            int sourceX = localIndex - sourceY * srcW;
+            // Batch-one graph lowering ordinarily folds the two mask rows into
+            // channels (d3, c=2). Retain the d4 depth-slice form as well for
+            // callers that preserve the original rank-four descriptor.
+            int sourceZ = srcC >= 2 ? 0 : channel;
+            int sourceChannel = srcC >= 2 ? channel : 0;
+            if (sourceZ < srcD && sourceChannel < srcC)
+                scalar = AexisReadPack4ChannelCDHW(_TexIn0Arr, sourceX, sourceY, sourceZ, sourceChannel, srcC);
+        }
+        AexisWriteLane(value, lane, scalar);
+    }
+
+    _TexOut0Arr[int3((int)id.x, (int)id.y, (int)id.z)] = value;
+}
+
+// Second half of the relative-position mask transform:
+//   Pad_3:    [2, L, 2L-1] (stored as [2L-1,L,depth=2,channels=1])
+//   Reshape_13: [2, L(2L-1)] (descriptor-only view)
+//   Pad_4:    append L zeros to each row
+//   Reshape_16: [1, 2, L, 2L] (descriptor-only view)
+//
+// The exporter normally materializes Reshape_13 as a very wide LinearMat.
+// Keep the two rows in the depth slices and write the final bounded d4
+// storage directly.  This is deliberately separate from the first compact
+// kernel above: its output packs are channels=1/depth=2, while the first
+// path emits channels=2/depth=1.
+void AexisAttentionMaskCompactPad4D4_Impl(uint3 id)
+{
+    uint ow, oh, od;
+    _TexOut0Arr.GetDimensions(ow, oh, od);
+    if (id.x >= ow || id.y >= oh || id.z >= od)
+        return;
+
+    int srcW = max(1, _AttentionMaskCompactSrcW);
+    int srcH = max(1, _AttentionMaskCompactSrcH);
+    int outW = max(1, _AttentionMaskCompactOutW);
+    int outH = max(1, _AttentionMaskCompactOutH);
+    int padLeft = max(0, _AttentionMaskCompactPadLeft);
+    int x = (int)id.x;
+    int y = (int)id.y;
+    int depth = (int)id.z;
+    int sourceIndex = y * outW + x - padLeft;
+    float value = 0.0;
+    if (depth < 2 && sourceIndex >= 0 && sourceIndex < srcW * srcH)
+    {
+        int sourceY = sourceIndex / srcW;
+        int sourceX = sourceIndex - sourceY * srcW;
+        value = AexisReadPack4ChannelCDHW(_TexIn0Arr, sourceX, sourceY, depth, 0, 1);
+    }
+
+    float4 output = 0.0;
+    output.x = value;
+    _TexOut0Arr[int3(x, y, depth)] = output;
+}
+
 void AexisAttentionContextFlattenPack4_Impl(uint3 id)
 {
     uint ow, oh, od;
@@ -1169,11 +1273,11 @@ void AexisSlicePack4CDHW_Impl(uint3 id)
     int srcY = outY;
     int srcZ = outZ;
     if (_SlicePack4CDHWAxis == 0)
-        srcX += _SlicePack4CDHWBegin;
+        srcX = outX * _SlicePack4CDHWStep + _SlicePack4CDHWBegin;
     else if (_SlicePack4CDHWAxis == 1)
-        srcY += _SlicePack4CDHWBegin;
+        srcY = outY * _SlicePack4CDHWStep + _SlicePack4CDHWBegin;
     else if (_SlicePack4CDHWAxis == 2)
-        srcZ += _SlicePack4CDHWBegin;
+        srcZ = outZ * _SlicePack4CDHWStep + _SlicePack4CDHWBegin;
 
     float4 o = 0.0;
     [unroll]
@@ -1184,7 +1288,7 @@ void AexisSlicePack4CDHW_Impl(uint3 id)
             continue;
 
         int srcC = _SlicePack4CDHWAxis == 3
-            ? outC + _SlicePack4CDHWBegin
+            ? outC * _SlicePack4CDHWStep + _SlicePack4CDHWBegin
             : outC;
         float scalar = AexisReadPack4ChannelCDHW(
             _SlicePack4CDHWInArr,

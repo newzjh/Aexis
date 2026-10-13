@@ -121,7 +121,7 @@ void AexisQuantizeBuf_Impl(uint3 id)
     if (idx >= (uint)_Total) return;
     int axis = AexisQuantAxisIndex((int)idx);
     float scale = AexisResolveQuantScaleIn(axis);
-    _QuantOut[idx] = clamp(AexisRoundToNearest(_QuantIn[idx] * scale), -127.0, 127.0);
+    _QuantOut[idx] = clamp(AexisRoundToNearest(_QuantIn[idx] * scale), -128.0, 127.0);
 }
 
 void AexisDequantizeBuf_Impl(uint3 id)
@@ -144,7 +144,7 @@ void AexisRequantizeBuf_Impl(uint3 id)
     float bias = AexisResolveQuantBias(axis);
     float v = AexisRoundToNearest(_QuantIn[idx]) * scaleIn + bias;
     v = AexisApplyActivationScalarQuant(v);
-    _QuantOut[idx] = clamp(AexisRoundToNearest(v * scaleOut), -127.0, 127.0);
+    _QuantOut[idx] = clamp(AexisRoundToNearest(v * scaleOut), -128.0, 127.0);
 }
 
 void AexisPixelShuffleBuf_Impl(uint3 id)

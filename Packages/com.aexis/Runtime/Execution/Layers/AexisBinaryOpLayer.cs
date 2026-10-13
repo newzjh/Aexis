@@ -10,10 +10,24 @@ namespace Aexis.Execution
     // Migration note: avoid expanding the legacy compute-buffer path; prefer pack4 RT execution, and plan for ComputeTexture command-buffer pack4 RT for async compute and temporary RT allocation support.
     public sealed class AexisBinaryOpLayer : AexisBaseLayer
     {
+        // [TTS-DIAG] tail binaryop 输入 staging（debug）。
+        public static RenderTexture s_tailBinRt;
+        public static RenderTexture s_tailBinRtB;
+        public static string s_tailBinTag;
+        // [TTS-DIAG] tail binaryop 输出 staging（FP16 断点定位）。
+        public static RenderTexture s_tailOutRt;
+        public static string s_tailOutTag;
+
         public AexisBinaryOpLayer() : base(AexisLayerTypes.BinaryOp, supportsBufferPath: true, supportsCommandBufferPath: true) { }
 
         public override void ExecuteBuffer(AexisGraphSession owner, AexisGraphModel.Layer layer, AexisLayerBufferContext context)
         {
+            // [TTS-DIAG] 入口日志：只对尾部层
+            if (layer.name.Contains("/dec/Add_") || layer.name.Contains("/dec/Div_") || layer.name.Contains("/dec/LeakyRelu_5"))
+            {
+                bool __canRt = CanExecuteRenderTexturePath(owner, layer, context);
+                if (AexisGraphSession.s_ttsVerbose) UnityEngine.Debug.Log($"[TTS-DIAG] BINOP-ENTRY {layer.name} canRt={__canRt} bottoms=[{string.Join(",", layer.bottomNames)}]");
+            }
             if (CanExecuteRenderTexturePath(owner, layer, context))
             {
                 ExecuteRenderTexturePath(owner, layer, context);
@@ -86,6 +100,26 @@ namespace Aexis.Execution
             var bViewFallback = bReadable;
             if (bBufFallback == null || bViewFallback == null)
                 throw new InvalidOperationException("BinaryOp second source not found: " + layer.name);
+
+            // [TTS-DIAG] buffer-path tail binary op 输入回读
+            if (aBufFallback != null && aBufFallback.count >= 1000000)
+            {
+                try
+                {
+                    var __fa = new float[aBufFallback.count];
+                    aBufFallback.GetData(__fa, 0, 0, aBufFallback.count);
+                    float __mxa = 0; foreach (var v in __fa) { if (System.Math.Abs(v) > __mxa) __mxa = (float)System.Math.Abs(v); }
+                    float __mxb = 0;
+                    if (bBufFallback != null && bBufFallback.count >= 1000000)
+                    {
+                        var __fb = new float[bBufFallback.count];
+                        bBufFallback.GetData(__fb, 0, 0, bBufFallback.count);
+                        foreach (var v in __fb) { if (System.Math.Abs(v) > __mxb) __mxb = (float)System.Math.Abs(v); }
+                    }
+                    UnityEngine.Debug.Log($"[TTS-DIAG] BUFPATH BINOP {layer.name} op={opType} aCount={aBufFallback.count} aMax={__mxa:F4} bMax={__mxb:F4} a0={layer.bottomNames[0]} b1={layer.bottomNames[1]}");
+                }
+                catch (System.Exception __bx) { UnityEngine.Debug.Log($"[TTS-DIAG] BUFPATH readback fail {layer.name}: {__bx.Message}"); }
+            }
 
             if (aViewFallback.dims == 2 && bViewFallback.dims == 2 && aBufFallback.count != bBufFallback.count)
             {
@@ -190,6 +224,49 @@ namespace Aexis.Execution
             var withScalar = layer.GetInt(1, 0);
             var scalarB = layer.GetFloat(2, 0f);
             var scalarTextureFormat = AexisGraphSession.ResolveTensorTextureFormat(2);
+
+            // [TTS-DIAG] tail render-texture binary-op 输入探针（verbose 开关）
+            if (AexisGraphSession.s_ttsVerbose
+                && layer.bottomNames.Length >= 1
+                && AexisGraphSession.TryGetExistingTexture(textureBlobs, textureShapes, layer.bottomNames[0], out var __aT, out var __aS)
+                && __aT.texture != null && __aT.texture.width >= 16000)
+            {
+                var __sb = new System.Text.StringBuilder();
+                __sb.Append($"[TTS-DIAG] RT-PATH BINOP {layer.name} op={opType} withScalar={withScalar} a0={layer.bottomNames[0]}(w={__aT.texture.width},h={__aT.texture.height})");
+                for (int bi = 1; bi < layer.bottomNames.Length; bi++)
+                {
+                    if (AexisGraphSession.TryGetExistingTexture(textureBlobs, textureShapes, layer.bottomNames[bi], out var __bT, out var __bS))
+                        __sb.Append($" b{bi}={layer.bottomNames[bi]}(w={__bT.texture.width})");
+                    else
+                        __sb.Append($" b{bi}={layer.bottomNames[bi]}(NOTEX)");
+                }
+                UnityEngine.Debug.Log(__sb.ToString());
+                // 回读两个输入 slice0
+                try
+                {
+                    var __gta = new Texture2D(__aT.texture.width, __aT.texture.height, TextureFormat.RGBAFloat, false, true);
+                    Graphics.SetRenderTarget(__aT.texture, 0);
+                    __gta.ReadPixels(new Rect(0, 0, __aT.texture.width, __aT.texture.height), 0, 0);
+                    __gta.Apply();
+                    float __mxa = 0; foreach (var p in __gta.GetPixels()) __mxa = Mathf.Max(__mxa, Mathf.Abs(p.r) + Mathf.Abs(p.g) + Mathf.Abs(p.b) + Mathf.Abs(p.a));
+                    UnityEngine.Debug.Log($"[TTS-DIAG] RT-PATH BINOP a0 readback max={__mxa:F4}");
+                    UnityEngine.Object.DestroyImmediate(__gta);
+                    for (int bi = 1; bi < layer.bottomNames.Length; bi++)
+                    {
+                        if (AexisGraphSession.TryGetExistingTexture(textureBlobs, textureShapes, layer.bottomNames[bi], out var __bt2, out _) && __bt2.texture != null)
+                        {
+                            var __gtb = new Texture2D(__bt2.texture.width, __bt2.texture.height, TextureFormat.RGBAFloat, false, true);
+                            Graphics.SetRenderTarget(__bt2.texture, 0);
+                            __gtb.ReadPixels(new Rect(0, 0, __bt2.texture.width, __bt2.texture.height), 0, 0);
+                            __gtb.Apply();
+                            float __mxb = 0; foreach (var p in __gtb.GetPixels()) __mxb = Mathf.Max(__mxb, Mathf.Abs(p.r) + Mathf.Abs(p.g) + Mathf.Abs(p.b) + Mathf.Abs(p.a));
+                            UnityEngine.Debug.Log($"[TTS-DIAG] RT-PATH BINOP b{bi} readback max={__mxb:F4}");
+                            UnityEngine.Object.DestroyImmediate(__gtb);
+                        }
+                    }
+                }
+                catch (System.Exception __dx) { UnityEngine.Debug.Log($"[TTS-DIAG] RT-PATH readback fail {layer.name}: {__dx.Message}"); }
+            }
 
             if (withScalar != 0)
             {
@@ -623,6 +700,59 @@ namespace Aexis.Execution
                 return;
             }
 
+            // A rank-1 MemoryData scalar is published as a 1x1 RFloat
+            // Texture2D, while the other operand is a Pack4 Texture2DArray.
+            // Keep this mixed pair on the immediate GPU path; binding the
+            // scalar to the Pack4 array slot would otherwise force the legacy
+            // buffer conversion path (and is rejected in strict Pack4 mode).
+            if (TryResolvePack4TextureScalarTexture(
+                    owner,
+                    layer.bottomNames[0],
+                    layer.bottomNames[1],
+                    textureBlobs,
+                    textureShapes,
+                    bufferBlobs,
+                    bufferViews,
+                    out var packScalarTexture,
+                    out var packScalarShape,
+                    out var rhsScalarTexture,
+                    out var rhsScalarShape))
+            {
+                RenderTexture finalTexture = null;
+                try
+                {
+                    var outDepth = packScalarShape.dims == 4
+                        ? Mathf.Max(1, packScalarShape.d * packScalarTexture.packs)
+                        : Mathf.Max(1, packScalarTexture.packs);
+                    finalTexture = owner.RentTempArray(
+                        packScalarTexture.width,
+                        packScalarTexture.height,
+                        outDepth,
+                        owner.ResolveActivationTextureFormat(packScalarShape.dims));
+                    owner.Ops.BinaryOpPack4TexScalar(
+                        packScalarTexture.texture,
+                        rhsScalarTexture.texture,
+                        packScalarTexture.packs,
+                        opType,
+                        finalTexture);
+                    AexisGraphSession.SetTextureBlob(
+                        textureBlobs,
+                        textureShapes,
+                        layer.topNames[0],
+                        finalTexture,
+                        packScalarShape);
+                    finalTexture = null;
+                }
+                finally
+                {
+                    if (finalTexture != null)
+                        owner.ReturnTempArray(finalTexture);
+                }
+
+                owner.Consume(textureBlobs, bufferBlobs, bufferRefs, bufferViews, remaining, layer.bottomNames, pinnedNames);
+                return;
+            }
+
             if (!owner.ForceBufferBinaryOpAll
                 && !isTargetSftAddLayer
                 && !isTargetSftMulLayer
@@ -902,6 +1032,38 @@ namespace Aexis.Execution
                 return true;
             }
 
+            // 深度轴广播：空间尺寸与 Pack4 通道打包完全一致，仅逻辑深度轴一侧为 1
+            // （batch 共享的相对位置注意力项）。输出取存活一侧的深度，内核按 pack
+            // 索引复用单层操作数。
+            var matchingPackedSpatial = aShape.w == bShape.w
+                && aShape.h == bShape.h
+                && aShape.c == bShape.c
+                && aTex.packs == bTex.packs
+                && aTex.packs == Mathf.Max(1, Mathf.CeilToInt(aShape.c / 4f))
+                && aTex.width == bTex.width
+                && aTex.height == bTex.height
+                && AexisGraphSession.MatchesPack4TextureStorage(aTex, aShape)
+                && AexisGraphSession.MatchesPack4TextureStorage(bTex, bShape);
+            if (matchingPackedSpatial && aShape.d == 1 && bShape.d > 1)
+            {
+                broadcastMode = 11;
+                outWidth = bTex.width;
+                outHeight = bTex.height;
+                outPacks = bTex.packs;
+                outShape = new AexisGraphSession.BufferShape(bShape.dims, bShape.w, bShape.h, bShape.d, bShape.c);
+                return true;
+            }
+
+            if (matchingPackedSpatial && bShape.d == 1 && aShape.d > 1)
+            {
+                broadcastMode = 10;
+                outWidth = aTex.width;
+                outHeight = aTex.height;
+                outPacks = aTex.packs;
+                outShape = new AexisGraphSession.BufferShape(aShape.dims, aShape.w, aShape.h, aShape.d, aShape.c);
+                return true;
+            }
+
             if (TryResolvePack4WidthVectorBroadcast(
                     aTex,
                     aShape,
@@ -1161,6 +1323,70 @@ namespace Aexis.Execution
             }
 
             return false;
+        }
+
+        private static bool TryResolvePack4TextureScalarTexture(
+            AexisGraphSession owner,
+            string aName,
+            string bName,
+            Dictionary<string, AexisGraphSession.TensorRef> textureBlobs,
+            Dictionary<string, AexisGraphSession.BufferShape> textureShapes,
+            Dictionary<string, ComputeBuffer> bufferBlobs,
+            Dictionary<string, AexisTensorBuffer> bufferViews,
+            out AexisGraphSession.TensorRef packTexture,
+            out AexisGraphSession.BufferShape packShape,
+            out AexisGraphSession.TensorRef scalarTexture,
+            out AexisGraphSession.BufferShape scalarShape)
+        {
+            packTexture = null;
+            packShape = default;
+            scalarTexture = null;
+            scalarShape = default;
+            if (owner == null)
+                return false;
+
+            // The dedicated immediate kernel implements tensor / scalar. Keep
+            // the scalar on the RHS so subtraction and division preserve ONNX
+            // operand order; scalar-on-LHS uses the general broadcast path.
+            if (!owner.TryGetPack4Texture(
+                    aName,
+                    textureBlobs,
+                    textureShapes,
+                    bufferBlobs,
+                    bufferViews,
+                    out var aPack,
+                    out var aPackShape)
+                || !AexisGraphSession.TryGetExistingTexture(
+                    textureBlobs,
+                    textureShapes,
+                    bName,
+                    out var bScalar,
+                    out var bScalarShape)
+                || !IsImmediateScalarTexture(bScalar, bScalarShape))
+            {
+                return false;
+            }
+
+            packTexture = aPack;
+            packShape = aPackShape;
+            scalarTexture = bScalar;
+            scalarShape = bScalarShape;
+            return true;
+        }
+
+        private static bool IsImmediateScalarTexture(
+            AexisGraphSession.TensorRef texture,
+            AexisGraphSession.BufferShape shape)
+        {
+            if (texture == null || texture.texture == null
+                || texture.texture.dimension != TextureDimension.Tex2D)
+                return false;
+            if (shape.dims == 1)
+                return shape.w == 1 && shape.h <= 1 && shape.d <= 1 && shape.c <= 1;
+            if (shape.dims == 2)
+                return shape.w == 1 && shape.h == 1 && shape.c <= 1;
+            return shape.dims >= 3
+                && shape.w == 1 && shape.h == 1 && shape.d == 1 && shape.c == 1;
         }
 
         private static bool TryResolveExactScalar2DTextureBinaryPath(
@@ -1708,9 +1934,16 @@ namespace Aexis.Execution
         {
             if (texture == null || texture.texture == null || texture.packs != 1)
                 return false;
-            if (logicalShape.dims != 1 && logicalShape.dims != 2)
-                return false;
-            if (logicalShape.w <= 0)
+            if (logicalShape.dims == 3
+                && logicalShape.w == 1 && logicalShape.h > 1
+                && logicalShape.d == 1 && logicalShape.c == 1)
+            {
+                return storageShape.w == 1
+                    && storageShape.h == logicalShape.h
+                    && texture.width == 1
+                    && texture.height == logicalShape.h;
+            }
+            if ((logicalShape.dims != 1 && logicalShape.dims != 2) || logicalShape.w <= 0)
                 return false;
             if (storageShape.w == logicalShape.w && storageShape.h == 1 && texture.width == logicalShape.w && texture.height == 1)
                 return true;
@@ -1825,7 +2058,8 @@ namespace Aexis.Execution
             AexisGraphSession.CmdTensorRef source,
             AexisGraphSession.BufferShape shape,
             RenderTextureFormat format,
-            ref ComputeTexture materialized)
+            ref ComputeTexture materialized,
+            string plannedResourceName = null)
         {
             if (owner == null)
                 throw new ArgumentNullException(nameof(owner));
@@ -1839,7 +2073,9 @@ namespace Aexis.Execution
 
             var outH = shape.dims == 1 ? 1 : Mathf.Max(1, shape.h);
             var outDims = shape.dims == 1 ? 1 : 2;
-            materialized = owner.RentTempArray(cmd, Mathf.Max(1, shape.w), outH, 1, format);
+            materialized = string.IsNullOrWhiteSpace(plannedResourceName)
+                ? owner.RentTempArray(cmd, Mathf.Max(1, shape.w), outH, 1, format)
+                : owner.RentTempArray(cmd, Mathf.Max(1, shape.w), outH, 1, format, plannedResourceName);
             owner.Ops.ReshapeLinearMatToPack4(
                 cmd,
                 source.texture,
@@ -1884,9 +2120,16 @@ namespace Aexis.Execution
         {
             if (texture == null || texture.texture == null || texture.packs != 1)
                 return false;
-            if (logicalShape.dims != 1 && logicalShape.dims != 2)
-                return false;
-            if (logicalShape.w <= 0)
+            if (logicalShape.dims == 3
+                && logicalShape.w == 1 && logicalShape.h > 1
+                && logicalShape.d == 1 && logicalShape.c == 1)
+            {
+                return storageShape.w == 1
+                    && storageShape.h == logicalShape.h
+                    && texture.width == 1
+                    && texture.height == logicalShape.h;
+            }
+            if ((logicalShape.dims != 1 && logicalShape.dims != 2) || logicalShape.w <= 0)
                 return false;
             if (storageShape.w == logicalShape.w && storageShape.h == 1 && texture.width == logicalShape.w && texture.height == 1)
                 return true;
@@ -1897,8 +2140,13 @@ namespace Aexis.Execution
 
         private static bool MatchesChannelVectorWidth(AexisGraphSession.BufferShape logicalShape, int channels)
         {
-            return logicalShape.w == channels
-                && (logicalShape.dims == 1 || (logicalShape.dims == 2 && logicalShape.h == 1));
+            return (logicalShape.w == channels
+                    && (logicalShape.dims == 1 || (logicalShape.dims == 2 && logicalShape.h == 1)))
+                || (logicalShape.dims == 3
+                    && logicalShape.w == 1
+                    && logicalShape.h == channels
+                    && logicalShape.d == 1
+                    && logicalShape.c == 1);
         }
 
         private static bool TryResolveScalarSingleBroadcastCmdBinaryPath(
@@ -1974,6 +2222,78 @@ namespace Aexis.Execution
             return false;
         }
 
+        private static bool TryResolveCmdPack4ChannelLayoutReshape(
+            AexisGraphSession.CmdTensorRef a,
+            AexisGraphSession.BufferShape aShape,
+            AexisGraphSession.CmdTensorRef b,
+            AexisGraphSession.BufferShape bShape,
+            out AexisGraphSession.CmdTensorRef target,
+            out AexisGraphSession.BufferShape targetShape,
+            out AexisGraphSession.CmdTensorRef source,
+            out AexisGraphSession.BufferShape sourceShape,
+            out bool sourceIsA)
+        {
+            target = null;
+            targetShape = default;
+            source = null;
+            sourceShape = default;
+            sourceIsA = false;
+
+            if (IsPack4ChannelLayoutTarget(a, aShape)
+                && IsPack4ChannelLayoutSource(b, bShape, aShape))
+            {
+                target = a;
+                targetShape = aShape;
+                source = b;
+                sourceShape = bShape;
+                return true;
+            }
+
+            if (IsPack4ChannelLayoutTarget(b, bShape)
+                && IsPack4ChannelLayoutSource(a, aShape, bShape))
+            {
+                target = b;
+                targetShape = bShape;
+                source = a;
+                sourceShape = aShape;
+                sourceIsA = true;
+                return true;
+            }
+
+            return false;
+        }
+
+        private static bool IsPack4ChannelLayoutTarget(
+            AexisGraphSession.CmdTensorRef tensor,
+            AexisGraphSession.BufferShape shape)
+        {
+            return tensor != null
+                && tensor.texture != null
+                && shape.dims == 3
+                && shape.w > 0
+                && shape.h == 1
+                && shape.d == 1
+                && shape.c > 1
+                && tensor.packs == Mathf.Max(1, Mathf.CeilToInt(shape.c / 4f))
+                && AexisGraphSession.MatchesPack4TextureStorage(tensor, shape);
+        }
+
+        private static bool IsPack4ChannelLayoutSource(
+            AexisGraphSession.CmdTensorRef tensor,
+            AexisGraphSession.BufferShape shape,
+            AexisGraphSession.BufferShape target)
+        {
+            return tensor != null
+                && tensor.texture != null
+                && tensor.packs == 1
+                && shape.dims == 3
+                && shape.w == target.w
+                && shape.h == target.c
+                && shape.d == 1
+                && shape.c == 1
+                && AexisGraphSession.MatchesPack4TextureStorage(tensor, shape);
+        }
+
         internal static bool TryResolveScalarSingleBroadcastShapes(
             AexisGraphSession.BufferShape aShape,
             AexisGraphSession.BufferShape bShape,
@@ -2003,6 +2323,18 @@ namespace Aexis.Execution
             var aCols = GetCols(aShape);
             var bRows = GetRows(bShape);
             var bCols = GetCols(bShape);
+
+            // Scalar-with-scalar (element count one on both sides): the XPOS
+            // relative-position metadata chain computes mel_len - k before the
+            // value is broadcast into a shape vector.  Mode 0 samples both
+            // operands at the single texel, so the result stays scalar.
+            if (IsScalarSingle(aShape) && IsScalarSingle(bShape))
+            {
+                broadcastMode = 0;
+                outShape = aShape;
+                storageShape = ScalarSingleStorage(aShape);
+                return true;
+            }
 
             if (IsScalarSingle(aShape) && !IsScalarSingle(bShape) && CanUseScalarSingleOutput(bShape))
             {
@@ -2246,6 +2578,22 @@ namespace Aexis.Execution
                 return true;
             }
 
+            if (TryResolvePack4TextureScalarTexture(
+                    owner,
+                    layer.bottomNames[0],
+                    layer.bottomNames[1],
+                    context.textureBlobs,
+                    context.textureShapes,
+                    context.bufferBlobs,
+                    context.bufferViews,
+                    out _,
+                    out _,
+                    out _,
+                    out _))
+            {
+                return true;
+            }
+
             if (!owner.ForceBufferBinaryOpAll
                 && !isTargetSftAddLayer
                 && !isTargetSftMulLayer
@@ -2330,6 +2678,77 @@ namespace Aexis.Execution
                                                 var scalarTextureFormat = AexisGraphSession.ResolveTensorTextureFormat(2);
                                                 var a = AexisGraphSession.GetCmdTensor(blobs, layer.bottomNames[0]);
                                                 var aShape = AexisGraphSession.GetCmdShape(shapes, blobs, layer.bottomNames[0]);
+                                                // [TTS-DIAG] tail binary-op 输入 nameID 日志（verbose 开关）
+                                                if (AexisGraphSession.s_ttsVerbose)
+                                                {
+                                                    var bs = new System.Text.StringBuilder();
+                                                    bs.Append($"[TTS-DIAG] BINOP {layer.name} op={opType} withScalar={withScalar} a0={layer.bottomNames[0]}({a.texture.nameID},w={a.width})");
+                                                    for (int bi = 1; bi < layer.bottomNames.Length; bi++)
+                                                    { try { var bb = AexisGraphSession.GetCmdTensor(blobs, layer.bottomNames[bi]); bs.Append($" b{bi}={layer.bottomNames[bi]}({bb.texture.nameID})"); } catch { bs.Append($" b{bi}={layer.bottomNames[bi]}(MISSING)"); } }
+                                                    UnityEngine.Debug.Log(bs.ToString());
+                                                    // [TTS-DIAG] cmd.CopyTexture 到静态 staging（Add_10/Div_4 专用）
+                                                    if (layer.name.Contains("/dec/Add_10") || layer.name.Contains("/dec/Div_4") || layer.name.Contains("/dec/Add_9"))
+                                                    {
+                                                        try
+                                                        {
+                                                            if (s_tailBinRt == null || s_tailBinRt.width != a.width)
+                                                            {
+                                                                if (s_tailBinRt != null) { s_tailBinRt.Release(); UnityEngine.Object.DestroyImmediate(s_tailBinRt); }
+                                                                var dd = new RenderTextureDescriptor(a.width, a.height, a.texture.format, 0)
+                                                                { dimension = TextureDimension.Tex2DArray, volumeDepth = Mathf.Max(1, a.texture.depth), enableRandomWrite = true, msaaSamples = 1 };
+                                                                s_tailBinRt = new RenderTexture(dd) { filterMode = FilterMode.Point, wrapMode = TextureWrapMode.Clamp };
+                                                                s_tailBinRt.Create();
+                                                            }
+                                                            var __srcTex = a.texture.directTexture;
+                                                            // [TTS-FIX §nullsource] 临时 RT 无 directTexture（仅 nameID）→ 延迟执行时源为 null。
+                                                            // 改用 nameID（RenderTargetIdentifier），与派发时点快照同语义，RT 存活时正常解析。
+                                                            if (__srcTex != null)
+                                                            {
+                                                                for (int sl = 0; sl < Mathf.Min(a.texture.depth, s_tailBinRt.volumeDepth); sl++)
+                                                                    cmd.CopyTexture(__srcTex, sl, 0, s_tailBinRt, sl, 0);
+                                                            }
+                                                            else
+                                                            {
+                                                                for (int sl = 0; sl < Mathf.Min(a.texture.depth, s_tailBinRt.volumeDepth); sl++)
+                                                                    cmd.CopyTexture(a.texture.nameID, sl, 0, s_tailBinRt, sl, 0);
+                                                            }
+                                                            s_tailBinTag = layer.name;
+                                                            // [TTS-DIAG] 同时快照 b 输入（Add_9/Add_10 的第二路）
+                                                            try {
+                                                                if (layer.bottomNames.Length > 1) {
+                                                                    var bb = AexisGraphSession.GetCmdTensor(blobs, layer.bottomNames[1]);
+                                                                    var bbTex = bb.texture;
+                                                                    // [TTS-FIX §mismatch] b 可能为 1x1 标量常量（Div_4 mode=9 广播），
+                                                                    // staging 须按 b 实际尺寸创建，否则 CopyTexture(1x1→16384x1) 报 mismatching data size。
+                                                                    if (s_tailBinRtB == null
+                                                                        || s_tailBinRtB.width != bbTex.width
+                                                                        || s_tailBinRtB.height != bbTex.height
+                                                                        || s_tailBinRtB.volumeDepth != Mathf.Max(1, bbTex.depth)) {
+                                                                        if (s_tailBinRtB != null) { s_tailBinRtB.Release(); UnityEngine.Object.DestroyImmediate(s_tailBinRtB); }
+                                                                        var ddb = new RenderTextureDescriptor(bbTex.width, bbTex.height, bbTex.format, 0)
+                                                                        { dimension = TextureDimension.Tex2DArray, volumeDepth = Mathf.Max(1, bbTex.depth), enableRandomWrite = true, msaaSamples = 1 };
+                                                                        s_tailBinRtB = new RenderTexture(ddb) { filterMode = FilterMode.Point, wrapMode = TextureWrapMode.Clamp };
+                                                                        s_tailBinRtB.Create();
+                                                                    }
+                                                                    var __srcTexB = bb.texture.directTexture;
+                                                                    // [TTS-FIX §nullsource] 同 tailBin：directTexture 为 null 时改走 nameID。
+                                                                    if (__srcTexB != null)
+                                                                    {
+                                                                        for (int sl = 0; sl < Mathf.Min(bb.texture.depth, s_tailBinRtB.volumeDepth); sl++)
+                                                                            cmd.CopyTexture(__srcTexB, sl, 0, s_tailBinRtB, sl, 0);
+                                                                    }
+                                                                    else
+                                                                    {
+                                                                        for (int sl = 0; sl < Mathf.Min(bb.texture.depth, s_tailBinRtB.volumeDepth); sl++)
+                                                                            cmd.CopyTexture(bb.texture.nameID, sl, 0, s_tailBinRtB, sl, 0);
+                                                                    }
+                                                                }
+                                                            } catch (System.Exception __bex) { UnityEngine.Debug.Log($"[TTS-DIAG] BINOP stage B fail {layer.name}: {__bex.Message}"); }
+                                                            if (AexisGraphSession.s_ttsVerbose) UnityEngine.Debug.Log($"[TTS-DIAG] BINOP stage COPY {layer.name} tag={s_tailBinTag}");
+                                                        }
+                                                        catch (System.Exception __rx) { UnityEngine.Debug.Log($"[TTS-DIAG] BINOP stage fail {layer.name}: {__rx.Message}"); }
+                                                    }
+                                                }
                                                 if (withScalar != 0)
                                                 {
                                                     if (!CanUseScalarLikeTexturePath(a, aShape))
@@ -2442,6 +2861,32 @@ namespace Aexis.Execution
                                                         blobs[layer.topNames[0]] = AexisGraphSession.CreateCmdTensorRef(outArr, mixedOutShape, mixedStorageShape, owned: true);
                                                         if (shapes != null)
                                                             shapes[layer.topNames[0]] = mixedOutShape;
+                                                    }
+                                                    else if (owner.IsVocoderTail8192TilingLayer(layer.name)
+                                                        && aShape.w > 8192 && aShape.w % 8192 == 0
+                                                        && aShape.h == 1 && a.width == 8192
+                                                        && a.height == aShape.w / 8192
+                                                        && ((aShape.dims == bShape.dims && aShape.w == bShape.w
+                                                                && aShape.h == bShape.h && aShape.c == bShape.c
+                                                                && a.width == b.width && a.height == b.height)
+                                                            || (bShape.w == 1 && bShape.h == 1 && bShape.d == 1
+                                                                && bShape.c == 1 && CanUseScalarLikeTexturePath(b, bShape))))
+                                                    {
+                                                        var outArr = owner.RentTempArray(cmd, a.width, a.height, a.packs,
+                                                            owner.ResolveActivationTextureFormat(aShape.dims));
+                                                        if (bShape.w == 1 && bShape.h == 1 && bShape.d == 1 && bShape.c == 1)
+                                                        {
+                                                            if (b.texture.dimension == TextureDimension.Tex2D)
+                                                                owner.Ops.BinaryOpPack4TexScalar(cmd, a.texture, b.texture, a.packs, opType, outArr);
+                                                            else
+                                                                owner.Ops.BinaryOpPack4Broadcast(cmd, a.texture, b.texture, a.packs, opType, 9, outArr);
+                                                        }
+                                                        else
+                                                            owner.Ops.BinaryOpPack4(cmd, a.texture, b.texture, a.packs, opType, outArr);
+                                                        blobs[layer.topNames[0]] = AexisGraphSession.CreateCmdTensorRef(outArr, aShape,
+                                                            AexisGraphSession.GetCmdStorageShape(a, aShape), owned: true);
+                                                        if (shapes != null)
+                                                            shapes[layer.topNames[0]] = aShape;
                                                     }
                                                     else if (CanUseExactCmdBinaryPath(a, aShape, b, bShape))
                                                     {
@@ -2679,11 +3124,20 @@ namespace Aexis.Execution
                                                         ComputeTexture channelVectorCmdMaterialized = null;
                                                         try
                                                         {
-                                                            var channelVectorCmdInput = MaterializeScalarLikeTexture(owner, cmd, channelVectorCmdTexture, channelVectorCmdTextureShape, scalarTextureFormat, ref channelVectorCmdMaterialized);
+                                                            var channelVectorCmdInput = MaterializeScalarLikeTexture(
+                                                                owner,
+                                                                cmd,
+                                                                channelVectorCmdTexture,
+                                                                channelVectorCmdTextureShape,
+                                                                scalarTextureFormat,
+                                                                ref channelVectorCmdMaterialized,
+                                                                AexisGraphSession.GetStrictPack4ScratchIdentity(
+                                                                    layer,
+                                                                    "binary-channel-vector-materialized"));
                                                             var outDepth = vectorCmdTextureShape.dims == 4
                                                                 ? Mathf.Max(1, vectorCmdTextureShape.d) * vectorCmdTexture.packs
                                                                 : vectorCmdTexture.packs;
-                                                            var outArr = owner.RentTempArray(cmd, vectorCmdTexture.width, vectorCmdTexture.height, outDepth, RenderTextureFormat.ARGBHalf);
+                                                            var outArr = owner.RentTempArray(cmd, vectorCmdTexture.width, vectorCmdTexture.height, outDepth, vectorCmdTexture.texture.format);
                                                             owner.Ops.BinaryOpPack4ChannelVectorTex(
                                                                 cmd,
                                                                 vectorCmdTexture.texture,
@@ -2714,6 +3168,82 @@ namespace Aexis.Execution
                                                                 owner.ReturnTempArray(cmd, channelVectorCmdMaterialized);
                                                         }
                                                     }
+                                                    else if (!owner.ForceBufferBinaryOpAll
+                                                        && !isTargetSftAddLayer
+                                                        && !isTargetSftMulLayer
+                                                        && TryResolveCmdPack4ChannelLayoutReshape(
+                                                        a,
+                                                        aShape,
+                                                        b,
+                                                        bShape,
+                                                        out var channelLayoutTarget,
+                                                        out var channelLayoutTargetShape,
+                                                        out var channelLayoutSource,
+                                                        out var channelLayoutSourceShape,
+                                                        out var channelLayoutSourceIsA))
+                                                    {
+                                                        ComputeTexture reshapedSource = null;
+                                                        ComputeTexture finalOut = null;
+                                                        try
+                                                        {
+                                                            reshapedSource = owner.RentTempArray(
+                                                                cmd,
+                                                                channelLayoutTarget.width,
+                                                                channelLayoutTarget.height,
+                                                                channelLayoutTarget.packs,
+                                                                channelLayoutTarget.texture.format,
+                                                                AexisGraphSession.GetStrictPack4ScratchIdentity(
+                                                                    layer,
+                                                                    "binary-channel-layout-reshape"));
+                                                            owner.Ops.ReshapePack4ToPack4(
+                                                                cmd,
+                                                                channelLayoutSource.texture,
+                                                                channelLayoutSourceShape.w,
+                                                                channelLayoutSourceShape.h,
+                                                                channelLayoutSourceShape.d,
+                                                                channelLayoutSourceShape.c,
+                                                                channelLayoutSourceShape.dims,
+                                                                channelLayoutTargetShape.w,
+                                                                channelLayoutTargetShape.h,
+                                                                channelLayoutTargetShape.d,
+                                                                channelLayoutTargetShape.c,
+                                                                channelLayoutTargetShape.dims,
+                                                                reshapedSource);
+
+                                                            finalOut = owner.RentTempArray(
+                                                                cmd,
+                                                                channelLayoutTarget.width,
+                                                                channelLayoutTarget.height,
+                                                                channelLayoutTarget.packs,
+                                                                channelLayoutTarget.texture.format);
+                                                            var lhs = channelLayoutSourceIsA ? reshapedSource : channelLayoutTarget.texture;
+                                                            var rhs = channelLayoutSourceIsA ? channelLayoutTarget.texture : reshapedSource;
+                                                            owner.Ops.BinaryOpPack4(cmd, lhs, rhs, channelLayoutTarget.packs, opType, finalOut);
+                                                            blobs[layer.topNames[0]] = new AexisGraphSession.CmdTensorRef
+                                                            {
+                                                                texture = finalOut,
+                                                                width = channelLayoutTarget.width,
+                                                                height = channelLayoutTarget.height,
+                                                                packs = channelLayoutTarget.packs,
+                                                                refs = 1,
+                                                                owned = true,
+                                                                hasLogicalShape = true,
+                                                                logicalShape = channelLayoutTargetShape,
+                                                                hasStorageShape = true,
+                                                                storageShape = channelLayoutTargetShape
+                                                            };
+                                                            if (shapes != null)
+                                                                shapes[layer.topNames[0]] = channelLayoutTargetShape;
+                                                            finalOut = null;
+                                                        }
+                                                        finally
+                                                        {
+                                                            if (reshapedSource != null)
+                                                                owner.ReturnTempArray(cmd, reshapedSource);
+                                                            if (finalOut != null)
+                                                                owner.ReturnTempArray(cmd, finalOut);
+                                                        }
+                                                    }
                                                     else if (TryResolveCmdSpatialBroadcast(a, aShape, b, bShape, out var broadcastMode, out var outShape, out var outWidth, out var outHeight, out var outPacks))
                                                     {
                                                         var outDepth = outShape.dims == 4 ? Mathf.Max(1, outShape.d) * outPacks : outPacks;
@@ -2734,6 +3264,39 @@ namespace Aexis.Execution
                                                         };
                                                         if (shapes != null)
                                                             shapes[layer.topNames[0]] = outShape;
+                                                    }
+                                                    else if (aShape.dims == 3
+                                                        && AexisGraphSession.MatchesPack4TextureStorage(a, aShape)
+                                                        && bShape.w == 1 && bShape.h == 1 && bShape.d == 1 && bShape.c == 1
+                                                        && CanUseScalarLikeTexturePath(b, bShape))
+                                                    {
+                                                        // d3 Pack4 激活 / d1 单元素标量纹理：标量恒采 b[0,0,0].x 全广播。
+                                                        // [FIX] MemoryData 单元素常量（Constant_4 等）以 Tex2D（维度2, RFloat）发布，
+                                                        //       直接绑 _TexIn1Arr（Texture2DArray）触发 "expected 5, got 2" 维度不匹配
+                                                        //       → 内核执行未定义 → Div_4 输出零 → 下游全零（静音 WAV）。
+                                                        //       方案：b 为 Tex2D 时改用专用内核 AexisBinaryOpPack4TexScalar，
+                                                        //       直接从 _LinearIn1[0,0] 读标量（不租新 RT、无计划器冲突、零回读）。
+                                                        var outDepth = a.packs;
+                                                        var outArr = owner.RentTempArray(cmd, a.width, a.height, outDepth, RenderTextureFormat.ARGBHalf);
+                                                        if (b.texture != null && b.texture.dimension == TextureDimension.Tex2D)
+                                                            owner.Ops.BinaryOpPack4TexScalar(cmd, a.texture, b.texture, a.packs, opType, outArr);
+                                                        else
+                                                            owner.Ops.BinaryOpPack4Broadcast(cmd, a.texture, b.texture, a.packs, opType, 9, outArr);
+                                                        blobs[layer.topNames[0]] = new AexisGraphSession.CmdTensorRef
+                                                        {
+                                                            texture = outArr,
+                                                            width = a.width,
+                                                            height = a.height,
+                                                            packs = a.packs,
+                                                            refs = 1,
+                                                            owned = true,
+                                                            hasLogicalShape = true,
+                                                            logicalShape = aShape,
+                                                            hasStorageShape = true,
+                                                            storageShape = aShape
+                                                        };
+                                                        if (shapes != null)
+                                                            shapes[layer.topNames[0]] = aShape;
                                                     }
                                                     else
                                                     {
@@ -2765,6 +3328,35 @@ namespace Aexis.Execution
                                                             + " | out=d" + fallbackShape.dims + ":" + fallbackShape.w + "x" + fallbackShape.h + "x" + fallbackShape.d + "x" + fallbackShape.c
                                                             + " | rejectedFallback=placeholder");
                                                     }
+                                                }
+                                                // [TTS-DIAG] 快照 BinaryOp 输出（FP16 断点定位，verbose 开关）
+                                                if (AexisGraphSession.s_ttsVerbose && (layer.name.Contains("/dec/Add_") || layer.name.Contains("/dec/Div_")))
+                                                {
+                                                    try
+                                                    {
+                                                        var oT = AexisGraphSession.GetCmdTensor(blobs, layer.topNames[0]);
+                                                        var oTex = oT.texture;
+                                                        if (oTex == null) { UnityEngine.Debug.Log($"[TTS-DIAG] BINOP-OUT {layer.name} OUT NULL"); }
+                                                        else
+                                                        {
+                                                            if (s_tailOutRt == null || s_tailOutRt.width != oTex.width || s_tailOutRt.height != oTex.height || s_tailOutRt.volumeDepth != Mathf.Max(1, oTex.depth) || s_tailOutRt.format != oTex.format)
+                                                            {
+                                                                if (s_tailOutRt != null) { s_tailOutRt.Release(); UnityEngine.Object.DestroyImmediate(s_tailOutRt); }
+                                                                var ddO = new RenderTextureDescriptor(oTex.width, oTex.height, oTex.format, 0)
+                                                                { dimension = TextureDimension.Tex2DArray, volumeDepth = Mathf.Max(1, oTex.depth), enableRandomWrite = true, msaaSamples = 1 };
+                                                                s_tailOutRt = new RenderTexture(ddO) { filterMode = FilterMode.Point, wrapMode = TextureWrapMode.Clamp };
+                                                                s_tailOutRt.Create();
+                                                            }
+                                                            var __srcO = oTex.directTexture;
+                                                            for (int sl = 0; sl < Mathf.Min(oTex.depth, s_tailOutRt.volumeDepth); sl++)
+                                                            {
+                                                                if (__srcO != null) cmd.CopyTexture(__srcO, sl, 0, s_tailOutRt, sl, 0);
+                                                                else cmd.CopyTexture(oTex.nameID, sl, 0, s_tailOutRt, sl, 0);
+                                                            }
+                                                            s_tailOutTag = layer.name;
+                                                        }
+                                                    }
+                                                    catch (Exception ex) { UnityEngine.Debug.Log($"[TTS-DIAG] BINOP-OUT {layer.name} EX={ex.Message}"); }
                                                 }
                                                 owner.ConsumeCmd(cmd, blobs, remaining, layer.bottomNames, pinnedNames, shapes);
                                                 continue;
@@ -2890,6 +3482,38 @@ namespace Aexis.Execution
                 && a.width == aShape.w)
             {
                 broadcastMode = 6;
+                outWidth = a.width;
+                outHeight = a.height;
+                outPacks = a.packs;
+                outShape = new AexisGraphSession.BufferShape(aShape.dims, aShape.w, aShape.h, aShape.d, aShape.c);
+                return true;
+            }
+
+            // 深度轴广播：空间尺寸与 Pack4 通道打包完全一致，仅逻辑深度轴一侧为 1
+            // （batch 共享的相对位置注意力项）。输出取存活一侧的深度，内核按 pack
+            // 索引复用单层操作数。
+            var matchingPackedSpatial = aShape.w == bShape.w
+                && aShape.h == bShape.h
+                && aShape.c == bShape.c
+                && a.packs == b.packs
+                && a.packs == Mathf.Max(1, Mathf.CeilToInt(aShape.c / 4f))
+                && a.width == b.width
+                && a.height == b.height
+                && AexisGraphSession.MatchesPack4TextureStorage(a, aShape)
+                && AexisGraphSession.MatchesPack4TextureStorage(b, bShape);
+            if (matchingPackedSpatial && aShape.d == 1 && bShape.d > 1)
+            {
+                broadcastMode = 11;
+                outWidth = b.width;
+                outHeight = b.height;
+                outPacks = b.packs;
+                outShape = new AexisGraphSession.BufferShape(bShape.dims, bShape.w, bShape.h, bShape.d, bShape.c);
+                return true;
+            }
+
+            if (matchingPackedSpatial && bShape.d == 1 && aShape.d > 1)
+            {
+                broadcastMode = 10;
                 outWidth = a.width;
                 outHeight = a.height;
                 outPacks = a.packs;

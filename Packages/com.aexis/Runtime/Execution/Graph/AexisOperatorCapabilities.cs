@@ -536,11 +536,25 @@ namespace Aexis.Execution
                 return new[] { 3, 4 };
             if (operatorName == "CopyTo" || operatorName == "MVN")
                 return new[] { 3, 4 };
-            if (operatorName == "Convolution" || operatorName == "ConvolutionDepthWise"
+            // ONNX exports a 1-D convolution as a 2-D convolution wrapped in
+            // Unsqueeze(axis=2)/Squeeze(axis=2). The inserted depth axis is a
+            // singleton and the Pack4 storage is byte-identical to the rank-3
+            // view, so Conv2D also accepts the rank-4 logical descriptor (d=1)
+            // and collapses it internally. Rank-4 input with d>1 is still
+            // rejected by the loaded-runtime verifier.
+            if (operatorName == "Convolution")
+                return new[] { 3, 4 };
+            if (operatorName == "ConvolutionDepthWise"
                 || operatorName == "Deconvolution" || operatorName == "DeconvolutionDepthWise"
                 || operatorName == "Pooling" || operatorName == "Bias")
                 return new[] { 3 };
-            if (operatorName == "Gemm" || operatorName == "MatMul" || operatorName == "InnerProduct")
+            // MatMul has a rank-4 attention form: the relative-position key/value
+            // operands carry an explicit batch axis (d=1) alongside the head axis,
+            // so the Pack4 attention profile accepts 3D and 4D descriptors. The
+            // loaded-runtime verifier still proves the exact broadcast contract.
+            if (operatorName == "MatMul")
+                return new[] { 1, 2, 3, 4 };
+            if (operatorName == "Gemm" || operatorName == "InnerProduct")
                 return new[] { 1, 2, 3 };
             if (operatorName == "Embed")
                 return new[] { 1, 2 };

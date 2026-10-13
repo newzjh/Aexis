@@ -140,6 +140,28 @@ namespace Aexis.Execution
                 return;
             }
 
+            // ONNX Slice with step=-1 lowers to Crop; every such slice in practice is a
+            // full-axis reversal, so the contiguous crop is the identity and the order is
+            // restored with a Flip on the reversed axes.
+            ResolveSliceFlipFlags(layer, srcShape, out var flipWidth, out var flipHeight, out var flipDepth, out var flipChannels);
+            if (flipWidth || flipHeight || flipDepth || flipChannels)
+            {
+                if (!IsIdentityCrop(srcShape, roi))
+                    throw new InvalidOperationException("Reversed Slice with a partial range is not supported on the Pack4 crop path: " + layer.name);
+                var depthDim = srcShape.dims >= 4 ? srcShape.d : 1;
+                var outShape = srcShape.dims >= 4
+                    ? srcShape
+                    : new AexisGraphSession.BufferShape(srcShape.dims, srcShape.w, srcShape.h, 1, srcShape.c);
+                var flippedDepth = Mathf.Max(1, depthDim * src.packs);
+                var flipped = owner.RentTempArray(cmd, srcShape.w, srcShape.h, flippedDepth, owner.ResolveActivationTextureFormat(srcShape.dims));
+                owner.Ops.FlipPack4(cmd, src.texture, srcShape.w, srcShape.h, depthDim, srcShape.c, flipWidth, flipHeight, flipDepth, flipChannels, flipped);
+                blobs[layer.topNames[0]] = AexisGraphSession.CreateCmdTensorRef(flipped, outShape, outShape, owned: true);
+                if (shapes != null)
+                    shapes[layer.topNames[0]] = outShape;
+                owner.ConsumeCmd(cmd, blobs, remaining, layer.bottomNames, pinnedNames, shapes);
+                return;
+            }
+
             if (CanUsePack4Crop(src, srcShape, roi))
             {
                 if (IsIdentityCrop(srcShape, roi))
@@ -284,6 +306,52 @@ namespace Aexis.Execution
                 && srcShape.h == src.height
                 && srcShape.d == 1
                 && roi.outd == 1;
+        }
+
+        // Mirrors AexisGraphSession.ResolveCropRoiFromSlice axis mapping so a reversed
+        // Slice axis lands on the same Flip flag the crop used.
+        private static void ResolveSliceFlipFlags(
+            AexisGraphModel.Layer layer,
+            AexisGraphSession.BufferShape shape,
+            out bool flipWidth,
+            out bool flipHeight,
+            out bool flipDepth,
+            out bool flipChannels)
+        {
+            flipWidth = flipHeight = flipDepth = flipChannels = false;
+            var steps = layer.GetInts(-23312, null);
+            if (steps == null || steps.Length == 0)
+                return;
+            var axes = layer.GetInts(-23311, null);
+            var count = axes == null ? steps.Length : Math.Min(steps.Length, axes.Length);
+            for (var i = 0; i < count; i++)
+            {
+                if (steps[i] >= 0)
+                    continue;
+                var axis = axes == null ? i : axes[i];
+                if (axis < 0) axis += shape.dims;
+                if (shape.dims <= 1)
+                {
+                    flipWidth = true;
+                    continue;
+                }
+                if (shape.dims == 2)
+                {
+                    if (axis == 0) flipHeight = true; else flipWidth = true;
+                    continue;
+                }
+                if (shape.dims == 3)
+                {
+                    if (axis == 0) flipChannels = true;
+                    else if (axis == 1) flipHeight = true;
+                    else flipWidth = true;
+                    continue;
+                }
+                if (axis == 0) flipChannels = true;
+                else if (axis == 1) flipDepth = true;
+                else if (axis == 2) flipHeight = true;
+                else flipWidth = true;
+            }
         }
 
         private static bool IsIdentityCrop(AexisGraphSession.BufferShape srcShape, AexisGraphSession.CropRoi roi)

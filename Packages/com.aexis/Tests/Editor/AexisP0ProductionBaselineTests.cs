@@ -3937,6 +3937,20 @@ namespace Aexis.Tests.Editor
             padding.intParams[7] = "1";
             Assert.That(AnalyzeLoadedLayer(padding, request).strictEligible, Is.False);
 
+            padding = SentisLayer("Padding", new[] { "linear" }, new[] { "padded" });
+            padding.intParams[3] = "2";
+            var linearPaddingReport = AnalyzeLoadedLayer(
+                padding,
+                StrictTextureRequest(new[] { LinearTexture("linear", 2, 4, 3, 1, 1) }));
+            Assert.That(linearPaddingReport.strictEligible, Is.True, DescribeReport(linearPaddingReport));
+            Assert.That(linearPaddingReport.texturePlan.nodes[0].executionPath,
+                Is.EqualTo("command-buffer-linearmat:padding-2d"));
+            Assert.That(linearPaddingReport.texturePlan.nodes[0].outputs[0].logicalShape,
+                Is.EqualTo(new[] { 2, 6, 3, 1, 1 }));
+            Assert.That(linearPaddingReport.texturePlan.nodes[0].outputs[0].storageShape,
+                Is.EqualTo(new[] { 2, 6, 3, 1, 1 }));
+            Assert.That(linearPaddingReport.texturePlan.nodes[0].scratch ?? Array.Empty<AexisTexturePlanTensorDescriptor>(), Is.Empty);
+
             var reorg = SentisLayer("Reorg", new[] { "data" }, new[] { "output" });
             reorg.intParams[0] = "2";
             reorg.intParams[1] = "0";
@@ -4007,6 +4021,137 @@ namespace Aexis.Tests.Editor
             var requantReport = AnalyzeLoadedLayer(requantize, int8Request, 0.5f, 2f);
             Assert.That(requantReport.strictEligible, Is.True, DescribeReport(requantReport));
             Assert.That(requantReport.nodes[0].outputs[0].logicalDtype, Is.EqualTo("Int8"));
+        }
+
+        [Test]
+        public void Padding_CommandBufferLinearMatPreservesRFloatAndMatchesConstantGolden()
+        {
+            if (!SystemInfo.supportsComputeShaders || !SystemInfo.SupportsRenderTextureFormat(RenderTextureFormat.RFloat))
+                Assert.Ignore("The graphics device does not support the RFloat LinearMat profile required by this Padding golden.");
+
+            var layer = SentisLayer("Padding", new[] { "linear" }, new[] { "padded" });
+            layer.name = "padding_linearmat_command_buffer_golden";
+            layer.intParams[3] = "2";
+            using var ops = new AexisOps();
+            using var session = new AexisGraphSession(ops)
+            {
+                TensorTextureFormat = RenderTextureFormat.ARGBFloat,
+                StrictTextureTargetDtype = "FP32"
+            };
+            using var reader = new AexisFloatArrayWeightReader(Array.Empty<float>());
+            session.LoadModel(SerializeSingleLayer(layer), reader);
+            using var upload = new ComputeBuffer(12, sizeof(float));
+            upload.SetData(Enumerable.Range(1, 12).Select(value => (float)value).ToArray());
+            using var commandBuffer = new CommandBuffer { name = "AexisPaddingLinearMatCommandBufferGolden" };
+            var input = session.RentTempMat(commandBuffer, 4, 3, RenderTextureFormat.RFloat);
+            var readback = CreateRFloatTarget(6, 3);
+            try
+            {
+                ops.FillLinearMatFromBuffer(commandBuffer, upload, 4, 3, input);
+                using (var result = session.ForwardPack4Outputs(
+                    commandBuffer,
+                    new Dictionary<string, ComputeTexture>(StringComparer.Ordinal) { ["linear"] = input },
+                    new Dictionary<string, AexisGraphSession.BufferShape>(StringComparer.Ordinal)
+                    {
+                        ["linear"] = new AexisGraphSession.BufferShape(2, 4, 3, 1, 1)
+                    },
+                    new[] { "padded" }))
+                {
+                    var output = result.GetTexture("padded");
+                    Assert.That(output.dimension, Is.EqualTo(TextureDimension.Tex2D));
+                    Assert.That(output.format, Is.EqualTo(RenderTextureFormat.RFloat));
+                    Assert.That(result.GetLogicalShape("padded"), Is.EqualTo(new AexisGraphSession.BufferShape(2, 6, 3, 1, 1)));
+                    commandBuffer.CopyTexture(output.nameID, new RenderTargetIdentifier(readback));
+                }
+                session.ReturnTempArray(commandBuffer, input);
+                input = null;
+                Graphics.ExecuteCommandBuffer(commandBuffer);
+
+                Assert.That(session.LastTextureExecutionPlan.strictEligible, Is.True, session.LastTextureExecutionPlan.summary);
+                Assert.That(session.LastTextureExecutionPlan.nodes.Last().executionPath,
+                    Is.EqualTo("command-buffer-linearmat:padding-2d"));
+                Assert.That(session.LastCommandBufferRtArena.unplannedTextureAllocations, Is.Zero);
+                Assert.That(session.LastCommandBufferRtArena.allPlannedResourcesBound, Is.True);
+                Assert.That(session.LastCommandBufferRtArena.allBoundResourcesReleased, Is.True);
+                Assert.That(ReadRFloat(readback, 18), Is.EqualTo(new[]
+                {
+                    1f, 2f, 3f, 4f, 0f, 0f,
+                    5f, 6f, 7f, 8f, 0f, 0f,
+                    9f, 10f, 11f, 12f, 0f, 0f
+                }).Within(1e-6f));
+            }
+            finally
+            {
+                if (input != null)
+                    session.ReturnTempArray(commandBuffer, input);
+                UnityEngine.Object.DestroyImmediate(readback);
+            }
+        }
+
+        [Test]
+        public void OnnxLowering_Rank4SoftmaxRestoresRemovedBatchAxisForPhysicalPack4Shape()
+        {
+            var model = new OnnxModel { opset = 18 };
+            model.graph.inputs.Add(Value("x", TensorDataType.Float32, 1, 2, 3, 5));
+            var softmaxNode = Node("softmax", "Softmax", new[] { "x" }, new[] { "y" });
+            softmaxNode.attributes["axis"] = Int(-1);
+            model.graph.nodes.Add(softmaxNode);
+
+            var result = AexisOnnxGraphLowering.Lower(model);
+
+            Assert.That(result.IsEligible, Is.True, DescribeLowering(result));
+            Assert.That(Find(result, "x").batchAxis, Is.EqualTo(0));
+            Assert.That(Find(result, "x").runtimeShape, Is.EqualTo(new long[] { 2, 3, 5 }));
+            var softmax = result.graph.layers.Single(layer => layer.typeName == "Softmax");
+            Assert.That(softmax.GetInt(0), Is.EqualTo(2), "ONNX axis=-1 becomes runtime axis 2 after removing batch.");
+            Assert.That(softmax.GetString("softmax.onnx_rank"), Is.EqualTo("4"));
+            Assert.That(softmax.GetString("softmax.runtime_rank"), Is.EqualTo("3"));
+            Assert.That(softmax.GetString("softmax.batch_axis"), Is.EqualTo("0"));
+
+            // The runtime may retain the singleton ONNX batch in its physical
+            // rank-4 Pack4 descriptor. Restore ONNX W (axis 3) before converting
+            // that NCNN axis to the shader's width coordinate.
+            var physicalShape = new AexisGraphSession.BufferShape(4, 5, 3, 2, 1);
+            Assert.That(AexisGraphSession.TryResolveSoftmaxNcnnAxis(softmax, physicalShape, out var ncnnAxis), Is.True);
+            Assert.That(ncnnAxis, Is.EqualTo(3));
+            Assert.That(AexisGraphSession.TryResolveSoftmaxTensorAxis(softmax, physicalShape, out var tensorAxis), Is.True);
+            Assert.That(tensorAxis, Is.EqualTo(0), "The Pack4 kernel axis 0 is the logical W axis.");
+
+            // Hand-authored layers and the legacy opset rewrite have no new
+            // coordinate metadata, so they retain their existing direct axis.
+            var legacyLayer = SoftmaxLayer(0);
+            legacyLayer.intParams[0] = "3";
+            Assert.That(AexisGraphSession.TryResolveSoftmaxNcnnAxis(legacyLayer, physicalShape, out ncnnAxis), Is.True);
+            Assert.That(ncnnAxis, Is.EqualTo(3));
+        }
+
+        [Test]
+        public void OnnxLowering_WhereOutputBatchContractComesFromValueBranches()
+        {
+            var model = new OnnxModel { opset = 18 };
+            var condition = Value("condition", TensorDataType.Int32, 1, 1, 2, 3);
+            condition.onnxDataType = 9;
+            model.graph.inputs.Add(condition);
+            model.graph.inputs.Add(Value("data", TensorDataType.Float32, 1, 2, 2, 3));
+            var transpose = Node("transpose", "Transpose", new[] { "data" }, new[] { "values" });
+            transpose.attributes["perm"] = Ints(1, 0, 2, 3);
+            model.graph.nodes.Add(transpose);
+            model.graph.nodes.Add(Node("where", "Where", new[] { "condition", "values", "values" }, new[] { "selected" }));
+            var softmax = Node("softmax", "Softmax", new[] { "selected" }, new[] { "result" });
+            softmax.attributes["axis"] = Int(3);
+            model.graph.nodes.Add(softmax);
+
+            var result = AexisOnnxGraphLowering.Lower(model);
+
+            Assert.That(Find(result, "condition").batchAxis, Is.EqualTo(0));
+            Assert.That(Find(result, "values").batchAxis, Is.EqualTo(1));
+            Assert.That(Find(result, "selected").batchAxis, Is.EqualTo(1),
+                "Where's mask must not replace the batch axis carried by its selected data values.");
+            var loweredSoftmax = result.graph.layers.Single(layer => layer.typeName == "Softmax");
+            Assert.That(loweredSoftmax.GetInt(0), Is.EqualTo(2),
+                "ONNX W axis 3 becomes runtime axis 2 after removing values' batch axis at position 1.");
+            Assert.That(result.diagnostics, Has.None.Matches<AexisOnnxLoweringDiagnostic>(diagnostic =>
+                diagnostic.code == "inconsistent-batch-axis" && diagnostic.node == "where"));
         }
 
         [Test]
@@ -4549,6 +4694,50 @@ namespace Aexis.Tests.Editor
                 UnityEngine.Object.DestroyImmediate(roiUpload);
                 UnityEngine.Object.DestroyImmediate(persistent);
             }
+        }
+
+        [Test]
+        public void CompactAttentionMaskPad4_PreservesTheLeftZeroPrefixInBoundedPack4Storage()
+        {
+            const int length = 226;
+            var inputSpatial = new AexisGraphSession.BufferShape(3, 2 * length - 1, length, 1, 2);
+            var inputStorage = new AexisGraphSession.BufferShape(3, 2 * length - 1, length, 1, 2);
+            var flattened = new AexisGraphSession.BufferShape(2, (2 * length - 1) * length, 2, 1, 1);
+            var reshape13 = new AexisGraphModel.Layer
+            {
+                name = "/flow/flows.6/enc/attn_layers.0/Reshape_13",
+                topNames = new[] { "flat" }
+            };
+
+            Assert.That(AexisGraphSession.TryResolveCompactAttentionMaskReshapeAlias(
+                reshape13, inputSpatial, inputStorage, flattened, out var flattenStorage), Is.True);
+            Assert.That(flattenStorage, Is.EqualTo(inputStorage));
+
+            var pad4 = new AexisGraphModel.Layer
+            {
+                name = "/flow/flows.6/enc/attn_layers.0/Pad_4",
+                topNames = new[] { "padded" },
+                intParams =
+                {
+                    [0] = "0", [1] = "0", [2] = length.ToString(CultureInfo.InvariantCulture), [3] = "0",
+                    [4] = "0", [5] = "0", [6] = "0", [7] = "0", [8] = "0"
+                }
+            };
+
+            Assert.That(AexisGraphSession.TryResolveCompactAttentionMaskPad4(
+                pad4, flattened, flattenStorage, out var padded, out var paddedStorage), Is.True);
+            Assert.That(padded, Is.EqualTo(new AexisGraphSession.BufferShape(2, 2 * length * length, 2, 1, 1)));
+            Assert.That(paddedStorage, Is.EqualTo(new AexisGraphSession.BufferShape(3, 2 * length, length, 1, 2)));
+
+            var reshape16 = new AexisGraphModel.Layer
+            {
+                name = "/flow/flows.6/enc/attn_layers.0/Reshape_16",
+                topNames = new[] { "restored" }
+            };
+            var restored = new AexisGraphSession.BufferShape(3, 2 * length, length, 1, 2);
+            Assert.That(AexisGraphSession.TryResolveCompactAttentionMaskReshapeAlias(
+                reshape16, padded, paddedStorage, restored, out var restoredStorage), Is.True);
+            Assert.That(restoredStorage, Is.EqualTo(paddedStorage));
         }
 
         private static AexisModelPreflightRequest StrictTextureRequest(AexisTexturePlanTensorDescriptor[] textureInputs)

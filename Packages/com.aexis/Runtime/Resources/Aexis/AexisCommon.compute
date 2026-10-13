@@ -23,8 +23,16 @@
 #pragma kernel AexisPackMaskToNhwcPack4
 #pragma kernel AexisUnpackPack4ToRgb
 #pragma kernel AexisConv3x3Pack4
+#pragma kernel AexisConv3x3Pack4Fp16Alu AEXIS_FP16_ALU
+#pragma kernel AexisConv5x5Pack4
+#pragma kernel AexisConv5x5Pack4Fp16Alu AEXIS_FP16_ALU
+#pragma kernel AexisConv5x5RawInt8Pack4
 #pragma kernel AexisConvPack4General
 #pragma kernel AexisDeconvolutionPack4General
+#pragma kernel AexisConvPack4GeneralFlat
+#pragma kernel AexisConvPack4GeneralTileX
+#pragma kernel AexisDeconvolutionPack4GeneralFlat
+#pragma kernel AexisDeconvolutionPack4GeneralTileX
 #pragma kernel AexisConv2dGroupPack4
 #pragma kernel AexisDeconvolution2dGroupPack4
 #pragma kernel AexisDeconvolutionDepthWisePack4
@@ -95,9 +103,13 @@
 #pragma kernel AexisPack4ToRgb01
 #pragma kernel AexisPack4ToRgbScaled
 #pragma kernel AexisNhwcPack4ToRgbScaled
+#pragma kernel AexisNhwcPack4TileToRgbScaled
+#pragma kernel AexisNchwPack4TileToRgbScaled
+#pragma kernel AexisSesrTailCrD12Pack4TileToRgbScaled
 #pragma kernel AexisProbeTilePack4
 #pragma kernel AexisProbeSeams
 #pragma kernel AexisPaddingPack4
+#pragma kernel AexisPaddingLinearMat2D
 #pragma kernel AexisPoolingPack4
 #pragma kernel AexisPooling1DPack4
 #pragma kernel AexisPoolingPack4CDHW
@@ -122,6 +134,7 @@
 #pragma kernel AexisBinaryOpPack4LinearMixedArray
 #pragma kernel AexisBinaryOpPack4Broadcast
 #pragma kernel AexisBinaryOpPack4BufferScalar
+#pragma kernel AexisBinaryOpPack4TexScalar
 #pragma kernel AexisBinaryOpPack4ChannelVectorTex
 #pragma kernel AexisBinaryOpScalarSingleBroadcast
 #pragma kernel AexisCodeFormerMinEncodingFromSoftOneHot
@@ -160,6 +173,8 @@
 #pragma kernel AexisReshapeLinearMatToPack4
 #pragma kernel AexisReshapeLinearMat2D
 #pragma kernel AexisAttentionReshapePack4
+#pragma kernel AexisAttentionMaskCompactPad4
+#pragma kernel AexisAttentionMaskCompactPad4D4
 #pragma kernel AexisAttentionContextFlattenPack4
 #pragma kernel AexisSlicePack4CDHW
 #pragma kernel AexisSwishPack4
@@ -190,6 +205,7 @@
 #pragma kernel AexisGemm2D16
 #pragma kernel AexisLayerNorm2D
 #pragma kernel AexisLayerNormPack4WidthTex
+#pragma kernel AexisLayerNormPack4ChannelsTex
 #pragma kernel AexisLayerNormPack4Linear2D
 #pragma kernel AexisSoftmax2D
 #pragma kernel AexisSoftmaxPack4CDHW
@@ -950,12 +966,16 @@ void AexisGfpganBuildDynamicWeight_Impl(uint3 id);
 void AexisGfpganAddNoisePack4_Impl(uint3 id);
 void AexisUnpackPack4ToRgb_Impl(uint3 id);
 void AexisConv3x3Pack4_Impl(uint3 id, uint3 groupId, uint3 groupThreadId);
+void AexisConv5x5Pack4_Impl(uint3 id, uint3 groupId, uint3 groupThreadId);
+void AexisConv5x5RawInt8Pack4_Impl(uint3 id);
 void AexisWinograd23TransformInputPack4_Impl(uint3 id);
 void AexisWinograd23GemmPack4_Impl(uint3 id);
 void AexisWinograd23TransformOutputPack4_Impl(uint3 id);
 void AexisConv1x1Pack4_Impl(uint3 id);
 void AexisConvPack4General_Impl(uint3 id);
+void AexisConvPack4GeneralFlat_Impl(int ox, int oy, int op);
 void AexisDeconvolutionPack4General_Impl(uint3 id);
+// v9-flat-kernel cache-bust marker: 2026-10-02
 void AexisDeconvolutionDepthWisePack4_Impl(uint3 id);
 void AexisConvDepthWisePack4_Impl(uint3 id);
 void AexisAddPack4_Impl(uint3 id);
@@ -1021,6 +1041,9 @@ void AexisSftPack4_Impl(uint3 id);
 void AexisPack4ToRgb01_Impl(uint3 id);
 void AexisPack4ToRgbScaled_Impl(uint3 id);
 void AexisNhwcPack4ToRgbScaled_Impl(uint3 id);
+void AexisNhwcPack4TileToRgbScaled_Impl(uint3 id);
+void AexisNchwPack4TileToRgbScaled_Impl(uint3 id);
+void AexisSesrTailCrD12Pack4TileToRgbScaled_Impl(uint3 id);
 void AexisConv3x3_Impl(uint3 id);
 void AexisConvDepthWise_Impl(uint3 id);
 void AexisConv3dBuf_Impl(uint3 id);
@@ -1057,6 +1080,7 @@ void AexisTouchU32_Impl(uint3 id);
 void AexisProbeTilePack4_Impl(uint3 id);
 void AexisProbeSeams_Impl(uint3 id);
 void AexisPaddingPack4_Impl(uint3 id);
+void AexisPaddingLinearMat2D_Impl(uint3 id);
 void AexisPoolingPack4_Impl(uint3 id);
 void AexisPooling1DPack4_Impl(uint3 id);
 void AexisPoolingPack4CDHW_Impl(uint3 id);
@@ -1079,6 +1103,7 @@ void AexisBinaryOpPack4LinearMixed_Impl(uint3 id);
 void AexisBinaryOpPack4LinearMixedArray_Impl(uint3 id);
 void AexisBinaryOpPack4Broadcast_Impl(uint3 id);
 void AexisBinaryOpPack4BufferScalar_Impl(uint3 id);
+void AexisBinaryOpPack4TexScalar_Impl(uint3 id);
 void AexisBinaryOpPack4ChannelVectorTex_Impl(uint3 id);
 void AexisBinaryOpScalarSingleBroadcast_Impl(uint3 id);
 void AexisCodeFormerMinEncodingFromSoftOneHot_Impl(uint3 id);
@@ -1120,6 +1145,7 @@ void AexisEmbedTextureLinearIndex_Impl(uint3 id);
 void AexisEmbedTexturePack4Index_Impl(uint3 id);
 void AexisLayerNorm2D_Impl(uint3 groupId, uint3 groupThreadId);
 void AexisLayerNormPack4WidthTex_Impl(uint3 id);
+void AexisLayerNormPack4ChannelsTex_Impl(uint3 id);
 void AexisLayerNormPack4Linear2D_Impl(uint3 id);
 void AexisSoftmax2D_Impl(uint3 groupId, uint3 groupThreadId);
 void AexisPermute_Impl(uint3 id);
@@ -1152,6 +1178,8 @@ void AexisReshapeScalar2DToPack4_Impl(uint3 id);
 void AexisPack4LinearFromScalar2D_Impl(uint3 id);
 void AexisReshapeLinearMatToPack4_Impl(uint3 id);
 void AexisAttentionReshapePack4_Impl(uint3 id);
+void AexisAttentionMaskCompactPad4_Impl(uint3 id);
+void AexisAttentionMaskCompactPad4D4_Impl(uint3 id);
 void AexisAttentionContextFlattenPack4_Impl(uint3 id);
 void AexisSlicePack4CDHW_Impl(uint3 id);
 void AexisGemm2DTextureA_Impl(uint3 id);
@@ -1225,6 +1253,8 @@ StructuredBuffer<float> _ConvWInt4Scales;
 StructuredBuffer<float> _ConvB;
 RWStructuredBuffer<float> _ConvOut;
 int _UseInt8ConvWeights;
+int _UseInt8ConvWeightUniformScale;
+float _Int8ConvWeightUniformScale;
 int _UseInt4ConvWeights;
 int _UseInt8Activations;
 float _Int8ActivationScale;
@@ -1268,6 +1298,10 @@ float _ActParam;
 float _ScaleX;
 float _ScaleY;
 float _InputValueScale;
+float _InputValueBias;
+int _InputReflectPad;
+int _InputPaddedWidth;
+int _InputPaddedHeight;
 float _OutputValueScale;
 float _OutputValueBias;
 float _MaskThreshold;
@@ -1371,7 +1405,10 @@ void AexisUnpackPack4ToRgb(uint3 id : SV_DispatchThreadID)
 
 StructuredBuffer<float4> _ConvW4;
 StructuredBuffer<uint2> _ConvW4Fp16;
+StructuredBuffer<uint> _ConvW4Int8Packed;
 StructuredBuffer<float4> _ConvB4;
+int _UseInt8ConvPack4Weights;
+float _Int8ConvPack4WeightScale;
 Texture2DArray<float4> _GfpganDynamicConvW4Tex;
 StructuredBuffer<float4> _DwConvW4;
 StructuredBuffer<uint2> _DwConvW4Fp16;
@@ -1380,6 +1417,8 @@ RWTexture2DArray<float4> _ConvOutArr;
 Texture2DArray<float4> _ConvInArr;
 int _InPacks;
 int _OutPacks;
+int _InTileW;  // 1D convolution input row width; zero for conventional texture storage.
+int _OutTileW; // 2D layout: >0 means wrap output into rows of this width (for outputs > maxTextureSize)
 int _UseFp16ConvWeights;
 int _UseFp16DepthWiseWeights;
 int _UseGfpganDynWeights;
@@ -1415,17 +1454,68 @@ void AexisAccumulateDot4(inout float4 sum, float4 v, float4 w0, float4 w1, float
     sum.w += dot(v, w3);
 }
 
-groupshared float4 _ConvTile[18 * 18];
-groupshared float4 _ConvWeight0[9 * 4];
-groupshared float4 _ConvWeight1[9 * 4];
+// The realtime SESR body has four Pack4 input/output channels.  A 16x4
+// group keeps the same two-output-pack / 2x2-pixel register tile as the
+// previous 16x8 kernel, but covers a 32x8 output region.  Its 34x10 source
+// tile uses 44% less LDS per group (and half as many live threads), which
+// lets memory-constrained D3D11 GPUs keep more convolution groups resident.
+// The additional vertical group boundary does not alter the direct 3x3
+// calculation: every output still reads the identical source and weights.
+// Unity's D3D11 compiler applies the keyword only to the dedicated SESR
+// kernel below.  All general Aexis consumers retain float32 accumulation.
+#if defined(AEXIS_FP16_ALU)
+    #define AEXIS_CONV_VECTOR min16float4
+#else
+    #define AEXIS_CONV_VECTOR float4
+#endif
+
+groupshared AEXIS_CONV_VECTOR _ConvTile[34 * 10];
+groupshared AEXIS_CONV_VECTOR _ConvWeight0[9 * 4];
+groupshared AEXIS_CONV_VECTOR _ConvWeight1[9 * 4];
+groupshared AEXIS_CONV_VECTOR _Conv5Tile[36 * 12];
+groupshared AEXIS_CONV_VECTOR _Conv5Weight0[25 * 4];
+groupshared AEXIS_CONV_VECTOR _Conv5Weight1[25 * 4];
 
 // Direct-read 3x3 pack4 with group-shared input tile reuse.
-// One 8x8 thread group covers a 16x16 output region and stages the corresponding
-// 18x18 input tile once per input-pack, while each invocation computes a 2x2 x 2-pack block.
-[numthreads(8,8,1)]
+// One 16x4 thread group covers a 32x8 output region and stages the corresponding
+// 34x10 input tile once per input-pack, while each invocation computes a 2x2 x 2-pack block.
+[numthreads(16,4,1)]
 void AexisConv3x3Pack4(uint3 id : SV_DispatchThreadID, uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_GroupThreadID)
 {
     AexisConv3x3Pack4_Impl(id, groupId, groupThreadId);
+}
+
+// SESR uses FP16 feature maps and weights end-to-end.  This separately compiled
+// variant permits the Arc driver to issue native min16 dot/FMA operations while
+// keeping the ordinary Aexis convolution ABI and FP32 path untouched.
+[numthreads(16,4,1)]
+void AexisConv3x3Pack4Fp16Alu(uint3 id : SV_DispatchThreadID, uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_GroupThreadID)
+{
+    AexisConv3x3Pack4_Impl(id, groupId, groupThreadId);
+}
+
+// 5x5 full-Pack4 convolution shares the same 32x8 spatial group.  It is used
+// by SESR's head/tail only when its full-channel, stride-1, pad-2 contract is
+// met; general 5x5 operators retain their existing kernel.
+[numthreads(16,4,1)]
+void AexisConv5x5Pack4(uint3 id : SV_DispatchThreadID, uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_GroupThreadID)
+{
+    AexisConv5x5Pack4_Impl(id, groupId, groupThreadId);
+}
+
+[numthreads(16,4,1)]
+void AexisConv5x5Pack4Fp16Alu(uint3 id : SV_DispatchThreadID, uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_GroupThreadID)
+{
+    AexisConv5x5Pack4_Impl(id, groupId, groupThreadId);
+}
+
+// This uses the same raw OIHW INT8 resources as AexisConv2dGroupPack4. It is
+// intentionally separate from AexisConv5x5Pack4, whose compact O4I4K weights
+// require complete input packs and therefore cannot represent the RGB head.
+[numthreads(8,8,1)]
+void AexisConv5x5RawInt8Pack4(uint3 id : SV_DispatchThreadID)
+{
+    AexisConv5x5RawInt8Pack4_Impl(id);
 }
 
 Texture2DArray<float4> _WinoInArr;
@@ -1440,6 +1530,16 @@ int _WinoInCstep;
 int _WinoOutCstep;
 int _WinoBlockX;
 int _WinoBlockY;
+
+// Winograd F(2,3) reads a 4x4 footprint from an implicitly zero-padded input.
+// Keep the full two-sided bounds check in one helper so D3D11 never receives a
+// negative texture coordinate from the first output tile.
+float4 AexisWinoReadInput(int x, int y, int pack)
+{
+    if (x < 0 || y < 0 || x >= _WinoW || y >= _WinoH)
+        return 0.0;
+    return _WinoInArr[int3(x, y, pack)];
+}
 int _WinoOutW;
 int _WinoOutH;
 int _WinoBiasTerm;
@@ -1481,6 +1581,61 @@ void AexisConvPack4General(uint3 id : SV_DispatchThreadID)
 void AexisDeconvolutionPack4General(uint3 id : SV_DispatchThreadID)
 {
     AexisDeconvolutionPack4General_Impl(id);
+}
+
+// Flat 1D dispatch variants for narrow 1-row vocoder stages. One thread per output
+// texel: the linear thread index is decomposed into (ox,oy,op) over the whole
+// output texture. Unlike the 8x8 tiled path, no workgroup slots are wasted on an
+// empty y-dimension when height==1, so the early narrow resblock/deconv stages
+// fill all 12 SMs instead of launching mostly-idle 8x8 workgroups. Numerically
+// identical to the tiled kernels (same inner loop, same output coordinate).
+[numthreads(256,1,1)]
+void AexisConvPack4GeneralFlat(uint3 id : SV_DispatchThreadID)
+{
+    uint ow, oh, od;
+    _ConvOutArr.GetDimensions(ow, oh, od);
+    if (id.x >= ow) return;
+    int ox = (int)id.x;
+    int oy = 0;
+    int op = (int)id.z;
+    AexisConvPack4GeneralFlat_Impl(ox, oy, op);
+}
+
+// Forward declarations for tiled kernel implementations (defined in included .hlsl)
+void AexisConvPack4GeneralTileX_Impl(int ox, int oy, int op);
+void AexisDeconvolutionPack4GeneralTileX_Impl(int baseOx, int oy, int op);
+
+// 1D register-tiled conv: each thread computes 4 output pixels along x, caching
+// input texels in registers to raise arithmetic intensity for narrow 1-row stages.
+[numthreads(256,1,1)]
+void AexisConvPack4GeneralTileX(uint3 id : SV_DispatchThreadID)
+{
+    uint ow, oh, od;
+    _ConvOutArr.GetDimensions(ow, oh, od);
+    int ox = (int)id.x * 4; // each thread handles 4 outputs
+    int oy = 0;
+    int op = (int)id.z;
+    AexisConvPack4GeneralTileX_Impl(ox, oy, op);
+}
+
+[numthreads(256,1,1)]
+void AexisDeconvolutionPack4GeneralFlat(uint3 id : SV_DispatchThreadID)
+{
+    uint ow, oh, od;
+    _ConvOutArr.GetDimensions(ow, oh, od);
+    if (id.x >= ow) return;
+    AexisDeconvolutionPack4General_Impl(uint3(id.x, 0, id.z));
+}
+
+// Wide deconv tiling: each thread computes 8 output pixels along x, caching input reads.
+[numthreads(256,1,1)]
+void AexisDeconvolutionPack4GeneralTileX(uint3 id : SV_DispatchThreadID)
+{
+    uint ow, oh, od;
+    _ConvOutArr.GetDimensions(ow, oh, od);
+    int baseOx = (int)id.x * 8;
+    int op = (int)id.z;
+    AexisDeconvolutionPack4GeneralTileX_Impl(baseOx, 0, op);
 }
 
 [numthreads(8,8,1)]
@@ -2046,6 +2201,7 @@ float _LreluSlope;
 StructuredBuffer<float> _PReluSlopePack4Buf;
 int _PReluSlopePack4Count;
 int _PReluSlopePack4Packs;
+int _ConvUsePRelu;
 
 [numthreads(8,8,1)]
 void AexisLeakyReluPack4(uint3 id : SV_DispatchThreadID)
@@ -2106,6 +2262,24 @@ void AexisPack4ToRgbScaled(uint3 id : SV_DispatchThreadID)
 void AexisNhwcPack4ToRgbScaled(uint3 id : SV_DispatchThreadID)
 {
     AexisNhwcPack4ToRgbScaled_Impl(id);
+}
+
+[numthreads(32,32,1)]
+void AexisNhwcPack4TileToRgbScaled(uint3 id : SV_DispatchThreadID)
+{
+    AexisNhwcPack4TileToRgbScaled_Impl(id);
+}
+
+[numthreads(32,32,1)]
+void AexisNchwPack4TileToRgbScaled(uint3 id : SV_DispatchThreadID)
+{
+    AexisNchwPack4TileToRgbScaled_Impl(id);
+}
+
+[numthreads(32,32,1)]
+void AexisSesrTailCrD12Pack4TileToRgbScaled(uint3 id : SV_DispatchThreadID)
+{
+    AexisSesrTailCrD12Pack4TileToRgbScaled_Impl(id);
 }
 
 [numthreads(8,8,1)]
@@ -2681,6 +2855,7 @@ int _SlicePack4CDHWInD;
 int _SlicePack4CDHWInC;
 int _SlicePack4CDHWAxis;
 int _SlicePack4CDHWBegin;
+int _SlicePack4CDHWStep;
 int _SlicePack4CDHWOutW;
 int _SlicePack4CDHWOutH;
 int _SlicePack4CDHWOutD;
@@ -2786,6 +2961,19 @@ int _AttentionReshapeInC;
 int _AttentionReshapeHeadDim;
 int _AttentionReshapeOutD;
 int _AttentionReshapeOutC;
+
+// Relative-position attention mask compact path. The source is the Pad_1
+// rank-4 tensor [srcW,srcH,2,1]. Reshape_7 flattens each depth slice into a
+// row, Pad_2 appends padRight zeros to each row, and Reshape_10 repacks the
+// two rows as the output channels [outW,outH,1,2].
+int _AttentionMaskCompactSrcW;
+int _AttentionMaskCompactSrcH;
+int _AttentionMaskCompactOutW;
+int _AttentionMaskCompactOutH;
+int _AttentionMaskCompactPadRight;
+int _AttentionMaskCompactPadLeft;
+int _AttentionMaskCompactSrcD;
+int _AttentionMaskCompactSrcC;
 
 
 int _AttentionContextFlattenInW;
@@ -3002,6 +3190,12 @@ void AexisPaddingPack4(uint3 id : SV_DispatchThreadID)
 }
 
 [numthreads(8,8,1)]
+void AexisPaddingLinearMat2D(uint3 id : SV_DispatchThreadID)
+{
+    AexisPaddingLinearMat2D_Impl(id);
+}
+
+[numthreads(8,8,1)]
 void AexisPoolingPack4(uint3 id : SV_DispatchThreadID)
 {
     AexisPoolingPack4_Impl(id);
@@ -3136,6 +3330,12 @@ void AexisBinaryOpPack4Broadcast(uint3 id : SV_DispatchThreadID)
 void AexisBinaryOpPack4BufferScalar(uint3 id : SV_DispatchThreadID)
 {
     AexisBinaryOpPack4BufferScalar_Impl(id);
+}
+
+[numthreads(8,8,1)]
+void AexisBinaryOpPack4TexScalar(uint3 id : SV_DispatchThreadID)
+{
+    AexisBinaryOpPack4TexScalar_Impl(id);
 }
 
 [numthreads(8,8,1)]
@@ -3428,6 +3628,12 @@ void AexisLayerNorm2D(uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_Group
 void AexisLayerNormPack4WidthTex(uint3 id : SV_DispatchThreadID)
 {
     AexisLayerNormPack4WidthTex_Impl(id);
+}
+
+[numthreads(8,8,1)]
+void AexisLayerNormPack4ChannelsTex(uint3 id : SV_DispatchThreadID)
+{
+    AexisLayerNormPack4ChannelsTex_Impl(id);
 }
 
 [numthreads(8,8,1)]
@@ -3811,6 +4017,18 @@ void AexisReshapeLinearMat2D(uint3 id : SV_DispatchThreadID)
 void AexisAttentionReshapePack4(uint3 id : SV_DispatchThreadID)
 {
     AexisAttentionReshapePack4_Impl(id);
+}
+
+[numthreads(8,8,1)]
+void AexisAttentionMaskCompactPad4(uint3 id : SV_DispatchThreadID)
+{
+    AexisAttentionMaskCompactPad4_Impl(id);
+}
+
+[numthreads(8,8,1)]
+void AexisAttentionMaskCompactPad4D4(uint3 id : SV_DispatchThreadID)
+{
+    AexisAttentionMaskCompactPad4D4_Impl(id);
 }
 
 [numthreads(8,8,1)]

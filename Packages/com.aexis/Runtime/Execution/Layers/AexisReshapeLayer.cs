@@ -322,6 +322,24 @@ namespace Aexis.Execution
                 return;
             }
 
+            // Reshape_13 and Reshape_16 are descriptor-only views around the
+            // compact Pad_4 result.  Preserve the bounded physical texture on
+            // the legacy RenderTexture path too; otherwise the generic reshape
+            // code attempts to allocate the oversized flattened LinearMat.
+            var compactStorage = AexisGraphSession.GetTextureStorageShape(src, srcShape);
+            if (AexisGraphSession.TryResolveCompactAttentionMaskReshapeAlias(
+                    layer,
+                    srcShape,
+                    compactStorage,
+                    outShape,
+                    out var compactAliasStorage))
+            {
+                textureBlobs[layer.topNames[0]] = AexisGraphSession.CreateTextureAlias(src, outShape, compactAliasStorage);
+                textureShapes[layer.topNames[0]] = outShape;
+                owner.Consume(textureBlobs, bufferBlobs, bufferRefs, bufferViews, remaining, layer.bottomNames, pinnedNames);
+                return;
+            }
+
             // A d3 attention context packs channels into texture lanes. Flattening
             // it to d2 changes physical order and must use the texture reshape path.
             if (TryExecuteRenderTextureDirectAttentionQkvReshapeAlias(owner, layer, src, srcShape, bottomShapes, textureBlobs, textureShapes))
@@ -468,6 +486,23 @@ namespace Aexis.Execution
                 return;
             }
 
+            // The long flow attention mask uses a compact Pack4 alias for the
+            // intermediate [2, 2L^2] reshape and for the final [2, L+1, 2L-1]
+            // view. Pad_2 performs the only real data movement. This keeps the
+            // logical ONNX views while avoiding an oversized LinearMat texture.
+            if (TryExecuteCommandBufferCompactAttentionMaskAlias(
+                    layer,
+                    owner,
+                    src,
+                    srcShape,
+                    initialOutShape,
+                    blobs,
+                    shapes))
+            {
+                owner.ConsumeCmd(cmd, blobs, remaining, layer.bottomNames, pinnedNames, shapes);
+                return;
+            }
+
             if (TryExecuteCommandBufferDirectAttentionQkvReshapeAlias(owner, layer, src, srcShape, bottomShapes, blobs, shapes))
             {
                 owner.ConsumeCmd(cmd, blobs, remaining, layer.bottomNames, pinnedNames, shapes);
@@ -591,14 +626,62 @@ namespace Aexis.Execution
             }
 
             var aliasStorageShape = ResolveTextureStorageShape(outShape);
-            if (!CanAliasTextureLayout(owner, srcShape, outShape) || !MatchesCmdTextureStorageShape(src, aliasStorageShape))
-                throw new InvalidOperationException("Reshape command-buffer path only supports alias-compatible layout or explicit pack4 specializations: " + layer.name);
+            var canAliasTextureLayout = CanAliasTextureLayout(owner, srcShape, outShape);
+            var matchesAliasStorage = MatchesCmdTextureStorageShape(src, aliasStorageShape);
+            if (!canAliasTextureLayout || !matchesAliasStorage)
+            {
+                var storageShape = AexisGraphSession.GetCmdStorageShape(src, srcShape);
+                throw new InvalidOperationException(
+                    "Reshape command-buffer path only supports alias-compatible layout or explicit pack4 specializations"
+                    + " | layer=" + layer.name
+                    + " | logical=d" + srcShape.dims + ":" + srcShape.w + "x" + srcShape.h + "x" + srcShape.d + "x" + srcShape.c
+                    + " -> d" + outShape.dims + ":" + outShape.w + "x" + outShape.h + "x" + outShape.d + "x" + outShape.c
+                    + " | storage=d" + storageShape.dims + ":" + storageShape.w + "x" + storageShape.h + "x" + storageShape.d + "x" + storageShape.c
+                    + " | texture=" + src.width + "x" + src.height + "x" + src.texture.depth + " packs=" + src.packs
+                    + " | aliasStorage=d" + aliasStorageShape.dims + ":" + aliasStorageShape.w + "x" + aliasStorageShape.h + "x" + aliasStorageShape.d + "x" + aliasStorageShape.c
+                    + " | canAlias=" + canAliasTextureLayout + " matchesAliasStorage=" + matchesAliasStorage
+                    + " | layout=" + sourceContract.LayoutKind);
+            }
 
             var fallbackStorageShape = AexisGraphSession.GetCmdStorageShape(src, srcShape);
             blobs[layer.topNames[0]] = AexisGraphSession.CreateCmdTensorAlias(src, outShape, fallbackStorageShape);
             if (shapes != null)
                 shapes[layer.topNames[0]] = outShape;
             owner.ConsumeCmd(cmd, blobs, remaining, layer.bottomNames, pinnedNames, shapes);
+        }
+
+        private static bool TryExecuteCommandBufferCompactAttentionMaskAlias(
+            AexisGraphModel.Layer layer,
+            AexisGraphSession owner,
+            AexisGraphSession.CmdTensorRef src,
+            AexisGraphSession.BufferShape srcShape,
+            AexisGraphSession.BufferShape outShape,
+            System.Collections.Generic.Dictionary<string, AexisGraphSession.CmdTensorRef> blobs,
+            System.Collections.Generic.Dictionary<string, AexisGraphSession.BufferShape> shapes)
+        {
+            if (owner == null || src == null || src.texture == null)
+                return false;
+
+            var storageShape = AexisGraphSession.GetCmdStorageShape(src, srcShape);
+            if (!AexisGraphSession.TryResolveCompactAttentionMaskReshapeAlias(
+                    layer,
+                    srcShape,
+                    storageShape,
+                    outShape,
+                    out var aliasStorage))
+            {
+                return false;
+            }
+
+            blobs[layer.topNames[0]] = AexisGraphSession.CreateCmdTensorAlias(src, outShape, aliasStorage);
+            if (shapes != null)
+                shapes[layer.topNames[0]] = outShape;
+            owner.DebugLog?.Invoke(
+                "[CmdTexture][AttentionMaskAlias]"
+                + " | layer=" + layer.name
+                + " | src=d" + srcShape.dims + ":" + srcShape.w + "x" + srcShape.h + "x" + srcShape.d + "x" + srcShape.c
+                + " | out=d" + outShape.dims + ":" + outShape.w + "x" + outShape.h + "x" + outShape.d + "x" + outShape.c);
+            return true;
         }
 
         private static bool TryExecuteCommandBufferLinearMat2DReshape(
@@ -968,7 +1051,9 @@ namespace Aexis.Execution
 
             var bottomShapes = BuildCmdBottomShapes(layer, blobs, shapes);
             var outShape = AexisGraphSession.ResolveReshapeShape(srcShape, layer, bottomShapes);
-            if (!CanUsePack4ToPack4Reshape(owner, srcShape, outShape))
+            var srcStorageShape = AexisGraphSession.GetCmdStorageShape(src, srcShape);
+            if (!CanUsePack4ToPack4Reshape(owner, srcShape, outShape)
+                && !CanUsePaddedScalar2DPack4ToPack4Reshape(owner, srcShape, outShape, srcStorageShape))
                 return false;
 
             var outPacks = Mathf.Max(1, Mathf.CeilToInt(outShape.c / 4f));
@@ -2715,7 +2800,16 @@ namespace Aexis.Execution
                 return true;
 
             var expectedW = srcShape.w * srcShape.h * Mathf.Max(1, srcShape.d);
-            return outShape.w == expectedW && outShape.h == srcShape.c;
+            if (outShape.w == expectedW && outShape.h == srcShape.c)
+                return true;
+
+            // Attention score preparation keeps each head as one row after
+            // flattening its [query,key] matrix.  The source is represented as
+            // [key, query, head, channel] in the Pack4 reader, while the ONNX
+            // target is [head*channel, query*key].  The linear kernel already
+            // preserves this stream; expose the exact row break here.
+            return outShape.w == srcShape.w * srcShape.h
+                && outShape.h == Mathf.Max(1, srcShape.d) * srcShape.c;
         }
 
         private static bool CanUsePack4ToPack4Reshape(
@@ -2740,6 +2834,33 @@ namespace Aexis.Execution
                 || srcShape.h != outShape.h
                 || srcShape.d != outShape.d
                 || srcShape.c != outShape.c;
+        }
+
+        private static bool CanUsePaddedScalar2DPack4ToPack4Reshape(
+            AexisGraphSession owner,
+            AexisGraphSession.BufferShape srcShape,
+            AexisGraphSession.BufferShape outShape,
+            AexisGraphSession.BufferShape storageShape)
+        {
+            if (!ShouldAllowGenericPack4ReshapeSpecializations(owner)
+                || srcShape.dims != 2
+                || outShape.dims < 3 || outShape.dims > 4
+                || storageShape.dims != 3
+                || storageShape.w != srcShape.w
+                || storageShape.h != srcShape.h
+                || storageShape.d != 1
+                || storageShape.c != 4)
+                return false;
+            if (srcShape.w <= 0 || srcShape.h <= 0 || outShape.w <= 0 || outShape.h <= 0 || outShape.c <= 0)
+                return false;
+
+            var srcCount = (long)srcShape.w * srcShape.h;
+            var outCount = (long)outShape.w * outShape.h * outShape.d * outShape.c;
+            return srcCount == outCount
+                && (srcShape.w != outShape.w
+                    || srcShape.h != outShape.h
+                    || srcShape.dims != outShape.dims
+                    || srcShape.c != outShape.c);
         }
 
         private static bool CanUseCodeFormerStylePack4ToScalar2DReshape(

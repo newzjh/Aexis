@@ -342,6 +342,51 @@ void AexisPaddingPack4_Impl(uint3 id)
     _PadOutArr[int3((int)id.x, (int)id.y, p)] = _PadInArr[int3(sx, sy, sp)];
 }
 
+int AexisPaddingReflect101Index(int coord, int length)
+{
+    if (length <= 1)
+        return 0;
+    int period = length * 2 - 2;
+    int value = abs(coord) % period;
+    return value >= length ? period - value : value;
+}
+
+void AexisPaddingLinearMat2D_Impl(uint3 id)
+{
+    uint ow, oh;
+    _LinearOut0.GetDimensions(ow, oh);
+    if (id.x >= ow || id.y >= oh)
+        return;
+
+    uint iw, ih;
+    _LinearIn0.GetDimensions(iw, ih);
+    int sx = (int)id.x - _PadLeft;
+    int sy = (int)id.y - _PadTop;
+    bool outside = sx < 0 || sy < 0 || sx >= (int)iw || sy >= (int)ih;
+    if (outside && _PadType == 0)
+    {
+        _LinearOut0[int2((int)id.x, (int)id.y)] = _PadValue4.x;
+        return;
+    }
+
+    if (sx < 0 || sx >= (int)iw)
+    {
+        if (_PadType == 1)
+            sx = clamp(sx, 0, (int)iw - 1);
+        else
+            sx = AexisPaddingReflect101Index(sx, (int)iw);
+    }
+    if (sy < 0 || sy >= (int)ih)
+    {
+        if (_PadType == 1)
+            sy = clamp(sy, 0, (int)ih - 1);
+        else
+            sy = AexisPaddingReflect101Index(sy, (int)ih);
+    }
+
+    _LinearOut0[int2((int)id.x, (int)id.y)] = _LinearIn0[int2(sx, sy)];
+}
+
 void AexisPoolingPack4_Impl(uint3 id)
 {
     uint ow, oh, od;
@@ -857,6 +902,24 @@ void AexisBinaryOpPack4Broadcast_Impl(uint3 id)
         aCoord = int3((int)id.x, 0, 0);
     else if (broadcastMode == 8)
         bCoord = int3((int)id.x, 0, 0);
+    else if (broadcastMode == 9)
+        bCoord = int3(0, 0, 0);
+    // 深度轴广播：两个操作数共享同一 Pack4 通道打包，仅一侧的逻辑深度轴为 1
+    // （batch 共享的相对位置注意力项）。输出深度为存活一侧的 d*packs；单层操作数
+    // 的纹理深度恰好等于 packs，故按 pack 索引循环复用即可（保留全部通道，不做
+    // 通道复制）。
+    else if (broadcastMode == 10)
+    {
+        uint bw, bh, bd;
+        _BinaryB.GetDimensions(bw, bh, bd);
+        bCoord.z = bd > 0 ? (p % (int)bd) : 0;
+    }
+    else if (broadcastMode == 11)
+    {
+        uint aw, ah, ad;
+        _BinaryA.GetDimensions(aw, ah, ad);
+        aCoord.z = ad > 0 ? (p % (int)ad) : 0;
+    }
 
     float4 a = _BinaryA[aCoord];
     float4 b = _BinaryB[bCoord];
@@ -867,6 +930,8 @@ void AexisBinaryOpPack4Broadcast_Impl(uint3 id)
     else if (broadcastMode == 7)
         a = a.xxxx;
     else if (broadcastMode == 8)
+        b = b.xxxx;
+    else if (broadcastMode == 9)
         b = b.xxxx;
 
     _BinaryOutArr[int3((int)id.x, (int)id.y, p)] = AexisApplyBinaryOp4(a, b, _BinaryOpType);
@@ -887,6 +952,23 @@ void AexisBinaryOpPack4BufferScalar_Impl(uint3 id)
     float4 b = _BinaryPack4BufferScalarMode == 1 ? tex : scalar;
 
     _BinaryOutArr[int3((int)id.x, (int)id.y, p)] = AexisApplyBinaryOp4(a, b, _BinaryOpType);
+}
+
+// 标量纹理全广播（MemoryData 单元素常量以 Texture2D 发布）：直接从 _LinearIn1[0,0] 读标量，
+// 避免把 Tex2D 绑给 Texture2DArray 槽 _TexIn1Arr 造成的维度不匹配（expected 5, got 2）。
+void AexisBinaryOpPack4TexScalar_Impl(uint3 id)
+{
+    uint w, h, d;
+    _BinaryOutArr.GetDimensions(w, h, d);
+    if (id.x >= w || id.y >= h) return;
+    int p = (int)id.z;
+    if (p < 0 || p >= (int)d) return;
+
+    float4 tex = _BinaryA[int3((int)id.x, (int)id.y, p)];
+    float s = _LinearIn1[int2(0, 0)];
+    float4 scalar = float4(s, s, s, s);
+
+    _BinaryOutArr[int3((int)id.x, (int)id.y, p)] = AexisApplyBinaryOp4(tex, scalar, _BinaryOpType);
 }
 
 void AexisBinaryOpPack4ChannelVectorTex_Impl(uint3 id)

@@ -37,11 +37,14 @@ namespace Aexis.Execution
             uploadMs += phaseSw.ElapsedMilliseconds;
 
             owner._extraPacks[layer.name] = pp;
+            owner.AttachFusedPRelu(layer, pp);
             return new AexisGraphSession.LayerLoadMetrics(Math.Max(0, br.Position - bytesStart), readMs, uploadMs, packMs);
         }
 
         public override void ExecuteBuffer(AexisGraphSession owner, AexisGraphModel.Layer layer, AexisLayerBufferContext context)
         {
+            if (owner.IsFusedPReluLayer(layer.name))
+                return;
             if (!owner._extraPacks.TryGetValue(layer.name, out var packObj) || packObj is not AexisGraphSession.PReluPack pp)
                 throw new InvalidOperationException("PReLU pack not found: " + layer.name);
 
@@ -100,6 +103,8 @@ namespace Aexis.Execution
 
         public override void ExecuteRenderTexturePath(AexisGraphSession owner, AexisGraphModel.Layer layer, AexisLayerBufferContext context)
         {
+            if (owner.IsFusedPReluLayer(layer.name))
+                return;
             if (!owner._extraPacks.TryGetValue(layer.name, out var packObj) || packObj is not AexisGraphSession.PReluPack pp)
                 throw new InvalidOperationException("PReLU pack not found: " + layer.name);
 
@@ -122,6 +127,8 @@ namespace Aexis.Execution
 
         public override void ExecuteCommandBuffer(AexisGraphSession owner, AexisGraphModel.Layer layer, AexisLayerCommandBufferContext context)
         {
+            if (owner.IsFusedPReluLayer(layer.name))
+                return;
             if (!owner._extraPacks.TryGetValue(layer.name, out var packObj) || packObj is not AexisGraphSession.PReluPack pp)
                 throw new InvalidOperationException("PReLU pack not found: " + layer.name);
 

@@ -535,6 +535,127 @@ void AexisNhwcPack4ToRgbScaled_Impl(uint3 id)
         1.0);
 }
 
+// Directly composites a cropped/scaled SESR NHWC tile to the final RGB target.
+// The ONNX boundary layout is [H,W,C], represented as width=C, height=W,
+// and slice/lane=H in the Pack4 texture. This avoids materializing a 512²
+// RGB RT for every tile before composing its non-overlapping core.
+void AexisNhwcPack4TileToRgbScaled_Impl(uint3 id)
+{
+    if ((int)id.x >= _BlitW || (int)id.y >= _BlitH) return;
+    int2 dst = int2(_DstX + (int)id.x, _DstY + (int)id.y);
+    float srcXf = (float)_TilePadX + ((float)id.x + 0.5) * (float)_TileCoreW / (float)_BlitW - 0.5;
+    float srcYf = (float)_TilePadY + ((float)id.y + 0.5) * (float)_TileCoreH / (float)_BlitH - 0.5;
+    int x0 = (int)floor(srcXf);
+    int y0 = (int)floor(srcYf);
+    int x1 = x0 + 1;
+    int y1 = y0 + 1;
+    float tx = srcXf - (float)x0;
+    float ty = srcYf - (float)y0;
+    x0 = clamp(x0, 0, _TileW - 1);
+    x1 = clamp(x1, 0, _TileW - 1);
+    y0 = clamp(y0, 0, _TileH - 1);
+    y1 = clamp(y1, 0, _TileH - 1);
+
+    int p0 = y0 >> 2;
+    int p1 = y1 >> 2;
+    int l0 = y0 & 3;
+    int l1 = y1 & 3;
+    float3 v00 = float3(
+        AexisReadLane(_RgbInArr[int3(0, x0, p0)], l0),
+        AexisReadLane(_RgbInArr[int3(1, x0, p0)], l0),
+        AexisReadLane(_RgbInArr[int3(2, x0, p0)], l0));
+    float3 v10 = float3(
+        AexisReadLane(_RgbInArr[int3(0, x1, p0)], l0),
+        AexisReadLane(_RgbInArr[int3(1, x1, p0)], l0),
+        AexisReadLane(_RgbInArr[int3(2, x1, p0)], l0));
+    float3 v01 = float3(
+        AexisReadLane(_RgbInArr[int3(0, x0, p1)], l1),
+        AexisReadLane(_RgbInArr[int3(1, x0, p1)], l1),
+        AexisReadLane(_RgbInArr[int3(2, x0, p1)], l1));
+    float3 v11 = float3(
+        AexisReadLane(_RgbInArr[int3(0, x1, p1)], l1),
+        AexisReadLane(_RgbInArr[int3(1, x1, p1)], l1),
+        AexisReadLane(_RgbInArr[int3(2, x1, p1)], l1));
+    float3 v = lerp(lerp(v00, v10, tx), lerp(v01, v11, tx), ty);
+    _RgbOut[dst] = float4(saturate(v * _OutputValueScale + _OutputValueBias), 1.0);
+}
+
+// Exact terminal rewrite for models whose last useful operation leaves a
+// three-channel NCHW Pack4 texture.  SESR's PixelShuffle is such an operation:
+// reading float4.xyz here is identical to first materialising the final
+// NCHW->NHWC transpose and then having AexisNhwcPack4TileToRgbScaled read its
+// three channel planes.  Avoiding that transpose removes one full-size
+// intermediate read/write without changing the sampling, crop, or colour math.
+void AexisNchwPack4TileToRgbScaled_Impl(uint3 id)
+{
+    if ((int)id.x >= _BlitW || (int)id.y >= _BlitH) return;
+    int2 dst = int2(_DstX + (int)id.x, _DstY + (int)id.y);
+    float srcXf = (float)_TilePadX + ((float)id.x + 0.5) * (float)_TileCoreW / (float)_BlitW - 0.5;
+    float srcYf = (float)_TilePadY + ((float)id.y + 0.5) * (float)_TileCoreH / (float)_BlitH - 0.5;
+    int x0 = (int)floor(srcXf);
+    int y0 = (int)floor(srcYf);
+    int x1 = x0 + 1;
+    int y1 = y0 + 1;
+    float tx = srcXf - (float)x0;
+    float ty = srcYf - (float)y0;
+    x0 = clamp(x0, 0, _TileW - 1);
+    x1 = clamp(x1, 0, _TileW - 1);
+    y0 = clamp(y0, 0, _TileH - 1);
+    y1 = clamp(y1, 0, _TileH - 1);
+
+    float3 v00 = _RgbInArr[int3(x0, y0, 0)].xyz;
+    float3 v10 = _RgbInArr[int3(x1, y0, 0)].xyz;
+    float3 v01 = _RgbInArr[int3(x0, y1, 0)].xyz;
+    float3 v11 = _RgbInArr[int3(x1, y1, 0)].xyz;
+    float3 v = lerp(lerp(v00, v10, tx), lerp(v01, v11, tx), ty);
+    _RgbOut[dst] = float4(saturate(v * _OutputValueScale + _OutputValueBias), 1.0);
+}
+
+// SESR-M7 has a fixed terminal PixelShuffle: x2, CRD ordering, and 12 NCHW
+// tail channels arranged into three RGB channels.  This helper reads the
+// source value that its generic PixelShuffle kernel would have stored.  The
+// tail and PixelShuffle activation formats are both ARGBHalf, therefore this
+// bypasses only a lossless lane copy and its intermediate allocation.
+float3 AexisReadSesrTailCrD12Pixel(int outputX, int outputY)
+{
+    int tailX = outputX >> 1;
+    int tailY = outputY >> 1;
+    int lane = ((outputY & 1) << 1) | (outputX & 1);
+    float4 r = _RgbInArr[int3(tailX, tailY, 0)];
+    float4 g = _RgbInArr[int3(tailX, tailY, 1)];
+    float4 b = _RgbInArr[int3(tailX, tailY, 2)];
+    return float3(AexisReadLane(r, lane), AexisReadLane(g, lane), AexisReadLane(b, lane));
+}
+
+// Fuses SESR's final x2 PixelShuffle with the direct NCHW-to-RGB terminal
+// conversion above.  Its crop/sample equations deliberately mirror
+// AexisNchwPack4TileToRgbScaled_Impl so native target sizes and diagnostic
+// resizes are bit-for-bit equivalent to the unfused graph.
+void AexisSesrTailCrD12Pack4TileToRgbScaled_Impl(uint3 id)
+{
+    if ((int)id.x >= _BlitW || (int)id.y >= _BlitH) return;
+    int2 dst = int2(_DstX + (int)id.x, _DstY + (int)id.y);
+    float srcXf = (float)_TilePadX + ((float)id.x + 0.5) * (float)_TileCoreW / (float)_BlitW - 0.5;
+    float srcYf = (float)_TilePadY + ((float)id.y + 0.5) * (float)_TileCoreH / (float)_BlitH - 0.5;
+    int x0 = (int)floor(srcXf);
+    int y0 = (int)floor(srcYf);
+    int x1 = x0 + 1;
+    int y1 = y0 + 1;
+    float tx = srcXf - (float)x0;
+    float ty = srcYf - (float)y0;
+    x0 = clamp(x0, 0, _TileW - 1);
+    x1 = clamp(x1, 0, _TileW - 1);
+    y0 = clamp(y0, 0, _TileH - 1);
+    y1 = clamp(y1, 0, _TileH - 1);
+
+    float3 v00 = AexisReadSesrTailCrD12Pixel(x0, y0);
+    float3 v10 = AexisReadSesrTailCrD12Pixel(x1, y0);
+    float3 v01 = AexisReadSesrTailCrD12Pixel(x0, y1);
+    float3 v11 = AexisReadSesrTailCrD12Pixel(x1, y1);
+    float3 v = lerp(lerp(v00, v10, tx), lerp(v01, v11, tx), ty);
+    _RgbOut[dst] = float4(saturate(v * _OutputValueScale + _OutputValueBias), 1.0);
+}
+
 void AexisProbeTilePack4_Impl(uint3 id)
 {
     uint iw, ih, idd;
