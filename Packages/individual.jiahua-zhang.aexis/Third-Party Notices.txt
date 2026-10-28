@@ -1,0 +1,79 @@
+Third-Party Notices for Aexis
+=============================
+
+This file identifies third-party source included in the optional AIImage Main2
+Application Example. The Aexis Asset Store package itself is distributed under
+the Unity Asset Store End User License Agreement. The license texts below apply
+only to the identified third-party components; they do not grant a separate
+license for the Aexis package.
+
+1. Json.NET 13.0.2
+-----------------
+Location: Samples~/AIImageApplicationExample/ThirdParty/AexisSampleJson
+Upstream: https://github.com/JamesNK/Newtonsoft.Json
+Revision: 4fba53a324c445f06ee08e45a015c346000a7ef2
+License: MIT
+Copyright (c) 2007 James Newton-King
+Changes: Namespaces were changed from Newtonsoft.Json to Aexis.Samples.Json;
+the sample uses source capability symbols matching the upstream netstandard2.0
+profile. See the adjacent UPSTREAM.md for the source archive checksum.
+
+The MIT License (MIT)
+
+Copyright (c) 2007 James Newton-King
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software is furnished to do so,
+subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+2. UniTask-derived sample source
+--------------------------------
+Location: Samples~/AIImageApplicationExample/ThirdParty/AexisSampleAsync
+Upstream: https://github.com/Cysharp/UniTask
+License: MIT
+Copyright (c) 2019 Yoshifumi Kawai and Cysharp, Inc.
+Changes: The sample source was moved to Aexis.Samples.Async and compiled as
+Aexis.Sample.Async. It is not referenced by Aexis Runtime.
+Source identification: This source snapshot was first added in repository
+commit 93f1ca53 and moved to the current UPM package in commit 05b8eb68.
+The original upstream tag was not preserved in the source snapshot; verify it
+against upstream before resubmitting the sample to the Asset Store.
+
+The MIT License (MIT)
+
+Copyright (c) 2019 Yoshifumi Kawai and Cysharp, Inc.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software is furnished to do so,
+subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+No third-party model weights, tokenizer vocabularies, sample photographs, or
+documentation screenshots are included in this Asset Store package. Unity
+packages listed in package.json are resolved by Unity Package Manager and are
+not copied into this package.

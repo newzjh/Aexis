@@ -56,7 +56,7 @@ public static class AIImageModelReleasePackager
             "Upload every AIImageModels.*.zip and AIImageModelReleaseManifest.json to the "
             + manifest.release_tag + " release of " + AIImageModelDelivery.ReleaseOwner + "/"
             + AIImageModelDelivery.ReleaseRepository + ".\n"
-            + "Runtime download URLs use the release asset names exactly as generated.\n");
+            + "These grouped archives are for manual distribution. The Main2 downloader uses the explicit individual-file mappings in AIImageModelDelivery.\n");
         Debug.Log("Prepared " + manifest.assets.Count + " AIImage model release archives: " + output);
     }
 

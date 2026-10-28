@@ -435,7 +435,7 @@ MonoBehaviour:
   priorSmallRadius: 3
   priorLargeRadius: 9
   blueNoiseTexture: {fileID: 0}
-  faceDetailTexture: {fileID: 2800000, guid: 63f26154873aced40b689be25dbfc93c, type: 3}
+  faceDetailTexture: {fileID: 0}
 --- !u!114 &2021060207
 MonoBehaviour:
   m_ObjectHideFlags: 0

@@ -137,15 +137,6 @@ internal static class AexisApplicationExamplePaths
 
     internal static string Main2SceneAssetPath => ToAssetPath(Path.Combine(SampleRootAbsolutePath, "Scenes", "Main2.unity"));
 
-    internal static string SampleTextureAbsolutePath(string fileName)
-    {
-        if (string.IsNullOrWhiteSpace(fileName))
-            throw new ArgumentException("A sample texture file name is required.", nameof(fileName));
-        return Path.Combine(SampleRootAbsolutePath, "Textures", fileName);
-    }
-
-    internal static string SampleTextureDirectory => Path.Combine(SampleRootAbsolutePath, "Textures");
-
     internal static string ResolveStreamingAssetFilePath(params string[] pathSegments)
     {
         return Aexis.Samples.AexisSampleStreamingAssets.ResolveFilePath(Path.Combine(pathSegments));

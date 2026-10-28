@@ -7,10 +7,8 @@
   "description": "A self-contained Unity on-device inference engine with ONNX and NCNN model-format support.",
   "keywords": ["aexis", "inference", "onnx", "ncnn", "gpu", "edge"],
   "author": { "name": "Aexis" },
-  "license": "MIT",
   "documentationUrl": "https://github.com/newzjh/Aexis/tree/main/Packages/individual.jiahua-zhang.aexis/Documentation~",
   "changelogUrl": "https://github.com/newzjh/Aexis/blob/main/Packages/individual.jiahua-zhang.aexis/CHANGELOG.md",
-  "licensesUrl": "https://github.com/newzjh/Aexis/blob/main/Packages/individual.jiahua-zhang.aexis/LICENSE.md",
   "dependencies": {
     "com.unity.modules.imageconversion": "1.0.0",
     "com.unity.modules.ui": "1.0.0",
@@ -23,7 +21,7 @@
   "samples": [
     {
       "displayName": "AIImage Main2 Application Example",
-      "description": "Complete Main2 scene, application pages, all runners, editor tools, and permitted default models in one importable example.",
+      "description": "Main2 application scene, runners, editor tools, and model configuration. Model weights are not included.",
       "path": "Samples~/AIImageApplicationExample"
     }
   ]

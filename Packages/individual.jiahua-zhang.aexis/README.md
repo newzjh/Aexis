@@ -12,7 +12,7 @@
   <a href="https://github.com/sponsors/newzjh"><img src="https://img.shields.io/badge/Sponsor-GitHub%20Sponsors-EA4AAA?style=flat&logo=githubsponsors" alt="Sponsor Aexis on GitHub"/></a>
   <a href="#community-links"><img src="https://img.shields.io/badge/LinkedIn-Coming%20soon-0A66C2?style=flat&logo=linkedin" alt="LinkedIn coming soon"/></a>
   <a href="#community-links"><img src="https://img.shields.io/badge/Discord-Coming%20soon-5865F2?style=flat&logo=discord" alt="Discord coming soon"/></a>
-  <a href="#license"><img src="https://img.shields.io/badge/License-MIT%20planned-3C8C6A?style=flat" alt="MIT planned pending release audit"/></a>
+  <a href="#license"><img src="https://img.shields.io/badge/License-Asset%20Store%20EULA-3C8C6A?style=flat" alt="Asset Store EULA"/></a>
 </p>
 
 <p align="center"><sub><a href="#at-a-glance">At a glance</a> &bull; <a href="#install">Install</a> &bull; <a href="#runner-evidence">Examples</a> &bull; <a href="#tested-environments">Tested environments</a> &bull; <a href="#how-to-help">How to help</a> &bull; <a href="#license">License</a></sub></p>
@@ -35,7 +35,7 @@ For commercial, integration, or partnership discussions, contact [newzjh@126.com
 - [Star Aexis on GitHub](https://github.com/newzjh/Aexis) and report reproducible package issues.
 - Review the package on the [Unity Asset Store](https://assetstore.unity.com/preview/397636/1435586).
 - [Sponsor on GitHub](https://github.com/sponsors/newzjh).
-- See the repository [support guide](../../SUPPORT.md) for current channels.
+- See the repository [support guide](https://github.com/newzjh/Aexis/blob/main/SUPPORT.md) for current channels.
 
 ## Status and compatibility
 
@@ -51,47 +51,40 @@ For commercial, integration, or partnership discussions, contact [newzjh@126.com
 
 ## Runner evidence
 
-AIImage Main2 is the complete application example built on Aexis. It contains runner configuration for Qwen3.5 Q4/Q8, CLIP, CodeFormer, Matting, Real-ESRGAN, GFPGAN, YOLO plus DeepFillV2, YOLO plus Stable Diffusion inpainting, and MONAI/VISTA. The following images are actual runner artifacts. In each comparison, the left panel is the input and the right panel is that runner's output.
+AIImage Main2 is the complete application example built on Aexis. It contains runner configuration for Qwen3.5 Q4/Q8, CLIP, CodeFormer, Matting, Real-ESRGAN, GFPGAN, YOLO plus DeepFillV2, YOLO plus Stable Diffusion inpainting, and MONAI/VISTA. The observations below are historical validation records; their input and output images are not part of the Asset Store package.
 
 ### Qwen3.5 Mobile Q4/Q8 and CLIP MobileCLIP S0
 
-![Qwen and CLIP multimodal input](Documentation~/images/qwen-and-clip-input.jpg)
 
 Qwen Q4 passed a Windows strict-texture text smoke in 65.533 s using 48 cache textures. It also passed the Android MuMu Vulkan Main2 run in 326.821 s across 103 decoder steps, emitted 397 visible characters, and detected four people. Q8 passed a strict multimodal smoke in 71.618 s with six generated tokens. CLIP's successful 2026-07-23 score artifact ranked `Photo` at `0.332389` and `Portrait` at `0.265945`; its current strict CommandBuffer profile rejects an undeclared temporary RT at `transpose_121`.
 
 ### CodeFormer Face Restoration
 
-![CodeFormer before and after on 03.jpg](Documentation~/images/codeformer-03-before-after.png)
 
 The CodeFormer runner processed `ref/03.jpg`, detected one face, and completed in 17,958 ms (Windows/Vulkan, 2026-07-29).
 
 ### Foreground Matting
 
-![Matting composite](Documentation~/images/matting-composite.png)
 
 The matting runner completed at 360x202 in 1,103 ms with the strict texture plan and CommandBuffer path.
 
 ### GFPGAN Face Restoration
 
-![GFPGAN before and after on 03.jpg](Documentation~/images/gfpgan-03-before-after.png)
 
 The GFPGAN runner processed `ref/03.jpg` in 6,053 ms with the strict Pack4 guard (Windows/Vulkan, 2026-07-29). The image is the raw output; this input visibly produces facial distortion, so it is execution evidence rather than a quality claim.
 
 ### YOLO Person Segmentation plus DeepFillV2
 
-![YOLO and DeepFillV2 before and after on 3.png](Documentation~/images/yolo-deepfillv2-3-before-after.png)
 
 For `ref/deepfillv2/DeepFillv2-main/test_data/3.png`, YOLO found seven people with mask coverage `0.042730`. DeepFillV2 completed in 2,196 ms, including 1,995 ms inference (Windows/Vulkan, 2026-07-29). The result retains the actual residual removal artifacts.
 
 ### Real-ESRGAN AnimeVideo v3 x4
 
-![Real-ESRGAN before and after on 03.jpg](Documentation~/images/realesrgan-03-before-after.png)
 
 The CommandBuffer Pack4-only Real-ESRGAN validation processed `ref/03.jpg` in 1,057 ms (Windows/Vulkan, 2026-07-29).
 
 ### YOLO plus Stable Diffusion Inpainting
 
-![YOLO and SD inpainting before and after on 3.png](Documentation~/images/yolo-sd-inpainting-3-before-after.png)
 
 For `ref/deepfillv2/DeepFillv2-main/test_data/3.png`, YOLO found seven people with mask coverage `0.042730`; the 12-step Stable Diffusion inpainting run completed in 630,213 ms (Windows/Vulkan, 2026-07-29). It removes people more completely than the DeepFillV2 result, while retaining the actual residual objects and artifacts.
 
@@ -101,17 +94,20 @@ For `ref/deepfillv2/DeepFillv2-main/test_data/3.png`, YOLO found seven people wi
 
 ## Release downloads
 
-The Main2 model-delivery configuration resolves its assets from [newzjh/AIImage releases](https://github.com/newzjh/Aexis/releases). Download the current generated asset named in `AIImageModelReleaseManifest.json`, or use the application's model-download UI. Do not infer an archive name from a runner name.
+The Main2 model downloader fetches the published files from [newzjh/Aexis Releases](https://github.com/newzjh/Aexis/releases) by their release tag and exact asset name. CLIP, CodeFormer, Matting, YOLOv8, DeepFillV2, Real-ESRGAN, GFPGAN, and the published Qwen variants use their matching release assets. YOLO11 and Qwen full precision are shown as unavailable until complete release file sets are published. See [model distribution](Documentation~/model-distribution.md).
 
 | Model group | Release download page |
 | --- | --- |
 | Qwen3.5 Q4 | [`qwen3.5_0.8b_mobile_q4`](https://github.com/newzjh/Aexis/releases/tag/qwen3.5_0.8b_mobile_q4) |
 | Qwen3.5 Q8 | [`qwen3.5_0.8b_mobile_q8`](https://github.com/newzjh/Aexis/releases/tag/qwen3.5_0.8b_mobile_q8) |
-| CLIP, CodeFormer, Matting, and YOLO configuration | [`model`](https://github.com/newzjh/Aexis/releases/tag/model) |
+| CLIP MobileCLIP S0 | [`clip`](https://github.com/newzjh/Aexis/releases/tag/clip) |
+| CodeFormer | [`codeformer`](https://github.com/newzjh/Aexis/releases/tag/codeformer) |
+| Matting | [`matting`](https://github.com/newzjh/Aexis/releases/tag/matting) |
+| YOLOv8 segmentation | [`yolo`](https://github.com/newzjh/Aexis/releases/tag/yolo) |
 | Real-ESRGAN | [`realesr`](https://github.com/newzjh/Aexis/releases/tag/realesr) |
 | GFPGAN | [`gfpgan`](https://github.com/newzjh/Aexis/releases/tag/gfpgan) |
 | DeepFillV2 | [`DeepFileV2`](https://github.com/newzjh/Aexis/releases/tag/DeepFileV2) |
-| Stable Diffusion inpainting | [`sdinpainting`](https://github.com/newzjh/Aexis/releases/tag/sdinpainting) |
+| Stable Diffusion inpainting | [`model`](https://github.com/newzjh/Aexis/releases/tag/model), [`sdinpainting`](https://github.com/newzjh/Aexis/releases/tag/sdinpainting) |
 | MONAI WholeBrain | [`MONAI_WholeBrain`](https://github.com/newzjh/Aexis/releases/tag/MONAI_WholeBrain) (external model and medical data only) |
 | VISTA3D skull | [`vista3d_skull`](https://github.com/newzjh/Aexis/releases/tag/vista3d_skull) (external model and medical data only) |
 | VISTA3D spine | [`vista3d_spine`](https://github.com/newzjh/Aexis/releases/tag/vista3d_spine) (external model and medical data only) |
@@ -142,7 +138,7 @@ For a registry or Git release, install the published `individual.jiahua-zhang.ae
 | `Runtime/Execution` | ONNX shape/index texture backend |
 | `Runtime/Resources/Aexis` | Compute shaders loaded through `Resources`, owned by the package |
 | `Editor` | Package editor tooling |
-| `Samples~` | Unity-managed application examples and their model payloads |
+| `Samples~` | Unity-managed application example and model configuration; no model weights |
 | `Documentation~` | Package documentation rendered by Package Manager |
 | `Tests/Editor` | Package boundary and planning tests |
 
@@ -204,9 +200,9 @@ See [API manual](Documentation~/api-manual.md) for input/output ownership and [r
 
 Import **AIImage Main2 Application Example** from Package Manager, then run `Tools/Aexis/Examples/Install Main2 Application StreamingAssets`. This is the single full example: it combines `Main2`, MainView2, DesignView, LibraryView, UI/application code, all runners including GFPGAN, Stable Diffusion, SD Inpainting, MONAI/VISTA, and QWEN, plus editor tests and debug tools.
 
-Its installer copies the complete sample payload to `Assets/StreamingAssets`, the Unity Player-included location. The reusable runner catalog uses `Clip/...`, `CodeFormer/...`, `DeepFileV2/...`, `Matting/...`, `RealESRGAN/...`, and `Yolo/...` paths below that root. Default model files are included only for those six model families. GFPGAN, Stable Diffusion, SD Inpainting, MONAI/VISTA, and QWEN weights are deliberately excluded because of package-size and redistribution constraints. See [model distribution](Documentation~/model-distribution.md) before redistributing any sample model.
+Its installer copies the sample inference configuration to `Assets/StreamingAssets`, the Unity Player-included location. The runner catalog uses `Clip/...`, `CodeFormer/...`, `DeepFileV2/...`, `Matting/...`, `RealESRGAN/...`, and `Yolo/...` paths below that root. No model weights or tokenizer vocabularies are included. Supply models under their own applicable licenses; see [model distribution](Documentation~/model-distribution.md).
 
-Reduced Main2 Player builds do not stage, move, or modify `Assets/StreamingAssets` or package sample `StreamingAssets`. `Tools/Aexis/Release/Build Reduced` selects the Main2 default model files after Unity has generated the Player output (or during Android Gradle asset generation), so the source tree remains unchanged. Non-default model groups are downloaded into persistent data from the AIImage GitHub Release and are not copied into a Player by default.
+Reduced Main2 Player builds do not stage, move, or modify `Assets/StreamingAssets` or package sample `StreamingAssets`. `Tools/Aexis/Release/Build Reduced` selects locally installed model files after Unity has generated the Player output (or during Android Gradle asset generation). The Asset Store package itself contains no model files.
 
 The complete sample retains its Editor NUnit sources. A default sample import excludes them through `AEXIS_INCLUDE_EDITOR_TESTS`; install Unity Test Framework and add that define symbol when running the included test suite.
 
@@ -214,13 +210,13 @@ The complete sample retains its Editor NUnit sources. A default sample import ex
 
 ## License and package boundaries
 
-`package.json` declares MIT as the Aexis source license target. The current pre-release [LICENSE.md](LICENSE.md) retains a release-audit gate; complete that audit before publishing or representing an archive as an MIT release. Aexis does not include Unity Sentis, Tencent ncnn, ONNX Runtime, MNN, MONAI, or VISTA source/binaries as runtime dependencies. Compatibility targets do not imply affiliation or use of upstream code.
+The Asset Store edition is governed by the Unity Asset Store End User License Agreement. There is no separate Aexis license in this UPM package. Aexis does not include Unity Sentis, Tencent ncnn, ONNX Runtime, MNN, MONAI, or VISTA source/binaries as runtime dependencies. Compatibility targets do not imply affiliation or use of upstream code.
 
-The complete application sample uses its namespace-isolated `Aexis.Samples.Json` source copy in fourteen files for dynamic JSON documents, token traversal, and editor diagnostics. These uses are not DTO-only configuration payloads, so Unity `JsonUtility` is not a compatible replacement. The source copy is MIT-licensed Json.NET 13.0.2, with its immutable revision, checksum, license, and shading record under `Samples~/AIImageApplicationExample/ThirdParty/AexisSampleJson`; it does not install a Newtonsoft package or copy a duplicate DLL into `Assets`.
+The application sample includes modified source copies of Json.NET 13.0.2 and UniTask under their respective MIT licenses. Their locations, modifications, and complete license texts are in [Third-Party Notices.txt](Third-Party%20Notices.txt). The Json.NET source revision and archive checksum are also recorded under `Samples~/AIImageApplicationExample/ThirdParty/AexisSampleJson`; no Newtonsoft or UniTask package is installed into `Assets`.
 
 The sample uses Unity-supported BCL compression streams for PNG metadata and MONAI volume I/O; it does not ship a third-party compression implementation.
 
-Models are separate artifacts with their own licenses and redistribution conditions. A release manager must complete the provenance table in `Documentation~/model-distribution.md` before publishing a package archive containing sample models. Do not place medical data, private goldens, checkpoints, or application-specific tooling in this package.
+Models are separate artifacts with their own licenses and redistribution conditions. This package does not include model weights, tokenizer vocabularies, sample photographs, or documentation screenshots. Do not place those assets in a Store upload until the provenance and redistribution review in `Documentation~/model-distribution.md` is complete.
 
 ## Community links
 
@@ -236,4 +232,4 @@ Models are separate artifacts with their own licenses and redistribution conditi
 - [Runner sample guide](Documentation~/runner-samples.md)
 - [Model distribution and exclusions](Documentation~/model-distribution.md)
 - [Changelog](CHANGELOG.md)
-- [Third-party audit](Third%20Party%20Notices.md)
+- [Third-party licenses](Third-Party%20Notices.txt)

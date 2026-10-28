@@ -66,12 +66,17 @@ public sealed class AIImageModelDownloadDialog : MonoBehaviour
             return false;
 
         var names = string.Join("\n", missing.Select(group => "- " + group.DisplayName));
+        var unavailable = missing.Where(group => !AIImageModelDelivery.CanDownloadGroup(group)).ToArray();
         _title.text = string.IsNullOrWhiteSpace(operationName) ? "Model download required" : operationName;
-        _detail.text = "This action requires model files that are not installed.\n" + names;
+        _detail.text = unavailable.Length == 0
+            ? "This action requires model files that are not installed.\n" + names
+            : "No complete GitHub Release asset mapping exists for "
+                + string.Join(", ", unavailable.Select(group => group.DisplayName))
+                + ". Install the model files manually before using this action.";
         _progress.value = 0f;
         _progress.title = "";
         _primaryButton.text = "Download";
-        _primaryButton.SetEnabled(true);
+        _primaryButton.SetEnabled(unavailable.Length == 0);
         _cancelButton.text = "Cancel";
         _cancelButton.SetEnabled(true);
         _downloading = false;

@@ -1,7 +1,6 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
-using System.IO.Compression;
 using System.Linq;
 using System.Threading;
 using Aexis.Samples;
@@ -114,7 +113,7 @@ public static class AIImageModelDelivery
 {
     public const string PersistentDirectoryName = "AIImageModels";
     public const string ReleaseOwner = "newzjh";
-    public const string ReleaseRepository = "AIImage";
+    public const string ReleaseRepository = "Aexis";
     public const string DefaultReleaseTag = "model";
     public const string BundledManifestFileName = "AIImageModelDelivery.bundled.json";
 
@@ -135,7 +134,8 @@ public static class AIImageModelDelivery
                 "Clip/mobileclip_s0_export.label_embeddings.json",
                 "Clip/mobileclip_s0_export/image_encoder.ncnn.param",
                 "Clip/mobileclip_s0_export/image_encoder.ncnn.bin"
-            }),
+            },
+            flatReleaseTag: "clip"),
         new AIImageModelGroup(
             AIImageModelGroupId.CodeFormerDefault,
             "CodeFormer",
@@ -148,7 +148,8 @@ public static class AIImageModelDelivery
                 "CodeFormer/models/generator.bin",
                 "CodeFormer/models/yolov7-lite-e.param",
                 "CodeFormer/models/yolov7-lite-e.bin"
-            }),
+            },
+            flatReleaseTag: "codeformer"),
         new AIImageModelGroup(
             AIImageModelGroupId.RealEsrganX4PlusAnime,
             "Real-ESRGAN AnimeVideo v3 x4",
@@ -178,7 +179,8 @@ public static class AIImageModelDelivery
             {
                 "Yolo/yolov8n_seg.ncnn.param",
                 "Yolo/yolov8n_seg.ncnn.bin"
-            }),
+            },
+            flatReleaseTag: "yolo"),
         new AIImageModelGroup(
             AIImageModelGroupId.DeepFillV2Case1Onnx,
             "DeepFillV2 case1 (ONNX)",
@@ -288,7 +290,8 @@ public static class AIImageModelDelivery
             AIImageModelGroupId.Matting,
             "Matting",
             true,
-            new[] { "Matting/matting.param", "Matting/matting.bin" }),
+            new[] { "Matting/matting.param", "Matting/matting.bin" },
+            flatReleaseTag: "matting"),
         new AIImageModelGroup(
             AIImageModelGroupId.StableDiffusion,
             "SD 1.5 inpainting",
@@ -303,6 +306,17 @@ public static class AIImageModelDelivery
                 "StableDiffusion/AutoencoderKL-encoder-512-512-fp16.bin",
                 "sdinpainting/unet.param",
                 "sdinpainting/unet.bin"
+            },
+            remoteFiles: new[]
+            {
+                new AIImageModelRemoteFile("StableDiffusion/FrozenCLIPEmbedder-fp16.param", "model", "FrozenCLIPEmbedder-fp16.param"),
+                new AIImageModelRemoteFile("StableDiffusion/FrozenCLIPEmbedder-fp16.bin", "model", "FrozenCLIPEmbedder-fp16.bin"),
+                new AIImageModelRemoteFile("StableDiffusion/AutoencoderKL-512-512-fp16-opt.param", "model", "AutoencoderKL-512-512-fp16-opt.param"),
+                new AIImageModelRemoteFile("StableDiffusion/AutoencoderKL-fp16.bin", "model", "AutoencoderKL-fp16.bin"),
+                new AIImageModelRemoteFile("StableDiffusion/AutoencoderKL-encoder-512-512-fp16.param", "model", "AutoencoderKL-encoder-512-512-fp16.param"),
+                new AIImageModelRemoteFile("StableDiffusion/AutoencoderKL-encoder-512-512-fp16.bin", "model", "AutoencoderKL-encoder-512-512-fp16.bin"),
+                new AIImageModelRemoteFile("sdinpainting/unet.param", "sdinpainting", "unet.param"),
+                new AIImageModelRemoteFile("sdinpainting/unet.bin", "sdinpainting", "unet.bin")
             }),
         new AIImageModelGroup(
             AIImageModelGroupId.GfpganNativeExtras,
@@ -328,6 +342,14 @@ public static class AIImageModelDelivery
     public static string PersistentRoot => Path.Combine(Application.persistentDataPath, PersistentDirectoryName);
 
     public static IEnumerable<AIImageModelGroup> DefaultGroups => Groups.Where(group => group.BundledByDefault);
+
+    public static bool CanDownloadGroup(AIImageModelGroup group)
+    {
+        return group != null
+            && group.Prefixes.Count == 0
+            && group.Files.Count > 0
+            && group.RemoteFiles.Count == group.Files.Count;
+    }
 
     public static AIImageModelGroup GetGroup(AIImageModelGroupId id)
     {
@@ -403,14 +425,26 @@ public static class AIImageModelDelivery
         if (group == null || Application.platform == RuntimePlatform.Android)
             return false;
 
-        for (var index = 0; index < group.Files.Count; index++)
+        var files = new List<string>(group.Files);
+        if (group.Id == AIImageModelGroupId.Qwen35MobileQ4)
         {
-            if (!AexisSampleStreamingAssets.TryResolveFilePath(group.Files[index], out var path)
+            var manifestRelativePath = group.Files.FirstOrDefault(path =>
+                path.EndsWith("qwen3.5_mobile_q4_assets.json", StringComparison.OrdinalIgnoreCase));
+            if (manifestRelativePath == null
+                || !AexisSampleStreamingAssets.TryResolveFilePath(manifestRelativePath, out var manifestPath)
+                || !File.Exists(manifestPath))
+                return false;
+            AppendQwen35ShardFiles(manifestPath, files);
+        }
+
+        for (var index = 0; index < files.Count; index++)
+        {
+            if (!AexisSampleStreamingAssets.TryResolveFilePath(files[index], out var path)
                 || !File.Exists(path))
                 return false;
         }
 
-        return group.Files.Count > 0;
+        return files.Count > 0;
     }
 
     public static async UniTask<bool> IsAvailableAsync(AIImageModelGroup group, CancellationToken cancellationToken = default)
@@ -653,23 +687,19 @@ public static class AIImageModelDelivery
             return;
         }
 
+        if (!CanDownloadGroup(group))
+            throw new NotSupportedException("No complete GitHub release file mapping is available for " + group.DisplayName + ".");
+
         var stagingRoot = Path.Combine(PersistentRoot, ".staging", group.Id.ToString());
         Cleanup(stagingRoot);
         Directory.CreateDirectory(Path.GetDirectoryName(stagingRoot));
 
         try
         {
-            if (group.RemoteFiles.Count > 0)
-            {
-                await DownloadRemoteFilesAsync(group, stagingRoot, onProgress, cancellationToken);
-                cancellationToken.ThrowIfCancellationRequested();
-                onProgress?.Invoke(new AIImageModelDownloadProgress(group, 0.97f, "Installing"));
-                CommitExtractedFiles(group, stagingRoot);
-            }
-            else
-            {
-                await DownloadArchiveAsync(group, stagingRoot, onProgress, cancellationToken);
-            }
+            await DownloadRemoteFilesAsync(group, stagingRoot, onProgress, cancellationToken);
+            cancellationToken.ThrowIfCancellationRequested();
+            onProgress?.Invoke(new AIImageModelDownloadProgress(group, 0.97f, "Installing"));
+            CommitExtractedFiles(group, stagingRoot);
 
             if (!IsInstalled(group))
                 throw new InvalidDataException("Downloaded files do not contain every required file for " + group.DisplayName + ".");
@@ -716,76 +746,66 @@ public static class AIImageModelDelivery
         var files = ResolveRemoteFiles(group);
         for (var index = 0; index < files.Count; index++)
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            var remote = files[index];
-            var stagingPath = ResolveContainedPath(stagingRoot, remote.DestinationPath);
-            Directory.CreateDirectory(Path.GetDirectoryName(stagingPath));
-            var url = GetReleaseAssetUrl(remote.AssetName, remote.ReleaseTag);
-            using (var request = new UnityWebRequest(url, UnityWebRequest.kHttpVerbGET))
-            {
-                request.downloadHandler = new DownloadHandlerFile(stagingPath, false);
-                request.disposeDownloadHandlerOnDispose = true;
-                var operation = request.SendWebRequest();
-                while (!operation.isDone)
-                {
-                    cancellationToken.ThrowIfCancellationRequested();
-                    var completed = (index + request.downloadProgress) / Mathf.Max(1, files.Count);
-                    onProgress?.Invoke(new AIImageModelDownloadProgress(group, completed * 0.95f,
-                        "Downloading " + remote.AssetName));
-                    await UniTask.Yield(PlayerLoopTiming.Update, cancellationToken);
-                }
+            await DownloadRemoteFileAsync(group, files[index], stagingRoot, index, files.Count,
+                0f, group.Id == AIImageModelGroupId.Qwen35MobileQ4 ? 0.8f : 1f,
+                onProgress, cancellationToken);
+        }
 
-                cancellationToken.ThrowIfCancellationRequested();
-                if (request.result != UnityWebRequest.Result.Success)
-                {
-                    throw new IOException("Failed to download " + group.DisplayName + " asset '"
-                        + remote.AssetName + "' from release '" + remote.ReleaseTag + "': "
-                        + request.error + " (" + url + ")");
-                }
+        if (group.Id == AIImageModelGroupId.Qwen35MobileQ4)
+        {
+            var manifestRelativePath = group.Files.First(path =>
+                path.EndsWith("qwen3.5_mobile_q4_assets.json", StringComparison.OrdinalIgnoreCase));
+            var shardPaths = new List<string>();
+            AppendQwen35ShardFiles(ResolveContainedPath(stagingRoot, manifestRelativePath), shardPaths);
+            var mappedPaths = new HashSet<string>(files.Select(file => file.DestinationPath), StringComparer.OrdinalIgnoreCase);
+            var additionalShards = shardPaths.Where(path => mappedPaths.Add(path)).ToArray();
+            for (var index = 0; index < additionalShards.Length; index++)
+            {
+                var path = additionalShards[index];
+                var remote = new AIImageModelRemoteFile(path, files[0].ReleaseTag, Path.GetFileName(path));
+                await DownloadRemoteFileAsync(group, remote, stagingRoot, index, additionalShards.Length,
+                    0.8f, 0.2f, onProgress, cancellationToken);
             }
         }
     }
 
-    private static async UniTask DownloadArchiveAsync(
+    private static async UniTask DownloadRemoteFileAsync(
         AIImageModelGroup group,
+        AIImageModelRemoteFile remote,
         string stagingRoot,
+        int index,
+        int count,
+        float progressStart,
+        float progressSpan,
         Action<AIImageModelDownloadProgress> onProgress,
         CancellationToken cancellationToken)
     {
-        var archivePath = stagingRoot + ".zip";
-        var extractRoot = stagingRoot + ".extract";
-        Cleanup(archivePath);
-        Cleanup(extractRoot);
-        try
+        cancellationToken.ThrowIfCancellationRequested();
+        var stagingPath = ResolveContainedPath(stagingRoot, remote.DestinationPath);
+        Directory.CreateDirectory(Path.GetDirectoryName(stagingPath));
+        var url = GetReleaseAssetUrl(remote.AssetName, remote.ReleaseTag);
+        using (var request = new UnityWebRequest(url, UnityWebRequest.kHttpVerbGET))
         {
-            var url = GetReleaseAssetUrl(group.ArchiveName);
-            onProgress?.Invoke(new AIImageModelDownloadProgress(group, 0f, "Downloading"));
-            using (var request = new UnityWebRequest(url, UnityWebRequest.kHttpVerbGET))
+            request.downloadHandler = new DownloadHandlerFile(stagingPath, false);
+            request.disposeDownloadHandlerOnDispose = true;
+            var operation = request.SendWebRequest();
+            while (!operation.isDone)
             {
-                request.downloadHandler = new DownloadHandlerFile(archivePath, false);
-                request.disposeDownloadHandlerOnDispose = true;
-                var operation = request.SendWebRequest();
-                while (!operation.isDone)
-                {
-                    cancellationToken.ThrowIfCancellationRequested();
-                    onProgress?.Invoke(new AIImageModelDownloadProgress(group, request.downloadProgress * 0.9f, "Downloading"));
-                    await UniTask.Yield(PlayerLoopTiming.Update, cancellationToken);
-                }
-
                 cancellationToken.ThrowIfCancellationRequested();
-                if (request.result != UnityWebRequest.Result.Success)
-                    throw new IOException("Failed to download " + group.DisplayName + ": " + request.error + " (" + url + ")");
+                var completed = (index + request.downloadProgress) / Mathf.Max(1, count);
+                onProgress?.Invoke(new AIImageModelDownloadProgress(group,
+                    (progressStart + progressSpan * completed) * 0.95f,
+                    "Downloading " + remote.AssetName));
+                await UniTask.Yield(PlayerLoopTiming.Update, cancellationToken);
             }
 
-            onProgress?.Invoke(new AIImageModelDownloadProgress(group, 0.91f, "Extracting"));
-            await UniTask.RunOnThreadPool(() => ExtractArchive(group, archivePath, extractRoot, cancellationToken), cancellationToken: cancellationToken);
             cancellationToken.ThrowIfCancellationRequested();
-            CommitExtractedFiles(group, extractRoot);
-        }
-        finally
-        {
-            Cleanup(archivePath);
-            Cleanup(extractRoot);
+            if (request.result != UnityWebRequest.Result.Success)
+            {
+                throw new IOException("Failed to download " + group.DisplayName + " asset '"
+                    + remote.AssetName + "' from release '" + remote.ReleaseTag + "': "
+                    + request.error + " (" + url + ")");
+            }
         }
     }
 
@@ -850,30 +870,6 @@ public static class AIImageModelDelivery
         return result;
     }
 
-    private static void ExtractArchive(
-        AIImageModelGroup group,
-        string archivePath,
-        string extractRoot,
-        CancellationToken cancellationToken)
-    {
-        Directory.CreateDirectory(extractRoot);
-        using (var archive = ZipFile.OpenRead(archivePath))
-        {
-            foreach (var entry in archive.Entries)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                if (string.IsNullOrEmpty(entry.Name))
-                    continue;
-                var relative = NormalizeRelativePath(entry.FullName);
-                if (!group.Covers(relative))
-                    throw new InvalidDataException("Unexpected file in " + group.ArchiveName + ": " + relative);
-                var destination = ResolveContainedPath(extractRoot, relative);
-                Directory.CreateDirectory(Path.GetDirectoryName(destination));
-                entry.ExtractToFile(destination, true);
-            }
-        }
-    }
-
     private static void CommitExtractedFiles(AIImageModelGroup group, string extractRoot)
     {
         for (var index = 0; index < group.Files.Count; index++)
@@ -885,6 +881,21 @@ public static class AIImageModelDelivery
             var destination = GetPersistentPath(relative);
             Directory.CreateDirectory(Path.GetDirectoryName(destination));
             File.Copy(source, destination, true);
+        }
+
+        if (group.Id == AIImageModelGroupId.Qwen35MobileQ4)
+        {
+            foreach (var relative in GetInstalledRequiredFiles(group))
+            {
+                if (group.Files.Contains(relative, StringComparer.OrdinalIgnoreCase))
+                    continue;
+                var source = ResolveContainedPath(extractRoot, relative);
+                if (!File.Exists(source))
+                    continue;
+                var destination = GetPersistentPath(relative);
+                Directory.CreateDirectory(Path.GetDirectoryName(destination));
+                File.Copy(source, destination, true);
+            }
         }
 
         foreach (var prefix in group.Prefixes)

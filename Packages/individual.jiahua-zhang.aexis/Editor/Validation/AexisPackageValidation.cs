@@ -80,6 +80,16 @@ namespace Aexis.Editor
                     "Aexis package.json must declare the supported minimum editor as Unity 2022.3.9f1.");
             }
 
+            if (!string.IsNullOrWhiteSpace(manifest.license) || !string.IsNullOrWhiteSpace(manifest.licensesUrl)
+                || File.Exists(Path.Combine(package.resolvedPath, "LICENSE.md"))
+                || File.Exists(Path.Combine(package.resolvedPath, "LICENSE.txt")))
+            {
+                throw new InferenceContractException("The Asset Store package must not declare an independent Aexis license.");
+            }
+
+            if (!File.Exists(Path.Combine(package.resolvedPath, "Third-Party Notices.txt")))
+                throw new InferenceContractException("Third-Party Notices.txt is required at the UPM package root.");
+
             if (Directory.Exists(Path.Combine(package.resolvedPath, "Assets")))
                 throw new InferenceContractException("Aexis must not contain an Assets folder inside the UPM package.");
             if (Directory.Exists(Path.Combine(package.resolvedPath, "Samples")))
@@ -97,6 +107,24 @@ namespace Aexis.Editor
                     throw new InferenceContractException("Every Aexis sample path must be nested under Samples~/.");
                 if (!Directory.Exists(Path.Combine(package.resolvedPath, samplePath)))
                     throw new InferenceContractException("Aexis sample directory is missing: " + samplePath);
+
+                var streamingAssets = Path.Combine(package.resolvedPath, samplePath, "StreamingAssets");
+                if (Directory.Exists(streamingAssets))
+                {
+                    foreach (var file in Directory.GetFiles(streamingAssets, "*", SearchOption.AllDirectories))
+                    {
+                        var extension = Path.GetExtension(file);
+                        if (string.Equals(extension, ".bin", StringComparison.OrdinalIgnoreCase)
+                            || string.Equals(extension, ".param", StringComparison.OrdinalIgnoreCase)
+                            || string.Equals(extension, ".onnx", StringComparison.OrdinalIgnoreCase)
+                            || string.Equals(extension, ".pth", StringComparison.OrdinalIgnoreCase)
+                            || string.Equals(extension, ".pt", StringComparison.OrdinalIgnoreCase)
+                            || string.Equals(extension, ".safetensors", StringComparison.OrdinalIgnoreCase))
+                        {
+                            throw new InferenceContractException("Unreviewed model payload remains in the UPM sample: " + file);
+                        }
+                    }
+                }
             }
         }
 
@@ -224,6 +252,8 @@ namespace Aexis.Editor
             public string name;
             public string unity;
             public string unityRelease;
+            public string license;
+            public string licensesUrl;
             public UpmPackageSample[] samples;
         }
 

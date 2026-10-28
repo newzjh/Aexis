@@ -12,7 +12,7 @@
   <a href="https://github.com/sponsors/newzjh"><img src="https://img.shields.io/badge/Sponsor-GitHub%20Sponsors-EA4AAA?style=flat&logo=githubsponsors" alt="Sponsor Aexis on GitHub"/></a>
   <a href="#community-links"><img src="https://img.shields.io/badge/LinkedIn-Coming%20soon-0A66C2?style=flat&logo=linkedin" alt="LinkedIn coming soon"/></a>
   <a href="#community-links"><img src="https://img.shields.io/badge/Discord-Coming%20soon-5865F2?style=flat&logo=discord" alt="Discord coming soon"/></a>
-  <a href="#license"><img src="https://img.shields.io/badge/License-MIT%20planned-3C8C6A?style=flat" alt="MIT planned pending release audit"/></a>
+  <a href="#license"><img src="https://img.shields.io/badge/License-Asset%20Store%20EULA-3C8C6A?style=flat" alt="Asset Store EULA"/></a>
 </p>
 
 <p align="center"><sub><a href="#at-a-glance">At a glance</a> &bull; <a href="#import">Import</a> &bull; <a href="#tested-environments">Tested environments</a> &bull; <a href="#how-to-help">How to help</a> &bull; <a href="#license">License</a></sub></p>
@@ -25,7 +25,7 @@ This is the single complete application example for `individual.jiahua-zhang.aex
 - The adjustment panel provides live-preview white balance, auto enhance, exposure, tone curve, levels, eight-range HSL, .cube LUTs, grain, vignette, and painted local exposure masks. Each completed adjustment becomes a history entry.
 - Uncompressed 16-bit Bayer DNG files are sensor-decoded and demosaiced in the portable sample. Other RAW formats retain the existing embedded-preview fallback until a separately licensed camera RAW decoder is supplied.
 - MainView2 includes a Development Build-only one-click Test command that writes a single incremental runner report from the current image.
-- Default permitted model payloads are isolated from external Qwen, GFPGAN, Stable Diffusion, MONAI, and VISTA releases.
+- Model paths and inference configuration are provided without third-party weights or tokenizer vocabularies.
 - Importable through Unity Package Manager without adding runtime dependencies to `individual.jiahua-zhang.aexis`.
 
 ### Business inquiries
@@ -37,7 +37,7 @@ For commercial, integration, or partnership discussions, contact [newzjh@126.com
 - [Star the repository](https://github.com/newzjh/Aexis), report reproducible runner issues, and contribute focused fixes.
 - Review Aexis on the [Unity Asset Store](https://assetstore.unity.com/preview/397636/1435586).
 - [Sponsor on GitHub](https://github.com/sponsors/newzjh).
-- Read the repository [support guide](../../../../SUPPORT.md).
+- Read the repository [support guide](https://github.com/newzjh/Aexis/blob/main/SUPPORT.md).
 
 ## Import
 
@@ -46,46 +46,53 @@ For commercial, integration, or partnership discussions, contact [newzjh@126.com
 3. Run `Tools/Aexis/Examples/Install Main2 Application StreamingAssets`.
 4. Open `Scenes/Main2.unity`, or choose `Tools/Aexis/Examples/Open Main2 Application Scene`.
 
-The installer copies the sample `StreamingAssets` tree to `Assets/StreamingAssets`, the location Unity includes in player builds. All model paths are relative to `Application.streamingAssetsPath`; the runner catalog defaults to `Clip`, `CodeFormer`, `DeepFileV2`, `Matting`, `RealESRGAN`, and `Yolo` under that directory.
+The installer copies sample inference configuration to `Assets/StreamingAssets`, the location Unity includes in player builds. All model paths are relative to `Application.streamingAssetsPath`; the runner catalog defaults to `Clip`, `CodeFormer`, `DeepFileV2`, `Matting`, `RealESRGAN`, and `Yolo` under that directory. Place only models you are licensed to use at those paths.
 
-## Included model payload
+## Model payload
 
-The sample carries the permitted default model files for Clip, CodeFormer, DeepFillV2, Matting, RealESRGAN, and YOLO, together with their tokenizer/configuration assets. Before publishing an archive containing those files, complete the provenance and redistribution review in `../../Documentation~/model-distribution.md`.
+The Asset Store sample includes no model weights, model graphs, tokenizer vocabularies, or sample photographs. It contains runner configuration and inference manifests only. Obtain model files separately under their own terms before running inference. See `Packages/individual.jiahua-zhang.aexis/Documentation~/model-distribution.md`.
 
-GFPGAN, Stable Diffusion, SD Inpainting, MONAI/VISTA, and QWEN runners and configuration are included, but their model weights are deliberately omitted because of package-size and redistribution constraints. Add licensed weights to the paths expected by the corresponding runner before running inference.
+GFPGAN, Stable Diffusion, SD Inpainting, MONAI/VISTA, and QWEN runners and configuration are also included without model weights. Add licensed weights to the paths expected by the corresponding runner before running inference.
 
 ## External model releases
 
-Use the current asset list on the relevant GitHub Release page or the model-download UI; do not infer archive names from a runner name.
+The model-download UI fetches exact files from the listed release tags and installs them into the persistent model directory.
 
 | Model group | Release download page |
 | --- | --- |
+| CLIP MobileCLIP S0 | [`clip`](https://github.com/newzjh/Aexis/releases/tag/clip) |
+| CodeFormer | [`codeformer`](https://github.com/newzjh/Aexis/releases/tag/codeformer) |
+| Matting | [`matting`](https://github.com/newzjh/Aexis/releases/tag/matting) |
+| YOLOv8 person segmentation | [`yolo`](https://github.com/newzjh/Aexis/releases/tag/yolo) |
+| Real-ESRGAN | [`realesr`](https://github.com/newzjh/Aexis/releases/tag/realesr) |
+| DeepFillV2 | [`DeepFileV2`](https://github.com/newzjh/Aexis/releases/tag/DeepFileV2) |
 | Qwen3.5 mobile Q4 | [`qwen3.5_0.8b_mobile_q4`](https://github.com/newzjh/Aexis/releases/tag/qwen3.5_0.8b_mobile_q4) |
 | Qwen3.5 mobile Q8 | [`qwen3.5_0.8b_mobile_q8`](https://github.com/newzjh/Aexis/releases/tag/qwen3.5_0.8b_mobile_q8) |
 | GFPGAN | [`gfpgan`](https://github.com/newzjh/Aexis/releases/tag/gfpgan) |
-| Stable Diffusion inpainting | [`sdinpainting`](https://github.com/newzjh/Aexis/releases/tag/sdinpainting) |
+| Stable Diffusion inpainting | [`model`](https://github.com/newzjh/Aexis/releases/tag/model), [`sdinpainting`](https://github.com/newzjh/Aexis/releases/tag/sdinpainting) |
 | MONAI WholeBrain | [`MONAI_WholeBrain`](https://github.com/newzjh/Aexis/releases/tag/MONAI_WholeBrain) |
 | VISTA3D skull | [`vista3d_skull`](https://github.com/newzjh/Aexis/releases/tag/vista3d_skull) |
 | VISTA3D spine | [`vista3d_spine`](https://github.com/newzjh/Aexis/releases/tag/vista3d_spine) |
 
-These are external model downloads, not package payloads or license grants. Medical input, data, and checkpoints remain excluded from `individual.jiahua-zhang.aexis`; obtain and use them only under their applicable terms.
+YOLO11 and Qwen3.5 full precision do not have a complete release file set and are marked unavailable by the download UI. These links are external model downloads, not package payloads or license grants. Medical input, data, and checkpoints remain excluded from `individual.jiahua-zhang.aexis`; obtain and use them only under their applicable terms.
 
 ## Reduced player release and model delivery
 
 Use `Tools/Aexis/Release/Build Reduced` for Main2 player builds. The release builder never moves,
 deletes, or stages either `Assets/StreamingAssets` or package sample `StreamingAssets`. It
-rewrites only the generated player output and includes the Main2 default payloads: MobileCLIP
-S0, CodeFormer, Matting, Real-ESRGAN x4plus anime, GFPGAN, YOLOv8 person segmentation, DeepFillV2 case1
-ONNX, and Qwen3.5 mobile Q8. MONAI/VISTA, Stable Diffusion, HiFill, alternate YOLO/ESRGAN
-variants, full-precision Qwen, and other non-default assets are excluded.
+rewrites only the generated player output and may include locally installed, complete default
+model groups. The Asset Store package supplies none of those files. MONAI/VISTA, Stable Diffusion,
+HiFill, alternate YOLO/ESRGAN variants, full-precision Qwen, and other non-default assets are
+excluded by the reduced build policy.
 
-`Tools/Aexis/Release/Build Reduced/Prepare Model Release Assets` creates named ZIP artifacts and a
-release manifest for `newzjh/AIImage`. The downloader also maps the repository's existing
-per-release flat assets to their required model paths. Use `Tools/Aexis/Examples/Models/Download Models...` to
-download optional models into the editor persistent model directory. Main2 presents a UI Toolkit confirmation dialog with progress and cancellation
-when a runtime action needs a missing downloadable group. The UPM package release excludes
-GFPGAN and Qwen weights in accordance with package redistribution policy; those assets are
-always delivered through the model release archives.
+`Tools/Aexis/Release/Build Reduced/Prepare Model Release Assets` creates optional grouped ZIP
+artifacts and a release manifest for manual distribution. The in-app downloader uses the exact
+individual assets currently published in `newzjh/Aexis`; newly published model files need matching
+entries in `AIImageModelDelivery` before the download UI can offer them. Use
+`Tools/Aexis/Examples/Models/Download Models...` to install available groups into the editor
+persistent model directory. Main2 presents a UI Toolkit confirmation dialog when an operation needs
+a missing downloadable group. The UPM package release excludes all model weights; downloads are
+separate assets subject to their own terms.
 
 ## Dependency isolation
 
@@ -95,7 +102,7 @@ always delivered through the model release archives.
 
 The copied Editor directory contains the existing AIImage tests and batch-debug tooling. Checks needing an omitted model, external executable, medical input, private golden result, or platform-native plugin remain unavailable until that artifact is installed. MONAI/VISTA model execution is intentionally not a post-import smoke test.
 
-For target-machine macOS and iOS timing evidence, use the [Apple runtime smoke guide](../../Documentation~/apple-runtime-smoke.md). It builds a Metal test Player, runs the default runner set, and writes a JSON report without adding the test inputs to package or project source assets.
+For target-machine macOS and iOS timing evidence, use the Apple runtime smoke guide at `Packages/individual.jiahua-zhang.aexis/Documentation~/apple-runtime-smoke.md`. It builds a Metal test Player, runs the default runner set, and writes a JSON report without adding the test inputs to package or project source assets.
 
 ## Tested environments
 
@@ -117,7 +124,7 @@ The command keeps one `AexisDevelopmentRunnerTest_*.json` report in `Application
 
 ## License
 
-The application example follows the Aexis package's intended MIT source license, subject to the pre-release audit in [LICENSE.md](../../LICENSE.md). External model weights, medical data, third-party sample artifacts, and generated outputs are not covered by that intended source license.
+The Asset Store edition follows the Unity Asset Store End User License Agreement. Modified Json.NET and UniTask source used by this sample retain their MIT notices in `Packages/individual.jiahua-zhang.aexis/Third-Party Notices.txt`. Model files are not included.
 
 ## Community links
 

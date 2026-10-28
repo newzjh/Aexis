@@ -8,7 +8,7 @@ assembly and it does not ship a `Newtonsoft.Json.dll`.
 - Source revision: Json.NET 13.0.2, commit `4fba53a324c445f06ee08e45a015c346000a7ef2`
 - Source archive: https://codeload.github.com/JamesNK/Newtonsoft.Json/zip/refs/tags/13.0.2
 - Archive SHA-256: `3FE7BBF46E2745E7742ECFA6A18E276999512597B017FB4AC5ED86655FF2FCBA`
-- License: MIT, reproduced in `LICENSE.md`
+- License: MIT, reproduced in the package-root `Third-Party Notices.txt`
 - Redistribution: permitted by the upstream MIT license with the copyright and
   license notice retained.
 

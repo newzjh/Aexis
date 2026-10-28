@@ -192,14 +192,14 @@ public static class NcnnDebugRunner
     private const string DesignViewDebugInputEnvVar = "AIIMAGE_DESIGNVIEW_DEBUG_INPUT";
     private static readonly MethodInfo EditorUpdatePumpMethod = typeof(EditorApplication).GetMethod("Internal_CallUpdateFunctions", BindingFlags.Static | BindingFlags.NonPublic);
     private static readonly MethodInfo EditorDelayPumpMethod = typeof(EditorApplication).GetMethod("Internal_CallDelayFunctions", BindingFlags.Static | BindingFlags.NonPublic);
-    private static readonly string DefaultFaceDebugImagePath = AexisApplicationExamplePaths.SampleTextureAbsolutePath("facedetail2.png");
-    private static readonly string DefaultCodeFormerDebugImagePath = AexisApplicationExamplePaths.SampleTextureAbsolutePath("facedetail2.png");
-    private static readonly string DefaultClipDebugImagePath = AexisApplicationExamplePaths.SampleTextureAbsolutePath("facedetail2.png");
-    private static readonly string DefaultMattingDebugImagePath = AexisApplicationExamplePaths.SampleTextureAbsolutePath("facedetail3.jpg");
+    private static readonly string DefaultFaceDebugImagePath = string.Empty;
+    private static readonly string DefaultCodeFormerDebugImagePath = string.Empty;
+    private static readonly string DefaultClipDebugImagePath = string.Empty;
+    private static readonly string DefaultMattingDebugImagePath = string.Empty;
     private static readonly string DefaultMattingReferencePath = null;
-    private static readonly string DefaultYoloSegDebugImagePath = AexisApplicationExamplePaths.SampleTextureAbsolutePath("facedetail2.png");
-    private static readonly string DefaultReproStressImagePath = AexisApplicationExamplePaths.SampleTextureAbsolutePath("facedetail2.png");
-    private static readonly string DefaultDeepFillV2DebugImagePath = AexisApplicationExamplePaths.SampleTextureAbsolutePath("facedetail3.jpg");
+    private static readonly string DefaultYoloSegDebugImagePath = string.Empty;
+    private static readonly string DefaultReproStressImagePath = string.Empty;
+    private static readonly string DefaultDeepFillV2DebugImagePath = string.Empty;
     private static readonly string DefaultDeepFillV2Case1ImagePath = Path.Combine(Directory.GetCurrentDirectory(), "ref", "deepfillv2", "deepfillv2-pytorch-master", "examples", "inpaint", "case1.png");
     private static readonly string DefaultDeepFillV2Case1MaskedPath = Path.Combine(Directory.GetCurrentDirectory(), "ref", "deepfillv2", "deepfillv2-pytorch-master", "examples", "inpaint", "case1_masked.png");
     private static readonly string DefaultDeepFillV2Case1OutputPath = Path.Combine(Directory.GetCurrentDirectory(), "ref", "deepfillv2", "deepfillv2-pytorch-master", "examples", "inpaint", "case1_out.png");
@@ -210,7 +210,7 @@ public static class NcnnDebugRunner
     private static readonly string DefaultMonaiInputPath = Environment.GetEnvironmentVariable("AEXIS_MONAI_INPUT_PATH") ?? string.Empty;
     private static readonly string DefaultVistaBaselineManifestPath = Path.Combine(Directory.GetCurrentDirectory(), "Tools", "MonaiToNCNN", "manual_test", "vista3d_ct_philips_heart_baseline", "ct_philips_heart", "baseline_manifest.json");
     private static readonly string DefaultVistaInputPath = Environment.GetEnvironmentVariable("AEXIS_VISTA_INPUT_PATH") ?? string.Empty;
-    private static readonly string DefaultRealEsrganInputDir = AexisApplicationExamplePaths.SampleTextureDirectory;
+    private static readonly string DefaultRealEsrganInputDir = null;
     private static readonly string DefaultSdPositivePrompt = "floating hair, portrait, ((loli)), ((one girl)), cute face, hidden hands, asymmetrical bangs, beautiful detailed eyes, eye shadow, hair ornament, ribbons, bowties, buttons, pleated skirt, (((masterpiece))), ((best quality)), colorful";
     private static readonly string DefaultSdNegativePrompt = "((part of the head)), ((((mutated hands and fingers)))), deformed, blurry, bad anatomy, disfigured, poorly drawn face, mutation, mutated, extra limb, ugly, poorly drawn hands, missing limb, blurry, floating limbs, disconnected limbs, malformed hands, blur, out of focus, long neck, long body, Octane renderer, lowres, bad anatomy, bad hands, text";
     private static bool _autoBatchScheduled;
@@ -6265,7 +6265,9 @@ public static class NcnnDebugRunner
         catch
         {
         }
-        return fallbackPath;
+        if (!string.IsNullOrWhiteSpace(fallbackPath) && File.Exists(fallbackPath))
+            return fallbackPath;
+        throw new FileNotFoundException("Set AIIMAGE_DEBUG_INPUT to a licensed local image before running this debug command.");
     }
 
     private static string ResolveClipInputDirectory()

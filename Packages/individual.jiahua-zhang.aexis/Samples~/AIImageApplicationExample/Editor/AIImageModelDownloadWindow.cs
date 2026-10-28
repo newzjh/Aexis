@@ -36,11 +36,19 @@ public sealed class AIImageModelDownloadWindow : EditorWindow
             EditorGUILayout.LabelField(group.DisplayName, EditorStyles.boldLabel);
             GUILayout.FlexibleSpace();
             var installed = AIImageModelDelivery.IsInstalled(group);
-            EditorGUILayout.LabelField(installed ? "Installed" : group.BundledByDefault ? "Bundled by release build" : "Optional", GUILayout.Width(150f));
-            EditorGUI.BeginDisabledGroup(_activeGroup.HasValue);
-            if (GUILayout.Button(installed ? "Download again" : "Download", GUILayout.Width(110f)))
+            var downloadable = AIImageModelDelivery.CanDownloadGroup(group);
+            var status = installed
+                ? "Installed"
+                : downloadable
+                    ? group.BundledByDefault ? "Available" : "Optional"
+                    : "Unavailable";
+            EditorGUILayout.LabelField(status, GUILayout.Width(120f));
+            EditorGUI.BeginDisabledGroup(_activeGroup.HasValue || !downloadable);
+            if (GUILayout.Button(installed ? "Download again" : "Download", GUILayout.Width(110f), GUILayout.Height(24f)))
                 DownloadAsync(group).Forget();
             EditorGUI.EndDisabledGroup();
+            if (!installed && !downloadable)
+                GUILayout.Label("No complete release asset mapping", EditorStyles.wordWrappedMiniLabel);
             EditorGUILayout.EndHorizontal();
 
             if (_progress.TryGetValue(group.Id, out var progress))
